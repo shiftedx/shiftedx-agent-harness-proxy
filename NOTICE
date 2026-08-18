@@ -1,0 +1,9 @@
+Shiftedx Agent Harness Proxy
+Copyright 2026 Shiftedx contributors
+
+This product includes software adapted from Shiftedx Bench's shiftedx-agent-harness-v1,
+revision 335e6694e4aec13e9370af8a993d8c8f14d7ffb5, licensed under Apache License 2.0:
+https://huggingface.co/datasets/Shiftedx/shiftedx-bench
+
+Adapted portions are identified in source-file headers. This proxy does not include the benchmark
+runner, scorers, private fixtures, hidden tests, or raw evaluation outputs.

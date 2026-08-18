@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "shiftedx-agent-harness-proxy"
+version = "0.1.0"
+description = "Bounded execution-policy middleware for OpenAI-compatible agent clients"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = [
+  "fastapi==0.141.1",
+  "httpx==0.28.1",
+  "pydantic-settings==2.10.1",
+  "PyYAML==6.0.2",
+  "starlette==1.6.0",
+  "uvicorn==0.35.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy==1.17.1",
+  "pytest==8.4.1",
+  "pytest-asyncio==1.1.0",
+  "ruff==0.12.8",
+  "types-PyYAML==6.0.12.20250822",
+]
+
+[project.scripts]
+shiftedx-agent-harness-proxy = "shiftedx_harness_proxy.main:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/shiftedx_harness_proxy"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "S"]
+ignore = ["S101", "SIM117"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["shiftedx_harness_proxy"]

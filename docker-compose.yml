@@ -1,0 +1,21 @@
+services:
+  proxy:
+    build:
+      context: .
+    image: shiftedx-agent-harness-proxy:local
+    ports:
+      - "8090:8090"
+    environment:
+      UPSTREAM_BASE_URL: "${UPSTREAM_BASE_URL:-http://host.docker.internal:8000/v1}"
+      HARNESS_PROFILE: "shiftedx-harness-v1"
+      TELEMETRY_ENABLED: "true"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    init: true
+    restart: unless-stopped

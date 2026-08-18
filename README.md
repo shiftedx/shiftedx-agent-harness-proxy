@@ -1,0 +1,119 @@
+# Shiftedx Agent Harness Proxy
+
+A small, stateless policy proxy for OpenAI-compatible Chat Completions. It blocks repeated or
+stalled tool calls, requires verification after mutations, and corrects malformed terminal JSON
+within fixed retry limits. It never executes tools or changes model weights.
+
+## Start with one Docker command
+
+Prerequisites: Docker Compose and an OpenAI-compatible model server listening on host port `8000`.
+
+```bash
+docker compose up --build -d
+```
+
+That builds the local image and exposes the proxy at `http://localhost:8090/v1`. It works on Docker
+Desktop and Linux; the supplied Compose file maps `host.docker.internal` appropriately.
+
+Check it:
+
+```bash
+curl -fsS http://localhost:8090/readyz
+curl -fsS http://localhost:8090/v1/models
+```
+
+Use a different upstream:
+
+```bash
+UPSTREAM_BASE_URL=http://host.docker.internal:1234/v1 docker compose up --build -d
+```
+
+Stop it with `docker compose down`.
+
+## Connect a client
+
+Point any non-streaming OpenAI-compatible client at `http://localhost:8090/v1`:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8090/v1", api_key="unused")
+response = client.chat.completions.create(
+    model="served-model-id",
+    messages=[{"role": "user", "content": "Inspect the project and report status."}],
+)
+print(response.choices[0].message)
+```
+
+Clients must send the complete visible conversation on every request, including assistant tool-call
+IDs and their later matching `role=tool` results. Version 1 rejects `stream=true` and requires
+`n=1` while the harness is enabled.
+
+## Authentication
+
+For an authenticated upstream and proxy, create ignored Docker secrets and use the secure override:
+
+```bash
+install -m 600 /dev/null secrets/upstream_api_key.txt
+install -m 600 /dev/null secrets/proxy_api_key.txt
+printf '%s' "$MODEL_SERVER_KEY" > secrets/upstream_api_key.txt
+printf '%s' "$CLIENT_PROXY_KEY" > secrets/proxy_api_key.txt
+docker compose -f docker-compose.yml -f docker-compose.secrets.yml up --build -d
+```
+
+Clients must use `CLIENT_PROXY_KEY` as their bearer token in this mode.
+Downstream credentials, cookies, and arbitrary forwarding headers are never sent upstream.
+
+## What the policy does
+
+- Reconstructs compact receipts from paired assistant calls and public tool results.
+- Blocks identical calls only while state is unchanged; successful mutation opens a new epoch.
+- Requires successful verification after mutation and preserves unresolved failures.
+- Withholds an entire parallel batch if one sibling is blocked, preventing false execution state.
+- Applies at most two terminal-format corrections and hard-bounds every internal retry loop.
+- Derives terminal key/type requirements from standard `response_format.json_schema` when present.
+
+Default tool roles cover common names such as `apply_patch`, `run_tests`, `read_file`, and
+`file_search`. Add `"x-shiftedx-role": "mutation|verification|investigation|other"` to a tool schema
+for custom names; the proxy strips this extension before forwarding. A trusted safe-refusal case
+may send the top-level boolean `"x-shiftedx-require-receipt": false`.
+
+See [the exact policy contract](docs/policy.md) for role configuration, receipt semantics, schema
+projection, parallel calls, and degraded transcript behavior.
+
+## Common configuration
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `UPSTREAM_BASE_URL` | host port `8000` in Compose | Fixed OpenAI-compatible `/v1` base |
+| `UPSTREAM_API_KEY` | unset | Upstream credential; Docker secret preferred |
+| `PROXY_API_KEY` | unset | Independent client-facing bearer token |
+| `MAX_INTERNAL_RETRIES` | `4` | Internal policy retries per request |
+| `MAX_UPSTREAM_CALLS` | `7` | Total upstream-call ceiling per request |
+| `UPSTREAM_TIMEOUT_SECONDS` | `120` | Upstream timeout |
+| `CONCURRENCY_LIMIT` | `32` | Concurrent upstream operations |
+| `TELEMETRY_ENABLED` | `false` | Safe policy response headers |
+| `METRICS_ENABLED` | `true` | Prompt-free counters at `/metrics` |
+
+The container runs as UID/GID `10001:10001`, needs no writable volume, drops all capabilities, and
+uses a read-only filesystem in Compose. Keep TLS, authentication, and network access control at a
+trusted ingress for public deployments. See [SECURITY.md](SECURITY.md) and the
+[architecture decision](docs/adr/0001-standalone-stateless-proxy.md).
+
+## Development and evidence
+
+```bash
+uv sync --extra dev
+uv run pytest
+uv run ruff check .
+uv run mypy src
+./scripts/docker-smoke.sh
+```
+
+The current suite has 35 tests. Dependency and container scans found no known high/critical
+vulnerabilities, and the local multi-architecture build and hardened-container smoke test passed.
+Proxy-only timing and the deferred external comparison are documented in
+[benchmarking](docs/benchmarking.md).
+
+This is an unreleased `0.1.0` implementation. No repository, package, or container image has been
+published; publication requires explicit owner authorization.
