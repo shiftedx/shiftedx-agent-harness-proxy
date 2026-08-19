@@ -19,6 +19,8 @@ def run() -> None:
         port=settings.listen_port,
         log_level=settings.log_level.lower(),
         access_log=True,
+        limit_concurrency=settings.server_connection_limit,
+        backlog=settings.server_backlog,
         timeout_graceful_shutdown=15,
     )
 

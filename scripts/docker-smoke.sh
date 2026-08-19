@@ -28,6 +28,8 @@ elif [ "$build_image" != "0" ]; then
   exit 2
 fi
 
+uv run python scripts/admission-soak.py
+
 mkdir "$tmpdir/secrets"
 printf '%s' 'smoke-proxy-key' >"$tmpdir/secrets/proxy_api_key"
 printf '%s' 'smoke-upstream-key' >"$tmpdir/secrets/upstream_api_key"

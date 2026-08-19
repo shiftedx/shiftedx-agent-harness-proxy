@@ -138,7 +138,15 @@ projection, parallel calls, and degraded transcript behavior.
 | `MAX_INTERNAL_RETRIES` | `4` | Internal policy retries per request |
 | `MAX_UPSTREAM_CALLS` | `7` | Total upstream-call ceiling per request |
 | `UPSTREAM_TIMEOUT_SECONDS` | `120` | Upstream timeout |
-| `CONCURRENCY_LIMIT` | `32` | Concurrent upstream operations |
+| `CONCURRENCY_LIMIT` | `32` | Concurrent upstream operations (one slot per upstream request/retry) |
+| `SERVER_CONNECTION_LIMIT` / `SERVER_BACKLOG` | `24` / `128` | Uvicorn parsed-request task ceiling and socket backlog, with management-route headroom beyond admission |
+| `ADMISSION_LIMIT` | `16` | Concurrent downstream requests admitted before body buffering |
+| `ADMISSION_WAIT_SECONDS` | `1` | Maximum admission queue wait before a retryable overload response |
+| `TOTAL_REQUEST_DEADLINE_SECONDS` | `180` | Monotonic wall-clock limit for queueing, body reads, policy, retries, and response construction |
+| `PRINCIPAL_BUDGET_MODE` | `authenticated` | Per configured bearer capability budget; `global` explicitly selects the single-principal fallback |
+| `PRINCIPAL_CONCURRENCY_LIMIT` | `4` | Concurrent admitted requests per authenticated principal or global fallback |
+| `PRINCIPAL_RATE_LIMIT` / `PRINCIPAL_RATE_WINDOW_SECONDS` | `60` / `60` | Finite in-process request budget per principal/fallback window |
+| `OVERLOAD_RETRY_AFTER_SECONDS` | `1` | Bounded numeric retry hint for admission and rate overloads |
 | `TELEMETRY_ENABLED` | `false` | Safe policy response headers |
 | `METRICS_ENABLED` | `true` | Prompt-free counters at `/metrics` |
 
@@ -147,6 +155,25 @@ uses a read-only filesystem in Compose. The production override also provides fi
 and PID limits. Keep TLS, authentication, and network access control at a trusted ingress for public
 deployments. See [SECURITY.md](SECURITY.md) and the
 [architecture decision](docs/adr/0001-standalone-stateless-proxy.md).
+
+## Admission and overload
+
+Authentication happens before admission; body bytes are not read until the request obtains both the
+global admission budget and the authenticated-principal (or documented global fallback) budget.
+`429 admission_overloaded`, `429 principal_concurrency_limited`, and
+`429 principal_rate_limited` include only the configured bounded numeric `Retry-After` hint. A total
+deadline returns `504 request_deadline_exceeded`; upstream-operation queue timeout returns
+`503 upstream_concurrency_limited`, also with that hint. The proxy never exposes queue position, limits,
+credentials, principal IDs, prompts, or transcripts in these responses or metric labels.
+
+`ADMISSION_LIMIT * MAX_REQUEST_BYTES` is the conservative buffered-body upper bound; leave room for
+JSON objects, policy copies, and bounded upstream responses beneath the production Compose memory
+limit. `CONCURRENCY_LIMIT` is separate: it bounds active upstream connections and is acquired only
+for a single upstream operation, so body buffering and local policy work do not hold an upstream
+slot. `SERVER_CONNECTION_LIMIT` bounds Uvicorn parsed-request task handling and intentionally leaves
+headroom for health/readiness and metrics; it does not limit sockets whose headers have not yet
+parsed. The trusted ingress must enforce finite accepted-connection, header-read, and slow-client
+limits. Internal retries consume more operations but never reset the total request deadline.
 
 ## Development and evidence
 

@@ -147,3 +147,14 @@ def test_overlapping_server_role_configuration_fails_closed() -> None:
                 verification_tools="deploy",
             )
         )
+
+
+def test_admission_settings_are_finite_and_principal_keys_are_opaque() -> None:
+    settings = Settings(upstream_base_url="http://model/v1", proxy_api_key=SecretStr("ordinary-key"))
+    assert settings.admission_limit > 0
+    assert settings.server_connection_limit > settings.admission_limit
+    assert settings.total_request_deadline_seconds > 0
+    assert settings.principal_rate_limit > 0
+    assert settings.principal_budget_key("Bearer ordinary-key") != "Bearer ordinary-key"
+    with pytest.raises(ValidationError, match="SERVER_CONNECTION_LIMIT"):
+        Settings(upstream_base_url="http://model/v1", admission_limit=2, server_connection_limit=2)

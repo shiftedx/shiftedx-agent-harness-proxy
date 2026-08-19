@@ -11,6 +11,7 @@ IMPORT_TO_DISTRIBUTION = {
     "httpx": "httpx",
     "pydantic": "pydantic",
     "pydantic_settings": "pydantic-settings",
+    "starlette": "starlette",
     "uvicorn": "uvicorn",
     "yaml": "pyyaml",
 }

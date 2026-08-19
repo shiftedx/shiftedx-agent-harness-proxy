@@ -8,14 +8,17 @@ import json
 import logging
 import re
 import uuid
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Coroutine
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from starlette.requests import ClientDisconnect
 
+from .admission import AdmissionController, BoundedUpstream
 from .cache_policy import ServerCacheNamespace
 from .config import Settings
 from .errors import ProxyError
@@ -39,6 +42,8 @@ class Counters:
     policy_extension_allows: int = 0
     policy_extension_denials: int = 0
     cache_namespace_rejections: int = 0
+    deadline_expiries: int = 0
+    cancellations: int = 0
 
     def observe(self, result: ChatResult) -> None:
         telemetry = result.telemetry
@@ -51,8 +56,8 @@ class Counters:
         self.local_projection_upstream_calls_avoided += telemetry.local_projection_upstream_calls_avoided
         self.policy_extension_allows += telemetry.policy_extensions_used
 
-    def render(self) -> str:
-        values = {
+    def render(self, admission: AdmissionController) -> str:
+        counters = {
             "shiftedx_proxy_downstream_requests_total": self.downstream_requests,
             "shiftedx_proxy_upstream_calls_total": self.upstream_calls,
             "shiftedx_proxy_blocked_duplicates_total": self.blocked_duplicates,
@@ -66,14 +71,31 @@ class Counters:
             "shiftedx_proxy_policy_extension_allows_total": self.policy_extension_allows,
             "shiftedx_proxy_policy_extension_denials_total": self.policy_extension_denials,
             "shiftedx_proxy_cache_namespace_rejections_total": self.cache_namespace_rejections,
+            "shiftedx_proxy_request_deadline_expiries_total": self.deadline_expiries,
+            "shiftedx_proxy_downstream_cancellations_total": self.cancellations,
         }
-        return "".join(f"# TYPE {key} counter\n{key} {value}\n" for key, value in values.items())
+        snapshot = admission.snapshot()
+        counters.update(
+            {
+                "shiftedx_proxy_admission_rejections_total": snapshot.admission_rejections,
+                "shiftedx_proxy_principal_rate_rejections_total": snapshot.rate_rejections,
+            }
+        )
+        gauges = {
+            "shiftedx_proxy_downstream_active": snapshot.active,
+            "shiftedx_proxy_downstream_queued": snapshot.queued,
+            "shiftedx_proxy_upstream_active": snapshot.upstream_active,
+        }
+        return "".join(
+            f"# TYPE {key} counter\n{key} {value}\n" for key, value in counters.items()
+        ) + "".join(f"# TYPE {key} gauge\n{key} {value}\n" for key, value in gauges.items())
 
 
 def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
-    transport = upstream or HttpxUpstream(settings)
+    base_transport = upstream or HttpxUpstream(settings)
+    admission = AdmissionController(settings)
+    transport = BoundedUpstream(base_transport, admission)
     service = ChatService(settings, transport)
-    semaphore = asyncio.Semaphore(settings.concurrency_limit)
     counters = Counters()
 
     @asynccontextmanager
@@ -91,6 +113,7 @@ def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
     )
     app.state.settings = settings
     app.state.upstream = transport
+    app.state.admission = admission
     app.state.counters = counters
 
     if origins := settings.allowed_origins():
@@ -112,6 +135,10 @@ def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
             counters.policy_extension_denials += 1
         if exc.code == "untrusted_cache_namespace":
             counters.cache_namespace_rejections += 1
+        if exc.code == "request_deadline_exceeded":
+            counters.deadline_expiries += 1
+        if exc.code == "downstream_disconnected":
+            counters.cancellations += 1
         correlation_id = getattr(request.state, "correlation_id", None) or _new_correlation_id(request)
         LOGGER.warning("proxy_request_failed code=%s correlation_id=%s", exc.code, correlation_id)
         headers = {"X-Request-ID": correlation_id, **exc.headers}
@@ -145,68 +172,66 @@ def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
         _authenticate(request, settings)
         if not settings.metrics_enabled:
             raise ProxyError(404, "metrics_disabled", "Metrics are disabled.")
-        return PlainTextResponse(counters.render(), media_type="text/plain; version=0.0.4")
+        return PlainTextResponse(counters.render(admission), media_type="text/plain; version=0.0.4")
 
     @app.get("/v1/models")
     async def models(request: Request) -> Response:
         correlation_id = _set_correlation_id(request)
-        _authenticate(request, settings)
-        async with _capacity(semaphore, settings.concurrency_wait_seconds):
-            value = await transport.models(_forwarded_request_headers(request, correlation_id))
-        return JSONResponse(value, headers={"X-Request-ID": correlation_id})
+        principal = _authenticate(request, settings)
+        deadline_at = _deadline_at(settings)
+        try:
+            async with asyncio.timeout_at(deadline_at):
+                async with admission.admit(principal.budget_key):
+                    value = await transport.models(_forwarded_request_headers(request, correlation_id))
+                    response = JSONResponse(value, headers={"X-Request-ID": correlation_id})
+                    _ensure_before_deadline(deadline_at)
+                    return response
+        except TimeoutError as exc:
+            raise ProxyError(504, "request_deadline_exceeded", "The request exceeded its total time limit.") from exc
 
     @app.post("/v1/chat/completions")
     async def chat(request: Request) -> Response:
         correlation_id = _set_correlation_id(request)
         principal = _authenticate(request, settings)
-        content_length = request.headers.get("content-length")
-        if content_length is not None:
-            try:
-                declared_length = int(content_length)
-            except ValueError as exc:
-                raise ProxyError(400, "invalid_content_length", "Content-Length is invalid.") from exc
-            if declared_length > settings.max_request_bytes:
-                raise ProxyError(413, "request_too_large", "Request body exceeds MAX_REQUEST_BYTES.")
-        chunks: list[bytes] = []
-        received = 0
-        async for chunk in request.stream():
-            received += len(chunk)
-            if received > settings.max_request_bytes:
-                raise ProxyError(413, "request_too_large", "Request body exceeds MAX_REQUEST_BYTES.")
-            chunks.append(chunk)
-        body = b"".join(chunks)
+        deadline_at = _deadline_at(settings)
         try:
-            payload = json.loads(body)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise ProxyError(400, "invalid_json", "Request body must be a JSON object.") from exc
-        if not isinstance(payload, dict):
-            raise ProxyError(400, "invalid_json", "Request body must be a JSON object.")
-
-        harness_header = request.headers.get("x-shiftedx-harness")
-        if harness_header is not None and harness_header.strip().lower() != "off":
-            raise ProxyError(400, "invalid_harness_opt_out", "X-Shiftedx-Harness supports only off.")
-        opt_out = harness_header is not None
-        if opt_out and not settings.allow_harness_opt_out:
-            raise ProxyError(403, "harness_opt_out_disabled", "Harness opt-out is disabled.")
-        if opt_out and not principal.policy_extensions_allowed:
-            raise ProxyError(
-                403,
-                "harness_opt_out_denied",
-                "Harness opt-out is not authorized for this principal.",
-            )
-        async with _capacity(semaphore, settings.concurrency_wait_seconds):
-            result = await service.complete(
-                payload,
-                _forwarded_request_headers(request, correlation_id),
-                harness_enabled=not opt_out,
-                policy_extensions_allowed=principal.policy_extensions_allowed,
-                trusted_policy_extension_used=opt_out,
-                server_cache_namespace=principal.server_cache_namespace,
-            )
-        counters.observe(result)
-        headers = _telemetry_headers(result, settings)
-        headers["X-Request-ID"] = correlation_id
-        return JSONResponse(result.body, headers=headers)
+            async with asyncio.timeout_at(deadline_at):
+                async with admission.admit(principal.budget_key):
+                    payload = await _read_payload(request, settings)
+                    harness_header = request.headers.get("x-shiftedx-harness")
+                    if harness_header is not None and harness_header.strip().lower() != "off":
+                        raise ProxyError(400, "invalid_harness_opt_out", "X-Shiftedx-Harness supports only off.")
+                    opt_out = harness_header is not None
+                    if opt_out and not settings.allow_harness_opt_out:
+                        raise ProxyError(403, "harness_opt_out_disabled", "Harness opt-out is disabled.")
+                    if opt_out and not principal.policy_extensions_allowed:
+                        raise ProxyError(
+                            403,
+                            "harness_opt_out_denied",
+                            "Harness opt-out is not authorized for this principal.",
+                        )
+                    result = await _complete_while_connected(
+                        request,
+                        service.complete(
+                            payload,
+                            _forwarded_request_headers(request, correlation_id),
+                            harness_enabled=not opt_out,
+                            policy_extensions_allowed=principal.policy_extensions_allowed,
+                            trusted_policy_extension_used=opt_out,
+                            server_cache_namespace=principal.server_cache_namespace,
+                        ),
+                    )
+                    headers = _telemetry_headers(result, settings)
+                    headers["X-Request-ID"] = correlation_id
+                    response = JSONResponse(result.body, headers=headers)
+                    _ensure_before_deadline(deadline_at)
+                    counters.observe(result)
+                    return response
+        except TimeoutError as exc:
+            raise ProxyError(504, "request_deadline_exceeded", "The request exceeded its total time limit.") from exc
+        except asyncio.CancelledError:
+            counters.cancellations += 1
+            raise
 
     return app
 
@@ -215,6 +240,7 @@ def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
 class AuthenticatedPrincipal:
     policy_extensions_allowed: bool = False
     server_cache_namespace: ServerCacheNamespace | None = None
+    budget_key: str | None = None
 
 
 def _authenticate(request: Request, settings: Settings) -> AuthenticatedPrincipal:
@@ -224,7 +250,10 @@ def _authenticate(request: Request, settings: Settings) -> AuthenticatedPrincipa
         hmac.compare_digest(supplied.encode(), f"Bearer {capability}".encode())
         for capability in trusted_capabilities
     ):
-        return AuthenticatedPrincipal(policy_extensions_allowed=True)
+        return AuthenticatedPrincipal(
+            policy_extensions_allowed=True,
+            budget_key=settings.principal_budget_key(supplied),
+        )
     if settings.proxy_api_key is None and not trusted_capabilities:
         return AuthenticatedPrincipal()
     expected = (
@@ -234,7 +263,7 @@ def _authenticate(request: Request, settings: Settings) -> AuthenticatedPrincipa
     )
     if not expected or not hmac.compare_digest(supplied.encode(), expected.encode()):
         raise ProxyError(401, "authentication_failed", "A valid proxy bearer token is required.")
-    return AuthenticatedPrincipal()
+    return AuthenticatedPrincipal(budget_key=settings.principal_budget_key(supplied))
 
 
 def _new_correlation_id(request: Request) -> str:
@@ -256,16 +285,61 @@ def _forwarded_request_headers(request: Request, correlation_id: str) -> dict[st
     return {"x-request-id": correlation_id}
 
 
-@asynccontextmanager
-async def _capacity(semaphore: asyncio.Semaphore, wait_seconds: float) -> AsyncIterator[None]:
+def _deadline_at(settings: Settings) -> float:
+    return asyncio.get_running_loop().time() + settings.total_request_deadline_seconds
+
+
+def _ensure_before_deadline(deadline_at: float) -> None:
+    if asyncio.get_running_loop().time() > deadline_at:
+        raise TimeoutError
+
+
+async def _read_payload(request: Request, settings: Settings) -> dict[str, Any]:
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError as exc:
+            raise ProxyError(400, "invalid_content_length", "Content-Length is invalid.") from exc
+        if declared_length > settings.max_request_bytes:
+            raise ProxyError(413, "request_too_large", "Request body exceeds MAX_REQUEST_BYTES.")
+    chunks: list[bytes] = []
+    received = 0
     try:
-        await asyncio.wait_for(semaphore.acquire(), timeout=wait_seconds)
-    except TimeoutError as exc:
-        raise ProxyError(503, "concurrency_limit", "Proxy concurrency capacity is exhausted.") from exc
+        async for chunk in request.stream():
+            received += len(chunk)
+            if received > settings.max_request_bytes:
+                raise ProxyError(413, "request_too_large", "Request body exceeds MAX_REQUEST_BYTES.")
+            chunks.append(chunk)
+    except ClientDisconnect as exc:
+        raise ProxyError(499, "downstream_disconnected", "The downstream client disconnected.") from exc
     try:
-        yield
-    finally:
-        semaphore.release()
+        payload = json.loads(b"".join(chunks))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ProxyError(400, "invalid_json", "Request body must be a JSON object.") from exc
+    if not isinstance(payload, dict):
+        raise ProxyError(400, "invalid_json", "Request body must be a JSON object.")
+    return payload
+
+
+async def _complete_while_connected(
+    request: Request, work: Coroutine[Any, Any, ChatResult]
+) -> ChatResult:
+    task = asyncio.create_task(work)
+    try:
+        while not task.done():
+            await asyncio.wait({task}, timeout=0.05)
+            if not task.done() and await request.is_disconnected():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+                raise ProxyError(499, "downstream_disconnected", "The downstream client disconnected.")
+        return await task
+    except asyncio.CancelledError:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+        raise
 
 
 def _telemetry_headers(result: ChatResult, settings: Settings) -> dict[str, str]:
