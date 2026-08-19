@@ -2,15 +2,17 @@
 
 ## Supported versions
 
-This project is prerelease software. Security fixes currently target the latest commit on `main`;
-there is no supported public image or stable release line yet.
+This project is prerelease software. Security fixes currently target the latest commit on `main`.
+The v0.1 release candidate is available for review and qualification, but no public image or stable
+release line is supported yet.
 
 ## Reporting a vulnerability
 
 Do not include credentials, private prompts, tool results, model output, hidden benchmark material,
-or exploit data in a public issue. Contact the repository owner through a private security advisory
-after the public repository is created. Until then, report privately to the Shiftedx maintainer who
-provided this source tree.
+or exploit data in a public issue. Report vulnerabilities with a
+[private GitHub Security Advisory](https://github.com/shiftedx/shiftedx-agent-harness-proxy/security/advisories/new).
+If GitHub does not permit you to open one, contact a repository maintainer privately and ask for a
+secure reporting channel; do not fall back to a public issue.
 
 Include the affected revision, deployment topology, minimal sanitized reproduction, impact, and
 whether a credential may have been exposed. Revoke suspected credentials before waiting for a

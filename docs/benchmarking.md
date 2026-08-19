@@ -26,12 +26,11 @@ an evaluation adapter, not benchmark or proxy policy derived from expected answe
 `--proxy-policy` only for the proxy endpoint. The benchmark runner's control profile remains
 `baseline` in both treatments so policy is not applied twice.
 
-Use a table like this for each profile and trial:
-
-| Trial | Profile | Proxy commit/image | Model/runtime revisions | Passed | Emitted | Dispatched | Blocked duplicate | Blocked stall | Corrections | Projections | Wall time | Decode tok/s |
-|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | baseline | n/a | pending | pending | pending | pending | 0 | 0 | 0 | 0 | pending | pending |
-| 1 | shiftedx-harness-v1 | pending | pending | pending | pending | pending | pending | pending | pending | pending | pending | pending |
+The public ledger has one row per trial, profile, and cache lane. Each row records the immutable
+proxy/model/runtime contract; passed/total cases; emitted and dispatched calls; blocked duplicate
+and stall counts; corrections; projections; upstream-model usage; wall time; TTFT; and weighted
+decode throughput. It also links the shared run manifest rather than repeating private endpoint or
+host data.
 
 Do not publish a benchmark report with missing trials, mismatched revisions, private prompts/raw
 model outputs, host paths, API keys, or holdout artifacts.
@@ -54,6 +53,9 @@ The latest scripted proxy-only measurement is stored in
 [`benchmark-reports/proxy-overhead-2026-08-18.json`](../benchmark-reports/proxy-overhead-2026-08-18.json).
 It excludes network and inference and therefore is not an end-to-end latency claim.
 
-The external model-backed comparison is currently deferred after an interrupted smoke attempt;
-see
-[`benchmark-reports/paired-benchmark-deferred-2026-08-17.md`](../benchmark-reports/paired-benchmark-deferred-2026-08-17.md).
+Promotion thresholds, cold/warm requirements, load/fault coverage, rollback criteria, and failure
+handling are frozen in the
+[`v1 qualification plan`](../benchmark-reports/v1-qualification-plan.md). The interrupted 2026-08-17
+smoke produced no benchmark row and is retained only as a
+[`historical audit note`](../benchmark-reports/historical/paired-benchmark-interruption-2026-08-17.md);
+it is not the current release status or a quality result.

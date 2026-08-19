@@ -40,6 +40,19 @@ def test_dockerfile_requires_the_checked_lockfile() -> None:
     assert "uv sync --locked --no-dev --no-editable" in dockerfile
 
 
+def test_release_compose_overlay_requires_an_exact_image_and_disables_build() -> None:
+    overlay = (ROOT / "docker-compose.release.yml").read_text()
+    assert 'image: "${PROXY_IMAGE:?Set PROXY_IMAGE to the exact approved image reference}"' in overlay
+    assert "build: !reset null" in overlay
+
+
+def test_ci_validates_the_merged_exact_image_compose_configuration() -> None:
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+    assert "Validate exact-image Compose configuration" in workflow
+    assert 'assert "build" not in proxy' in workflow
+    assert 'assert proxy["image"] == expected_image' in workflow
+
+
 def test_smoke_uses_the_production_profile_with_a_file_mounted_credential() -> None:
     smoke = (ROOT / "scripts/docker-smoke.sh").read_text()
     assert 'printf \'%s\' \'smoke-proxy-key\' >"$tmpdir/secrets/proxy_api_key"' in smoke
