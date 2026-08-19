@@ -43,6 +43,21 @@ class ToolRoles:
     verification: frozenset[str] = DEFAULT_VERIFICATION_TOOLS
     investigation: frozenset[str] = DEFAULT_INVESTIGATION_TOOLS
 
+    def configured_role(self, name: str) -> str | None:
+        """Return the server role protecting ``name``, when it has one."""
+        matches = tuple(
+            role
+            for role, names in (
+                ("mutation", self.mutation),
+                ("verification", self.verification),
+                ("investigation", self.investigation),
+            )
+            if name in names
+        )
+        if len(matches) > 1:
+            raise ValueError("Configured tool roles must assign each tool name to only one role")
+        return matches[0] if matches else None
+
     def with_annotation(self, name: str, role: str) -> ToolRoles:
         """Return roles with one tool assigned exclusively to the annotated role."""
         if role not in {"mutation", "verification", "investigation", "other"}:

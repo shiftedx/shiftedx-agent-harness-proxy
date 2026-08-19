@@ -31,6 +31,8 @@ class Counters:
     correction_turns: int = 0
     receipt_projections: int = 0
     errors: int = 0
+    policy_extension_allows: int = 0
+    policy_extension_denials: int = 0
 
     def observe(self, result: ChatResult) -> None:
         telemetry = result.telemetry
@@ -40,6 +42,7 @@ class Counters:
         self.blocked_stalls += telemetry.blocked_stalls
         self.correction_turns += telemetry.corrections
         self.receipt_projections += telemetry.receipt_projections
+        self.policy_extension_allows += telemetry.policy_extensions_used
 
     def render(self) -> str:
         values = {
@@ -50,6 +53,8 @@ class Counters:
             "shiftedx_proxy_correction_turns_total": self.correction_turns,
             "shiftedx_proxy_receipt_projections_total": self.receipt_projections,
             "shiftedx_proxy_errors_total": self.errors,
+            "shiftedx_proxy_policy_extension_allows_total": self.policy_extension_allows,
+            "shiftedx_proxy_policy_extension_denials_total": self.policy_extension_denials,
         }
         return "".join(f"# TYPE {key} counter\n{key} {value}\n" for key, value in values.items())
 
@@ -88,6 +93,12 @@ def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
     @app.exception_handler(ProxyError)
     async def proxy_error_handler(_request: Request, exc: ProxyError) -> JSONResponse:
         counters.errors += 1
+        if exc.code in {
+            "receipt_override_denied",
+            "protected_role_override_denied",
+            "harness_opt_out_denied",
+        }:
+            counters.policy_extension_denials += 1
         LOGGER.warning("proxy_request_failed code=%s", exc.code)
         return JSONResponse(
             status_code=exc.status_code,
@@ -129,7 +140,7 @@ def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
 
     @app.post("/v1/chat/completions")
     async def chat(request: Request) -> Response:
-        _authenticate(request, settings)
+        principal = _authenticate(request, settings)
         content_length = request.headers.get("content-length")
         if content_length is not None:
             try:
@@ -156,11 +167,19 @@ def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
         opt_out = request.headers.get("x-shiftedx-harness", "").strip().lower() == "off"
         if opt_out and not settings.allow_harness_opt_out:
             raise ProxyError(403, "harness_opt_out_disabled", "Harness opt-out is disabled.")
+        if opt_out and not principal.policy_extensions_allowed:
+            raise ProxyError(
+                403,
+                "harness_opt_out_denied",
+                "Harness opt-out is not authorized for this principal.",
+            )
         async with _capacity(semaphore, settings.concurrency_wait_seconds):
             result = await service.complete(
                 payload,
                 dict(request.headers),
                 harness_enabled=not opt_out,
+                policy_extensions_allowed=principal.policy_extensions_allowed,
+                trusted_policy_extension_used=opt_out,
             )
         counters.observe(result)
         headers = _telemetry_headers(result, settings)
@@ -169,13 +188,29 @@ def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
     return app
 
 
-def _authenticate(request: Request, settings: Settings) -> None:
-    if settings.proxy_api_key is None:
-        return
-    expected = f"Bearer {settings.proxy_api_key.get_secret_value()}"
+@dataclass(frozen=True)
+class AuthenticatedPrincipal:
+    policy_extensions_allowed: bool = False
+
+
+def _authenticate(request: Request, settings: Settings) -> AuthenticatedPrincipal:
     supplied = request.headers.get("authorization", "")
-    if not hmac.compare_digest(supplied.encode(), expected.encode()):
+    trusted_capabilities = settings.trusted_policy_extension_keys()
+    if any(
+        hmac.compare_digest(supplied.encode(), f"Bearer {capability}".encode())
+        for capability in trusted_capabilities
+    ):
+        return AuthenticatedPrincipal(policy_extensions_allowed=True)
+    if settings.proxy_api_key is None and not trusted_capabilities:
+        return AuthenticatedPrincipal()
+    expected = (
+        f"Bearer {settings.proxy_api_key.get_secret_value()}"
+        if settings.proxy_api_key is not None
+        else ""
+    )
+    if not expected or not hmac.compare_digest(supplied.encode(), expected.encode()):
         raise ProxyError(401, "authentication_failed", "A valid proxy bearer token is required.")
+    return AuthenticatedPrincipal()
 
 
 @asynccontextmanager

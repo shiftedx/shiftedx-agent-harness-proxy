@@ -12,7 +12,13 @@ from typing import Any
 from .config import Settings, configured_roles
 from .core import HARNESS_SYSTEM_SUFFIX, AgentHarness, normalize_bare_json
 from .errors import ProxyError, UpstreamFailure
-from .transcript import Reconstruction, prepare_tools, reconstruct, response_schema_contract
+from .transcript import (
+    PolicyAnnotationError,
+    Reconstruction,
+    prepare_tools,
+    reconstruct,
+    response_schema_contract,
+)
 from .transport import Upstream
 
 JsonObject = dict[str, Any]
@@ -29,6 +35,7 @@ class PolicyTelemetry:
     policy_wall_ms: float
     receipt_projections: int = 0
     degraded_state: bool = False
+    policy_extensions_used: int = 0
 
 
 @dataclass(frozen=True)
@@ -49,6 +56,8 @@ class ChatService:
         request_headers: dict[str, str],
         *,
         harness_enabled: bool = True,
+        policy_extensions_allowed: bool = False,
+        trusted_policy_extension_used: bool = False,
     ) -> ChatResult:
         started = time.perf_counter()
         if payload.get("stream") is True:
@@ -62,21 +71,44 @@ class ChatService:
         if has_receipt_override and not isinstance(require_receipt_override, bool):
             raise ProxyError(
                 400,
-                "invalid_request",
+                "invalid_receipt_override",
                 f"{REQUIRE_RECEIPT_EXTENSION} must be a boolean when present.",
             )
+        if require_receipt_override is False and not policy_extensions_allowed:
+            raise ProxyError(
+                403,
+                "receipt_override_denied",
+                "Receipt requirements cannot be disabled by this principal.",
+            )
         try:
-            tools, roles = prepare_tools(forwarded.get("tools"), self.base_roles)
+            tools, roles, role_extension_used = prepare_tools(
+                forwarded.get("tools"),
+                self.base_roles,
+                policy_extensions_allowed=policy_extensions_allowed,
+            )
+        except PolicyAnnotationError as exc:
+            raise ProxyError(exc.status_code, exc.code, str(exc)) from exc
         except ValueError as exc:
             raise ProxyError(400, "invalid_tools", str(exc)) from exc
         if "tools" in forwarded:
             forwarded["tools"] = tools
+        policy_extension_used = (
+            trusted_policy_extension_used or role_extension_used or require_receipt_override is False
+        )
 
         if not harness_enabled:
             body = await self.upstream.chat(forwarded, request_headers)
             return ChatResult(
                 body,
-                PolicyTelemetry("off", 0, 0, 0, 1, (time.perf_counter() - started) * 1000),
+                PolicyTelemetry(
+                    "off",
+                    0,
+                    0,
+                    0,
+                    1,
+                    (time.perf_counter() - started) * 1000,
+                    policy_extensions_used=int(policy_extension_used),
+                ),
             )
         if payload.get("n", 1) != 1:
             raise ProxyError(400, "multiple_choices_not_supported", "Harness mode requires n=1.")
@@ -105,7 +137,14 @@ class ChatService:
             body = _projected_response(str(forwarded.get("model", "")), projection)
             return ChatResult(
                 body,
-                _telemetry(started, harness, 0, rebuilt, receipt_projections=1),
+                _telemetry(
+                    started,
+                    harness,
+                    0,
+                    rebuilt,
+                    receipt_projections=1,
+                    policy_extensions_used=int(policy_extension_used),
+                ),
             )
 
         working_messages = _inject_harness(copy.deepcopy(forwarded["messages"]), harness, rebuilt)
@@ -126,7 +165,16 @@ class ChatService:
                     raise UpstreamFailure("upstream_malformed_tool_calls")
                 rejected = _rejected_results(calls, harness)
                 if not rejected:
-                    return ChatResult(response, _telemetry(started, harness, upstream_calls, rebuilt))
+                    return ChatResult(
+                        response,
+                        _telemetry(
+                            started,
+                            harness,
+                            upstream_calls,
+                            rebuilt,
+                            policy_extensions_used=int(policy_extension_used),
+                        ),
+                    )
                 if internal_retries >= self.settings.max_internal_retries:
                     break
                 internal_retries += 1
@@ -155,7 +203,16 @@ class ChatService:
                 content = normalized
             issue = harness.terminal_issue(content)
             if issue is None:
-                return ChatResult(response, _telemetry(started, harness, upstream_calls, rebuilt))
+                return ChatResult(
+                    response,
+                    _telemetry(
+                        started,
+                        harness,
+                        upstream_calls,
+                        rebuilt,
+                        policy_extensions_used=int(policy_extension_used),
+                    ),
+                )
             if harness.terminal_corrections >= 2 or internal_retries >= self.settings.max_internal_retries:
                 break
             internal_retries += 1
@@ -283,6 +340,7 @@ def _telemetry(
     rebuilt: Reconstruction,
     *,
     receipt_projections: int = 0,
+    policy_extensions_used: int = 0,
 ) -> PolicyTelemetry:
     return PolicyTelemetry(
         profile=self_profile(harness),
@@ -293,6 +351,7 @@ def _telemetry(
         policy_wall_ms=(time.perf_counter() - started) * 1000,
         receipt_projections=receipt_projections,
         degraded_state=rebuilt.degraded,
+        policy_extensions_used=policy_extensions_used,
     )
 
 

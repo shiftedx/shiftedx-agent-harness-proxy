@@ -93,8 +93,11 @@ network is not a substitute for authentication.
 
 Default tool roles cover common names such as `apply_patch`, `run_tests`, `read_file`, and
 `file_search`. Add `"x-shiftedx-role": "mutation|verification|investigation|other"` to a tool schema
-for custom names; the proxy strips this extension before forwarding. A trusted safe-refusal case
-may send the top-level boolean `"x-shiftedx-require-receipt": false`.
+for custom names; the proxy strips this extension before forwarding. Names configured by the server
+are protected from ordinary clients. A safe-refusal or protected-role override requires a separate,
+server-configured trusted policy-extension bearer capability. `X-Shiftedx-Harness: off` additionally
+requires both that trusted capability and explicit server enablement; it is not an ordinary client
+escape hatch.
 
 See [the exact policy contract](docs/policy.md) for role configuration, receipt semantics, schema
 projection, parallel calls, and degraded transcript behavior.
@@ -107,6 +110,8 @@ projection, parallel calls, and degraded transcript behavior.
 | `UPSTREAM_BASE_URL` | host port `8000` in Compose | Fixed OpenAI-compatible `/v1` base |
 | `UPSTREAM_API_KEY` | unset | Upstream credential; Docker secret preferred |
 | `PROXY_API_KEY` | unset | Independent client-facing bearer token |
+| `TRUSTED_POLICY_EXTENSION_API_KEYS` | unset | Distinct comma-separated opaque bearer capabilities allowed to disable receipt requirements or override protected tool roles |
+| `ALLOW_HARNESS_OPT_OUT` | `false` | Allows only trusted policy-extension principals to send `X-Shiftedx-Harness: off` |
 | `MAX_INTERNAL_RETRIES` | `4` | Internal policy retries per request |
 | `MAX_UPSTREAM_CALLS` | `7` | Total upstream-call ceiling per request |
 | `UPSTREAM_TIMEOUT_SECONDS` | `120` | Upstream timeout |
