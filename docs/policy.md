@@ -44,6 +44,36 @@ sent upstream, returned downstream, and used as a scalar structured-log value.
 The credentialed upstream receives only that correlation header from the downstream header set;
 downstream authorization, cookies, `OpenAI-Organization`, and `OpenAI-Project` are never forwarded.
 
+## Admission, deadline, and overload contract
+
+After downstream authentication and before body buffering, the proxy acquires a global admission
+budget plus an authenticated-principal budget. Principal keys are opaque process-derived values from
+the configured ordinary bearer or trusted policy-extension capability; they are never sourced from
+caller IP, `user`, tenant fields, client IDs, headers, logs, or metric labels. Development,
+unauthenticated deployments and the explicit `PRINCIPAL_BUDGET_MODE=global` profile use one internal
+global budget key. Principal entries expire only when no request references them and their rate window
+is idle.
+
+`ADMISSION_LIMIT` bounds full downstream request lifetimes and `CONCURRENCY_LIMIT` bounds one
+upstream operation at a time. The monotonic `TOTAL_REQUEST_DEADLINE_SECONDS` begins before admission
+queueing and covers queueing, reading up to `MAX_REQUEST_BYTES`, validation, reconstruction, every
+retry/upstream operation, disconnect cleanup, and response construction. The deadline never resets
+for retries. A downstream disconnect cancels in-flight policy/upstream work and releases both gates.
+
+Overload has no queue-detail disclosure: admission/concurrency/rate rejection returns `429` with
+`admission_overloaded`, `principal_concurrency_limited`, or `principal_rate_limited`, respectively,
+and only the configured bounded numeric `Retry-After`. Deadline expiry returns
+`504 request_deadline_exceeded`. Upstream-operation queue timeout returns
+`503 upstream_concurrency_limited` with the same bounded hint. Metrics are aggregate prompt-free counters for admission/rate
+rejection, deadline expiry, and cancellation; active/queued downstream work and active upstream work
+are gauges without principal labels.
+
+`SERVER_CONNECTION_LIMIT` and `SERVER_BACKLOG` are process-fixed Uvicorn parsed-request task and
+pending-socket limits. The parsed-request limit does not bound slow-header sockets before HTTP parsing;
+only the parsed-request limit reserves management-route headroom. A trusted ingress must separately
+apply finite accepted-connection, header-read, and slow-client limits. Application admission never
+claims to bound sockets that have not reached the ASGI application.
+
 ## Cache namespace controls
 
 Generic v1 upstreams run with `UPSTREAM_CACHE_CAPABILITY_MODE=disabled` by default. The only other

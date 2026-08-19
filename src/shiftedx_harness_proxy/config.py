@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import re
 from pathlib import Path
 from typing import Any, Literal
@@ -45,6 +47,16 @@ class Settings(BaseSettings):
     upstream_timeout_seconds: float = Field(default=120.0, gt=0, le=3600)
     max_request_bytes: int = Field(default=2_000_000, ge=1024, le=100_000_000)
     max_upstream_response_bytes: int = Field(default=10_000_000, ge=1024, le=500_000_000)
+    server_connection_limit: int = Field(default=24, ge=1, le=100_000)
+    server_backlog: int = Field(default=128, ge=1, le=100_000)
+    admission_limit: int = Field(default=16, ge=1, le=10_000)
+    admission_wait_seconds: float = Field(default=1.0, gt=0, le=60)
+    total_request_deadline_seconds: float = Field(default=180.0, gt=0, le=3600)
+    principal_budget_mode: Literal["authenticated", "global"] = "authenticated"
+    principal_concurrency_limit: int = Field(default=4, ge=1, le=10_000)
+    principal_rate_limit: int = Field(default=60, ge=1, le=100_000)
+    principal_rate_window_seconds: float = Field(default=60.0, gt=0, le=3600)
+    overload_retry_after_seconds: int = Field(default=1, ge=0, le=3600)
     concurrency_limit: int = Field(default=32, ge=1, le=10_000)
     concurrency_wait_seconds: float = Field(default=1.0, gt=0, le=60)
     telemetry_enabled: bool = False
@@ -106,6 +118,8 @@ class Settings(BaseSettings):
     def validate_production_profile(self) -> Settings:
         if self.deployment_profile == "production" and self.proxy_api_key is None:
             raise ValueError("DEPLOYMENT_PROFILE=production requires PROXY_API_KEY")
+        if self.server_connection_limit <= self.admission_limit:
+            raise ValueError("SERVER_CONNECTION_LIMIT must exceed ADMISSION_LIMIT for management headroom")
         if self.proxy_api_key is not None and any(
             self.proxy_api_key.get_secret_value() == capability
             for capability in self.trusted_policy_extension_keys()
@@ -138,6 +152,15 @@ class Settings(BaseSettings):
     def cache_namespace_fields(self) -> frozenset[str]:
         """Return the process-fixed normalized client namespace denylist."""
         return cache_namespace_field_names(self.upstream_cache_namespace_fields)
+
+    def principal_budget_key(self, credential: str) -> str:
+        """Return an opaque, process-derived budget key without retaining the credential."""
+        key = (
+            self.proxy_api_key.get_secret_value().encode()
+            if self.proxy_api_key is not None
+            else b"shiftedx-admission-development"
+        )
+        return hmac.new(key, credential.encode(), hashlib.sha256).hexdigest()
 
 
 def _csv(value: str) -> list[str]:
