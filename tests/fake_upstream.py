@@ -12,6 +12,9 @@ async def models() -> dict[str, Any]:
 
 @app.post("/v1/chat/completions")
 async def chat(payload: dict[str, Any]) -> dict[str, Any]:
+    content = "fake upstream ready"
+    if payload.get("model") == "oversized-response":
+        content = "x" * 4096
     return {
         "id": "chatcmpl-fake",
         "object": "chat.completion",
@@ -20,7 +23,7 @@ async def chat(payload: dict[str, Any]) -> dict[str, Any]:
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": "fake upstream ready"},
+                "message": {"role": "assistant", "content": content},
                 "finish_reason": "stop",
             }
         ],

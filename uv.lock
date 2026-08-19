@@ -452,6 +452,7 @@ source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "pyyaml" },
     { name = "starlette" },
@@ -472,6 +473,7 @@ requires-dist = [
     { name = "fastapi", specifier = "==0.141.1" },
     { name = "httpx", specifier = "==0.28.1" },
     { name = "mypy", marker = "extra == 'dev'", specifier = "==1.17.1" },
+    { name = "pydantic", specifier = "==2.13.4" },
     { name = "pydantic-settings", specifier = "==2.10.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = "==8.4.1" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = "==1.1.0" },
