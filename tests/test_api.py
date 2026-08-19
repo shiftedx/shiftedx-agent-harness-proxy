@@ -47,6 +47,7 @@ async def test_http_surface_auth_health_streaming_and_unknown_request_passthroug
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
             assert (await client.get("/healthz")).status_code == 200
             assert (await client.post("/v1/chat/completions", json={})).status_code == 401
+            assert (await client.get("/v1/models")).status_code == 401
             headers = {"Authorization": "Bearer downstream-secret"}
             streamed = await client.post(
                 "/v1/chat/completions",

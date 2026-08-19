@@ -1,0 +1,16 @@
+services:
+  proxy:
+    environment:
+      DEPLOYMENT_PROFILE: "production"
+      UPSTREAM_BASE_URL: "${UPSTREAM_BASE_URL:?Set UPSTREAM_BASE_URL to the explicit fixed upstream /v1 URL}"
+      TELEMETRY_ENABLED: "true"
+    secrets:
+      - proxy_api_key
+    user: "10001:10001"
+    cpus: 1.0
+    mem_limit: 512m
+    stop_grace_period: 20s
+
+secrets:
+  proxy_api_key:
+    file: "${PROXY_API_KEY_FILE:-./secrets/proxy_api_key.txt}"

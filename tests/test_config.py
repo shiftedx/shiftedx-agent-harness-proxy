@@ -13,6 +13,36 @@ def test_upstream_url_is_process_fixed_and_rejects_embedded_credentials() -> Non
         Settings(upstream_base_url="http://secret@model:8000/v1")
 
 
+def test_production_profile_requires_nonempty_well_formed_proxy_credentials() -> None:
+    with pytest.raises(ValidationError, match="requires PROXY_API_KEY"):
+        Settings(upstream_base_url="http://model:8000/v1", deployment_profile="production")
+    with pytest.raises(ValidationError, match="non-empty visible ASCII bearer token"):
+        Settings(
+            upstream_base_url="http://model:8000/v1",
+            deployment_profile="production",
+            proxy_api_key="",
+        )
+    with pytest.raises(ValidationError, match="visible ASCII bearer token"):
+        Settings(
+            upstream_base_url="http://model:8000/v1",
+            deployment_profile="production",
+            proxy_api_key="malformed token",
+        )
+    with pytest.raises(ValidationError, match="upstream_base_url"):
+        Settings(deployment_profile="production", proxy_api_key="valid-token")
+
+
+def test_production_profile_loads_file_mounted_proxy_credentials(tmp_path: Path) -> None:
+    (tmp_path / "proxy_api_key").write_text("file-mounted-secret")
+    settings = Settings(
+        upstream_base_url="http://model:8000/v1",
+        deployment_profile="production",
+        _secrets_dir=tmp_path,
+    )
+    assert settings.proxy_api_key is not None
+    assert settings.proxy_api_key.get_secret_value() == "file-mounted-secret"
+
+
 def test_yaml_roles_load_and_environment_style_values_override(tmp_path: Path) -> None:
     config = tmp_path / "harness.yaml"
     config.write_text(

@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import yaml
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .core import HARNESS_PROFILE, ToolRoles
@@ -19,11 +19,15 @@ class Settings(BaseSettings):
         case_sensitive=False,
         secrets_dir="/run/secrets" if Path("/run/secrets").is_dir() else None,
         extra="ignore",
+        hide_input_in_errors=True,
     )
 
+    deployment_profile: Literal["development", "production"] = "development"
     upstream_base_url: str
     upstream_api_key: SecretStr | None = None
     proxy_api_key: SecretStr | None = None
+    listen_host: str = "0.0.0.0"  # noqa: S104 - container listener; Compose controls host exposure
+    listen_port: int = Field(default=8090, ge=1, le=65535)
     harness_profile: str = HARNESS_PROFILE
     harness_config_file: Path | None = None
     mutation_tools: str | None = None
@@ -59,6 +63,22 @@ class Settings(BaseSettings):
         if value != HARNESS_PROFILE:
             raise ValueError(f"Only HARNESS_PROFILE={HARNESS_PROFILE} is supported")
         return value
+
+    @field_validator("proxy_api_key")
+    @classmethod
+    def validate_proxy_api_key(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        secret = value.get_secret_value()
+        if not secret or any(not 33 <= ord(character) <= 126 for character in secret):
+            raise ValueError("PROXY_API_KEY must be a non-empty visible ASCII bearer token")
+        return value
+
+    @model_validator(mode="after")
+    def validate_production_profile(self) -> Settings:
+        if self.deployment_profile == "production" and self.proxy_api_key is None:
+            raise ValueError("DEPLOYMENT_PROFILE=production requires PROXY_API_KEY")
+        return self
 
     @field_validator("log_level")
     @classmethod

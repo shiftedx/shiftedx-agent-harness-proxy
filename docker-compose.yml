@@ -4,8 +4,9 @@ services:
       context: .
     image: shiftedx-agent-harness-proxy:local
     ports:
-      - "8090:8090"
+      - "127.0.0.1:8090:8090"
     environment:
+      DEPLOYMENT_PROFILE: "development"
       UPSTREAM_BASE_URL: "${UPSTREAM_BASE_URL:-http://host.docker.internal:8000/v1}"
       HARNESS_PROFILE: "shiftedx-harness-v1"
       TELEMETRY_ENABLED: "true"
