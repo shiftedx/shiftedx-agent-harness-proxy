@@ -26,6 +26,13 @@ an evaluation adapter, not benchmark or proxy policy derived from expected answe
 `--proxy-policy` only for the proxy endpoint. The benchmark runner's control profile remains
 `baseline` in both treatments so policy is not applied twice.
 
+Pass authenticated proxy credentials with `--api-key-file`; never put a bearer value directly in
+the command line. If the benchmark client cannot obtain a response (for example, a bounded proxy
+`502`), the runner writes a failed row with only the exception type, HTTP status when available,
+elapsed time, and the ordinary request hash, then continues in fixed case order. It does not copy
+the response body into that row. A transport failure is therefore counted instead of aborting the
+trial or disappearing from the report.
+
 The public ledger has one row per trial, profile, and cache lane. Each row records the immutable
 proxy/model/runtime contract; passed/total cases; emitted and dispatched calls; blocked duplicate
 and stall counts; corrections; projections; upstream-model usage; wall time; TTFT; and weighted
