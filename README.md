@@ -4,16 +4,19 @@ A small, stateless policy proxy for OpenAI-compatible Chat Completions. It block
 stalled tool calls, requires verification after mutations, and corrects malformed terminal JSON
 within fixed retry limits. It never executes tools or changes model weights.
 
-## Start with one Docker command
+## Local development
 
 Prerequisites: Docker Compose and an OpenAI-compatible model server listening on host port `8000`.
+The default Compose file is development-only: it permits unauthenticated clients, selects the local
+upstream default, and publishes the service only on host loopback.
 
 ```bash
 docker compose up --build -d
 ```
 
-That builds the local image and exposes the proxy at `http://localhost:8090/v1`. It works on Docker
-Desktop and Linux; the supplied Compose file maps `host.docker.internal` appropriately.
+That builds the local image and exposes the proxy at `http://127.0.0.1:8090/v1`. It works on Docker
+Desktop and Linux; the supplied Compose file maps `host.docker.internal` appropriately. Do not use
+this profile on a shared host or route it from a public ingress.
 
 Check it:
 
@@ -37,7 +40,7 @@ Point any non-streaming OpenAI-compatible client at `http://localhost:8090/v1`:
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8090/v1", api_key="unused")
+client = OpenAI(base_url="http://127.0.0.1:8090/v1", api_key="development-only")
 response = client.chat.completions.create(
     model="served-model-id",
     messages=[{"role": "user", "content": "Inspect the project and report status."}],
@@ -49,20 +52,35 @@ Clients must send the complete visible conversation on every request, including 
 IDs and their later matching `role=tool` results. Version 1 rejects `stream=true` and requires
 `n=1` while the harness is enabled.
 
-## Authentication
+## Authenticated production profile
 
-For an authenticated upstream and proxy, create ignored Docker secrets and use the secure override:
+Production mode refuses to start without a valid downstream bearer token and an explicit fixed
+upstream URL. Create ignored, newline-free Docker secret files, then apply the production override:
 
 ```bash
-install -m 600 /dev/null secrets/upstream_api_key.txt
 install -m 600 /dev/null secrets/proxy_api_key.txt
-printf '%s' "$MODEL_SERVER_KEY" > secrets/upstream_api_key.txt
 printf '%s' "$CLIENT_PROXY_KEY" > secrets/proxy_api_key.txt
-docker compose -f docker-compose.yml -f docker-compose.secrets.yml up --build -d
+UPSTREAM_BASE_URL=http://host.docker.internal:8000/v1 \
+  docker compose -f docker-compose.yml -f docker-compose.production.yml up --build -d
 ```
 
 Clients must use `CLIENT_PROXY_KEY` as their bearer token in this mode.
 Downstream credentials, cookies, and arbitrary forwarding headers are never sent upstream.
+If the fixed upstream also requires authentication, create `secrets/upstream_api_key.txt` with
+`printf '%s' "$MODEL_SERVER_KEY"` and add `-f docker-compose.secrets.yml` to the command.
+
+The merged production configuration keeps the host publication on `127.0.0.1:8090`, runs as the
+image's non-root user with a read-only filesystem, drops every capability, enables
+`no-new-privileges`, and applies finite PID, CPU, and memory limits. A trusted same-host ingress may
+proxy the public `/v1/models` and `/v1/chat/completions` routes to that loopback listener and must
+provide TLS. Do not publish port 8090 directly. `/healthz`, `/readyz`, and `/metrics` share the
+internal listener; the profile does not create a separate management socket, so the ingress must
+not route those endpoints publicly. `/healthz` remains unauthenticated for liveness, `/readyz`
+reports upstream readiness, and `/metrics` requires the proxy bearer token.
+
+For a trusted internal deployment, retain downstream bearer authentication and expose the service
+only through a private network policy. The production startup requirements still apply; an internal
+network is not a substitute for authentication.
 
 ## What the policy does
 
@@ -85,6 +103,7 @@ projection, parallel calls, and degraded transcript behavior.
 
 | Variable | Default | Purpose |
 |---|---:|---|
+| `DEPLOYMENT_PROFILE` | `development` | `production` fails closed unless downstream authentication is configured |
 | `UPSTREAM_BASE_URL` | host port `8000` in Compose | Fixed OpenAI-compatible `/v1` base |
 | `UPSTREAM_API_KEY` | unset | Upstream credential; Docker secret preferred |
 | `PROXY_API_KEY` | unset | Independent client-facing bearer token |
@@ -96,8 +115,9 @@ projection, parallel calls, and degraded transcript behavior.
 | `METRICS_ENABLED` | `true` | Prompt-free counters at `/metrics` |
 
 The container runs as UID/GID `10001:10001`, needs no writable volume, drops all capabilities, and
-uses a read-only filesystem in Compose. Keep TLS, authentication, and network access control at a
-trusted ingress for public deployments. See [SECURITY.md](SECURITY.md) and the
+uses a read-only filesystem in Compose. The production override also provides finite CPU, memory,
+and PID limits. Keep TLS, authentication, and network access control at a trusted ingress for public
+deployments. See [SECURITY.md](SECURITY.md) and the
 [architecture decision](docs/adr/0001-standalone-stateless-proxy.md).
 
 ## Development and evidence
