@@ -6,6 +6,8 @@ import asyncio
 import hmac
 import json
 import logging
+import re
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -20,6 +22,7 @@ from .service import ChatResult, ChatService
 from .transport import HttpxUpstream, Upstream
 
 LOGGER = logging.getLogger("shiftedx_harness_proxy")
+_SAFE_CORRELATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
 @dataclass
@@ -91,7 +94,7 @@ def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
         )
 
     @app.exception_handler(ProxyError)
-    async def proxy_error_handler(_request: Request, exc: ProxyError) -> JSONResponse:
+    async def proxy_error_handler(request: Request, exc: ProxyError) -> JSONResponse:
         counters.errors += 1
         if exc.code in {
             "receipt_override_denied",
@@ -99,10 +102,13 @@ def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
             "harness_opt_out_denied",
         }:
             counters.policy_extension_denials += 1
-        LOGGER.warning("proxy_request_failed code=%s", exc.code)
+        correlation_id = getattr(request.state, "correlation_id", None) or _new_correlation_id(request)
+        LOGGER.warning("proxy_request_failed code=%s correlation_id=%s", exc.code, correlation_id)
+        headers = {"X-Request-ID": correlation_id, **exc.headers}
         return JSONResponse(
             status_code=exc.status_code,
             content={"error": {"message": exc.message, "type": "shiftedx_proxy_error", "code": exc.code}},
+            headers=headers,
         )
 
     @app.get("/healthz")
@@ -133,13 +139,15 @@ def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
 
     @app.get("/v1/models")
     async def models(request: Request) -> Response:
+        correlation_id = _set_correlation_id(request)
         _authenticate(request, settings)
         async with _capacity(semaphore, settings.concurrency_wait_seconds):
-            value = await transport.models(dict(request.headers))
-        return JSONResponse(value)
+            value = await transport.models(_forwarded_request_headers(request, correlation_id))
+        return JSONResponse(value, headers={"X-Request-ID": correlation_id})
 
     @app.post("/v1/chat/completions")
     async def chat(request: Request) -> Response:
+        correlation_id = _set_correlation_id(request)
         principal = _authenticate(request, settings)
         content_length = request.headers.get("content-length")
         if content_length is not None:
@@ -164,7 +172,10 @@ def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
         if not isinstance(payload, dict):
             raise ProxyError(400, "invalid_json", "Request body must be a JSON object.")
 
-        opt_out = request.headers.get("x-shiftedx-harness", "").strip().lower() == "off"
+        harness_header = request.headers.get("x-shiftedx-harness")
+        if harness_header is not None and harness_header.strip().lower() != "off":
+            raise ProxyError(400, "invalid_harness_opt_out", "X-Shiftedx-Harness supports only off.")
+        opt_out = harness_header is not None
         if opt_out and not settings.allow_harness_opt_out:
             raise ProxyError(403, "harness_opt_out_disabled", "Harness opt-out is disabled.")
         if opt_out and not principal.policy_extensions_allowed:
@@ -176,13 +187,14 @@ def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
         async with _capacity(semaphore, settings.concurrency_wait_seconds):
             result = await service.complete(
                 payload,
-                dict(request.headers),
+                _forwarded_request_headers(request, correlation_id),
                 harness_enabled=not opt_out,
                 policy_extensions_allowed=principal.policy_extensions_allowed,
                 trusted_policy_extension_used=opt_out,
             )
         counters.observe(result)
         headers = _telemetry_headers(result, settings)
+        headers["X-Request-ID"] = correlation_id
         return JSONResponse(result.body, headers=headers)
 
     return app
@@ -211,6 +223,25 @@ def _authenticate(request: Request, settings: Settings) -> AuthenticatedPrincipa
     if not expected or not hmac.compare_digest(supplied.encode(), expected.encode()):
         raise ProxyError(401, "authentication_failed", "A valid proxy bearer token is required.")
     return AuthenticatedPrincipal()
+
+
+def _new_correlation_id(request: Request) -> str:
+    candidate = request.headers.get("x-request-id", "")
+    if _SAFE_CORRELATION_ID.fullmatch(candidate):
+        return candidate
+    return f"shiftedx-{uuid.uuid4().hex}"
+
+
+def _set_correlation_id(request: Request) -> str:
+    correlation_id = _new_correlation_id(request)
+    request.state.correlation_id = correlation_id
+    return correlation_id
+
+
+def _forwarded_request_headers(request: Request, correlation_id: str) -> dict[str, str]:
+    """Forward only the proxy-owned correlation ID to the credentialed upstream."""
+    del request
+    return {"x-request-id": correlation_id}
 
 
 @asynccontextmanager

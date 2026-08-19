@@ -52,6 +52,21 @@ Clients must send the complete visible conversation on every request, including 
 IDs and their later matching `role=tool` results. Version 1 rejects `stream=true` and requires
 `n=1` while the harness is enabled.
 
+## v1 Chat Completions compatibility
+
+`POST /v1/chat/completions` supports non-streaming Chat Completions requests with a non-empty
+string `model`; an array of `system`, `user`, `assistant`, and `tool` messages; function tools; and
+unknown compatible request fields, which are retained when forwarding upstream. `stream` is an
+actual JSON boolean and only `false` is supported. While the Harness Proxy is enabled, `n` must be
+the JSON integer `1` (JSON booleans are not integers). Tool schemas, tool-call transcripts, and
+proxy-owned `x-shiftedx-*` policy extensions are validated locally before any upstream call.
+Content-part arrays must be non-empty arrays of objects with non-empty string `type` values;
+unknown well-formed part types and fields remain compatible.
+
+Version 1 does not support SSE streaming, the Responses API, Anthropic Messages, multiple choices
+in harness mode, provider-native policy controls, or verbatim upstream error responses. See the
+[policy contract](docs/policy.md#transport-and-error-contract) for the error/status matrix.
+
 ## Authenticated production profile
 
 Production mode refuses to start without a valid downstream bearer token and an explicit fixed
@@ -66,6 +81,8 @@ UPSTREAM_BASE_URL=http://host.docker.internal:8000/v1 \
 
 Clients must use `CLIENT_PROXY_KEY` as their bearer token in this mode.
 Downstream credentials, cookies, and arbitrary forwarding headers are never sent upstream.
+The proxy sends only its validated or generated `X-Request-ID` correlation ID to the credentialed
+upstream; downstream `OpenAI-Organization` and `OpenAI-Project` headers are not forwarded.
 If the fixed upstream also requires authentication, create `secrets/upstream_api_key.txt` with
 `printf '%s' "$MODEL_SERVER_KEY"` and add `-f docker-compose.secrets.yml` to the command.
 

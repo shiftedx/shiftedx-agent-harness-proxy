@@ -60,10 +60,9 @@ class ChatService:
         trusted_policy_extension_used: bool = False,
     ) -> ChatResult:
         started = time.perf_counter()
+        _validate_chat_payload(payload, harness_enabled=harness_enabled)
         if payload.get("stream") is True:
             raise ProxyError(400, "streaming_not_supported", "stream=true is not supported by this proxy version.")
-        if "messages" not in payload:
-            raise ProxyError(400, "invalid_request", "messages is required.")
 
         forwarded = copy.deepcopy(payload)
         has_receipt_override = REQUIRE_RECEIPT_EXTENSION in forwarded
@@ -110,9 +109,6 @@ class ChatService:
                     policy_extensions_used=int(policy_extension_used),
                 ),
             )
-        if payload.get("n", 1) != 1:
-            raise ProxyError(400, "multiple_choices_not_supported", "Harness mode requires n=1.")
-
         contract = response_schema_contract(forwarded.get("response_format"))
         available = {_tool_name(tool) for tool in tools}
         require_receipt = (
@@ -231,6 +227,138 @@ def _tool_name(tool: JsonObject) -> str:
     if not isinstance(function, dict) or not isinstance(function.get("name"), str):
         raise ProxyError(400, "invalid_tools", "Every tool must contain function.name.")
     return str(function["name"])
+
+
+def _validate_chat_payload(payload: JsonObject, *, harness_enabled: bool) -> None:
+    """Validate proxy-consumed Chat Completions fields before any upstream call."""
+    model = payload.get("model")
+    if not isinstance(model, str) or not model.strip():
+        raise ProxyError(400, "invalid_model", "model must be a non-empty string.")
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        raise ProxyError(400, "invalid_messages", "messages must be an array.")
+    for message in messages:
+        _validate_message(message)
+    if "stream" in payload and not isinstance(payload["stream"], bool):
+        raise ProxyError(400, "invalid_stream", "stream must be a JSON boolean.")
+    if harness_enabled and "n" in payload:
+        n = payload["n"]
+        if not isinstance(n, int) or isinstance(n, bool) or n != 1:
+            raise ProxyError(400, "multiple_choices_not_supported", "Harness mode requires n=1.")
+    if "tools" in payload:
+        _validate_tool_schemas(payload["tools"])
+    if "response_format" in payload:
+        _validate_response_format(payload["response_format"])
+
+
+def _validate_message(message: Any) -> None:
+    if not isinstance(message, dict):
+        raise ProxyError(400, "invalid_messages", "Every message must be an object.")
+    role = message.get("role")
+    if role not in {"system", "user", "assistant", "tool"}:
+        raise ProxyError(400, "invalid_messages", "Every message role must be supported by v1.")
+    content = message.get("content")
+    if role in {"system", "user", "tool"} and "content" not in message:
+        raise ProxyError(400, "invalid_messages", "System, user, and tool messages require content.")
+    if role in {"system", "user", "tool"} and not isinstance(content, str | list):
+        raise ProxyError(400, "invalid_messages", "Message content must be a string or content-part array.")
+    if role == "assistant" and content is not None and not isinstance(content, str | list):
+        raise ProxyError(400, "invalid_messages", "Assistant content must be a string, content-part array, or null.")
+    if isinstance(content, list):
+        _validate_content_parts(content)
+    if "name" in message and (not isinstance(message["name"], str) or not message["name"].strip()):
+        raise ProxyError(400, "invalid_messages", "Message name must be a non-empty string when present.")
+    if role == "tool":
+        call_id = message.get("tool_call_id")
+        if not isinstance(call_id, str) or not call_id:
+            raise ProxyError(400, "invalid_messages", "Tool messages require a non-empty tool_call_id.")
+    if "tool_calls" in message:
+        if role != "assistant" or not isinstance(message["tool_calls"], list):
+            raise ProxyError(400, "invalid_messages", "tool_calls is supported only as an assistant array.")
+        for call in message["tool_calls"]:
+            _validate_tool_call(call)
+    if role == "assistant" and not _has_usable_assistant_content(content):
+        calls = message.get("tool_calls")
+        if not isinstance(calls, list) or not calls:
+            raise ProxyError(
+                400,
+                "invalid_messages",
+                "Assistant messages require content or a non-empty valid tool_calls array.",
+            )
+
+
+def _validate_content_parts(parts: list[Any]) -> None:
+    if not parts or any(
+        not isinstance(part, dict)
+        or not isinstance(part.get("type"), str)
+        or not part["type"].strip()
+        for part in parts
+    ):
+        raise ProxyError(
+            400,
+            "invalid_messages",
+            "Content-part arrays must contain objects with non-empty string types.",
+        )
+
+
+def _has_usable_assistant_content(content: Any) -> bool:
+    if isinstance(content, str):
+        return bool(content.strip())
+    return isinstance(content, list) and bool(content)
+
+
+def _validate_tool_call(call: Any) -> None:
+    if not isinstance(call, dict):
+        raise ProxyError(400, "invalid_messages", "Every tool call must be an object.")
+    function = call.get("function")
+    if (
+        not isinstance(call.get("id"), str)
+        or not call["id"]
+        or call.get("type") != "function"
+        or not isinstance(function, dict)
+        or not isinstance(function.get("name"), str)
+        or not function["name"].strip()
+        or not isinstance(function.get("arguments"), str)
+    ):
+        raise ProxyError(400, "invalid_messages", "Assistant tool calls must be complete function calls.")
+
+
+def _validate_tool_schemas(tools: Any) -> None:
+    if not isinstance(tools, list):
+        raise ProxyError(400, "invalid_tools", "tools must be an array.")
+    for tool in tools:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        if (
+            not isinstance(tool, dict)
+            or tool.get("type") != "function"
+            or not isinstance(function, dict)
+            or not isinstance(function.get("name"), str)
+            or not function["name"].strip()
+            or ("parameters" in function and not isinstance(function["parameters"], dict))
+        ):
+            raise ProxyError(400, "invalid_tools", "Every tool must be a function schema with function.name.")
+
+
+def _validate_response_format(response_format: Any) -> None:
+    if not isinstance(response_format, dict):
+        raise ProxyError(400, "invalid_response_format", "response_format must be an object.")
+    type_name = response_format.get("type")
+    if not isinstance(type_name, str) or not type_name.strip():
+        raise ProxyError(400, "invalid_response_format", "response_format.type must be a non-empty string.")
+    if type_name != "json_schema":
+        return
+    wrapper = response_format.get("json_schema")
+    if not isinstance(wrapper, dict):
+        raise ProxyError(400, "invalid_response_format", "json_schema response_format requires an object wrapper.")
+    schema = wrapper.get("schema")
+    if not isinstance(schema, dict):
+        raise ProxyError(400, "invalid_response_format", "json_schema response_format requires an object schema.")
+    if schema.get("type") == "object" and "properties" in schema and not isinstance(schema["properties"], dict):
+        raise ProxyError(
+            400,
+            "invalid_response_format",
+            "json_schema object properties must be an object when present.",
+        )
 
 
 def _inject_harness(messages: list[Any], harness: AgentHarness, rebuilt: Reconstruction) -> list[Any]:

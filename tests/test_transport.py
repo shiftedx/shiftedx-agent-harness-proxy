@@ -74,3 +74,34 @@ async def test_timeout_is_distinct_and_headers_are_allowlisted() -> None:
     assert captured["x-request-id"] == "safe-id"
     assert "cookie" not in captured
     await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_after", ["3601", "1.5", "tomorrow"])
+async def test_unsafe_retry_after_is_not_forwarded(retry_after: str) -> None:
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(429, headers={"Retry-After": retry_after})
+        )
+    )
+    upstream = HttpxUpstream(Settings(upstream_base_url="http://upstream/v1"), client)
+    with pytest.raises(UpstreamFailure) as raised:
+        await upstream.chat({"messages": []}, {})
+    assert raised.value.status_code == 429
+    assert raised.value.code == "upstream_rate_limited"
+    assert "Retry-After" not in raised.value.headers
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_is_a_stable_transport_failure() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.RemoteProtocolError("peer disconnected", request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    upstream = HttpxUpstream(Settings(upstream_base_url="http://upstream/v1"), client)
+    with pytest.raises(UpstreamFailure) as raised:
+        await upstream.chat({"messages": []}, {})
+    assert raised.value.status_code == 502
+    assert raised.value.code == "upstream_connection_error"
+    await client.aclose()

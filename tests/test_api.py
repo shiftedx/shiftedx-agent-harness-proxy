@@ -1,3 +1,4 @@
+import logging
 from typing import Any
 
 import httpx
@@ -355,3 +356,260 @@ async def test_policy_annotation_client_errors_are_stable(
     assert response.status_code == (403 if expected_code.endswith("denied") else 400)
     assert response.json()["error"]["code"] == expected_code
     assert upstream.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "code"),
+    [
+        ({}, "invalid_model"),
+        ({"model": "", "messages": []}, "invalid_model"),
+        ({"model": "model"}, "invalid_messages"),
+        ({"model": "model", "messages": "not-an-array"}, "invalid_messages"),
+        ({"model": "model", "messages": [{"role": "unknown", "content": "x"}]}, "invalid_messages"),
+        ({"model": "model", "messages": [{"role": "user"}]}, "invalid_messages"),
+        ({"model": "model", "messages": [{"role": "user", "content": []}]}, "invalid_messages"),
+        (
+            {"model": "model", "messages": [{"role": "user", "content": ["not-an-object"]}]},
+            "invalid_messages",
+        ),
+        (
+            {"model": "model", "messages": [{"role": "user", "content": [{}]}]},
+            "invalid_messages",
+        ),
+        ({"model": "model", "messages": [{"role": "assistant", "content": None}]}, "invalid_messages"),
+        ({"model": "model", "messages": [{"role": "assistant", "tool_calls": []}]}, "invalid_messages"),
+        ({"model": "model", "messages": [], "stream": 1}, "invalid_stream"),
+        ({"model": "model", "messages": [], "n": True}, "multiple_choices_not_supported"),
+        ({"model": "model", "messages": [], "n": 2}, "multiple_choices_not_supported"),
+        ({"model": "model", "messages": [], "tools": [{"type": "function"}]}, "invalid_tools"),
+        (
+            {
+                "model": "model",
+                "messages": [],
+                "x-shiftedx-require-receipt": 1,
+            },
+            "invalid_receipt_override",
+        ),
+        ({"model": "model", "messages": [], "response_format": "json_schema"}, "invalid_response_format"),
+        (
+            {"model": "model", "messages": [], "response_format": {"type": "json_schema"}},
+            "invalid_response_format",
+        ),
+        (
+            {
+                "model": "model",
+                "messages": [],
+                "response_format": {"type": "json_schema", "json_schema": {"schema": []}},
+            },
+            "invalid_response_format",
+        ),
+        (
+            {
+                "model": "model",
+                "messages": [],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"schema": {"type": "object", "properties": []}},
+                },
+            },
+            "invalid_response_format",
+        ),
+    ],
+)
+async def test_invalid_chat_completions_fields_fail_locally(
+    payload: dict[str, Any], code: str
+) -> None:
+    upstream = EchoUpstream()
+    app = create_app(Settings(upstream_base_url="http://upstream/v1"), upstream)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client:
+            response = await client.post("/v1/chat/completions", json=payload)
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == code
+    assert upstream.requests == []
+
+
+@pytest.mark.asyncio
+async def test_invalid_harness_extension_fails_before_an_upstream_call() -> None:
+    upstream = EchoUpstream()
+    app = create_app(Settings(upstream_base_url="http://upstream/v1"), upstream)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={"X-Shiftedx-Harness": "maybe"},
+                json={"model": "model", "messages": []},
+            )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_harness_opt_out"
+    assert upstream.requests == []
+
+
+@pytest.mark.asyncio
+async def test_unknown_well_formed_content_part_and_response_format_are_preserved() -> None:
+    upstream = EchoUpstream()
+    app = create_app(Settings(upstream_base_url="http://upstream/v1"), upstream)
+    payload = {
+        "model": "model",
+        "messages": [{"role": "user", "content": [{"type": "future_input", "value": "hello"}]}],
+        "response_format": {"type": "future_format", "provider_option": {"keep": True}},
+    }
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client:
+            response = await client.post("/v1/chat/completions", json=payload)
+    assert response.status_code == 200
+    assert upstream.requests[0]["response_format"] == payload["response_format"]
+    assert upstream.requests[0]["messages"][1]["content"] == payload["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_correlation_id_is_validated_propagated_and_returned() -> None:
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(request.headers)
+        return httpx.Response(
+            200,
+            json={"id": "chatcmpl", "choices": [{"message": {"role": "assistant", "content": "ok"}}]},
+        )
+
+    settings = Settings(upstream_base_url="http://upstream/v1")
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    app = create_app(settings, HttpxUpstream(settings, mock_client))
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client:
+            safe = await client.post(
+                "/v1/chat/completions",
+                headers={"X-Request-ID": "client.trace-1"},
+                json={"model": "model", "messages": []},
+            )
+            unsafe = await client.post(
+                "/v1/chat/completions",
+                headers={"X-Request-ID": "not safe"},
+                json={"model": "model", "messages": []},
+            )
+    await mock_client.aclose()
+    assert safe.headers["x-request-id"] == "client.trace-1"
+    assert unsafe.headers["x-request-id"].startswith("shiftedx-")
+    assert captured["x-request-id"] == unsafe.headers["x-request-id"]
+
+
+@pytest.mark.asyncio
+async def test_only_proxy_correlation_header_reaches_credentialed_upstream() -> None:
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(request.headers)
+        return httpx.Response(
+            200,
+            json={"id": "chatcmpl", "choices": [{"message": {"role": "assistant", "content": "ok"}}]},
+        )
+
+    settings = Settings(upstream_base_url="http://upstream/v1", upstream_api_key=SecretStr("upstream-key"))
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    app = create_app(settings, HttpxUpstream(settings, mock_client))
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer downstream-key",
+                    "Cookie": "private=value",
+                    "OpenAI-Organization": "org-downstream",
+                    "OpenAI-Project": "proj-downstream",
+                    "X-Request-ID": "client.trace-1",
+                },
+                json={"model": "model", "messages": []},
+            )
+    await mock_client.aclose()
+    assert response.status_code == 200
+    assert captured["authorization"] == "Bearer upstream-key"
+    assert captured["x-request-id"] == "client.trace-1"
+    assert "cookie" not in captured
+    assert "openai-organization" not in captured
+    assert "openai-project" not in captured
+
+
+@pytest.mark.asyncio
+async def test_invalid_correlation_id_is_not_emitted_as_log_structure(caplog: pytest.LogCaptureFixture) -> None:
+    upstream = EchoUpstream()
+    app = create_app(Settings(upstream_base_url="http://upstream/v1"), upstream)
+    caplog.set_level(logging.WARNING, logger="shiftedx_harness_proxy")
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={"X-Request-ID": "not safe"},
+                json={},
+            )
+    correlation_id = response.headers["x-request-id"]
+    assert correlation_id.startswith("shiftedx-")
+    assert f"correlation_id={correlation_id}" in caplog.text
+    assert "correlation_id=not safe" not in caplog.text
+    assert upstream.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("upstream_status", "downstream_status", "code"),
+    [
+        (400, 400, "upstream_bad_request"),
+        (401, 502, "upstream_authentication_failed"),
+        (403, 502, "upstream_authentication_failed"),
+        (404, 502, "upstream_not_found"),
+        (409, 409, "upstream_conflict"),
+        (422, 422, "upstream_unprocessable"),
+        (429, 429, "upstream_rate_limited"),
+        (500, 502, "upstream_server_error"),
+    ],
+)
+async def test_upstream_statuses_are_safe_and_mapped(
+    upstream_status: int, downstream_status: int, code: str
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            upstream_status,
+            text='{"secret":"must-not-leak"}',
+            headers={
+                "Retry-After": "5",
+                "X-Request-ID": "upstream-request-1",
+                "X-RateLimit-Remaining-Requests": "4",
+                "Set-Cookie": "secret-cookie",
+            },
+        )
+
+    settings = Settings(upstream_base_url="http://upstream/v1")
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    app = create_app(settings, HttpxUpstream(settings, mock_client))
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions", json={"model": "model", "messages": []}
+            )
+    await mock_client.aclose()
+    assert response.status_code == downstream_status
+    assert response.json()["error"]["code"] == code
+    assert "must-not-leak" not in response.text
+    assert "set-cookie" not in response.headers
+    assert "authorization" not in response.headers
+    assert response.headers["x-shiftedx-upstream-request-id"] == "upstream-request-1"
+    if upstream_status == 429:
+        assert response.headers["retry-after"] == "5"
+        assert response.headers["x-shiftedx-upstream-Ratelimit-Remaining-Requests"] == "4"
+    else:
+        assert "retry-after" not in response.headers
