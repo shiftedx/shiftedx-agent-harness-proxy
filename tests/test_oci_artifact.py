@@ -39,6 +39,16 @@ def test_dockerfile_requires_the_checked_lockfile() -> None:
     assert "uv sync --locked --no-dev --no-editable" in dockerfile
 
 
+def test_smoke_uses_the_production_profile_with_a_file_mounted_credential() -> None:
+    smoke = (ROOT / "scripts/docker-smoke.sh").read_text()
+    assert 'printf \'%s\' \'smoke-proxy-key\' >"$tmpdir/secrets/proxy_api_key"' in smoke
+    assert '--mount "type=bind,src=$tmpdir/secrets,dst=/run/secrets,readonly"' in smoke
+    assert '--publish "127.0.0.1:$proxy_port:8090"' in smoke
+    assert "--env DEPLOYMENT_PROFILE=production" in smoke
+    assert '--env "UPSTREAM_BASE_URL=http://host.docker.internal:$upstream_port/v1"' in smoke
+    assert "grep --fixed-strings 'smoke-proxy-key'" in smoke
+
+
 def test_release_manifest_distinguishes_release_candidate_from_smoke_image(tmp_path: Path) -> None:
     release_digest = "sha256:" + "a" * 64
     smoke_digest = "sha256:" + "b" * 64

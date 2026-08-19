@@ -46,6 +46,7 @@ docker run --detach \
   --add-host host.docker.internal:host-gateway \
   --mount "type=bind,src=$tmpdir/secrets,dst=/run/secrets,readonly" \
   --publish "127.0.0.1:$proxy_port:8090" \
+  --env DEPLOYMENT_PROFILE=production \
   --env "UPSTREAM_BASE_URL=http://host.docker.internal:$upstream_port/v1" \
   --env MAX_UPSTREAM_RESPONSE_BYTES=1024 \
   "$image" >/dev/null
@@ -78,6 +79,10 @@ assert_hardening() {
   test "$(docker inspect --format '{{.HostConfig.NanoCpus}}' "$container")" = "1000000000"
   test "$(docker inspect --format '{{.HostConfig.Memory}}' "$container")" = "268435456"
   docker inspect --format '{{json .Mounts}}' "$container" | grep '"Destination":"/run/secrets"' >/dev/null
+}
+
+assert_secret_redaction() {
+  ! docker logs "$container" 2>&1 | grep --fixed-strings 'smoke-proxy-key' >/dev/null
 }
 
 await_status 200 "http://127.0.0.1:$proxy_port/healthz"
@@ -120,5 +125,6 @@ status="$(curl --silent --output "$tmpdir/response" --write-out '%{http_code}' \
 test "$status" = "502"
 grep 'upstream_response_too_large' "$tmpdir/response" >/dev/null
 
+assert_secret_redaction
 docker kill --signal=SIGTERM "$container" >/dev/null
 test "$(docker wait "$container")" = "0"
