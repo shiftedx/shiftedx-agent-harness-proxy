@@ -63,6 +63,16 @@ def test_ci_attests_the_oci_archive_but_can_load_the_smoke_image() -> None:
     assert "--sbom" not in smoke_build
 
 
+def test_container_job_provisions_the_frozen_fake_upstream_runner() -> None:
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+    container_job = workflow.split("  container:\n", maxsplit=1)[1]
+    setup, _ = container_job.split("      - uses: docker/setup-qemu-action", maxsplit=1)
+    assert "astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9" in setup
+    assert "uv python install 3.11" in setup
+    assert "uv lock --check" in setup
+    assert "uv sync --frozen --extra dev --python 3.11" in setup
+
+
 def test_release_manifest_distinguishes_release_candidate_from_smoke_image(tmp_path: Path) -> None:
     release_digest = "sha256:" + "a" * 64
     smoke_digest = "sha256:" + "b" * 64
