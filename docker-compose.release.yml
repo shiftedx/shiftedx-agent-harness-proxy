@@ -1,0 +1,4 @@
+services:
+  proxy:
+    image: "${PROXY_IMAGE:?Set PROXY_IMAGE to the exact approved image reference}"
+    build: !reset null

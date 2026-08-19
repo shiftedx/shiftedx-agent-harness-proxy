@@ -1,5 +1,16 @@
 # Shiftedx Agent Harness Proxy
 
+[![CI](https://github.com/shiftedx/shiftedx-agent-harness-proxy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/shiftedx/shiftedx-agent-harness-proxy/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
+**Status: v0.1 release candidate.** The supported v1 surface is implementation-complete, covered by
+213 automated tests, and verified by hardened multi-architecture image CI, dependency and image
+scanning, SBOM generation, provenance attestation, and bounded-load checks. Model-backed production
+qualification is pre-registered and requires an operator-approved model-server window; no stable
+package or container release has been promoted. See [Release status](RELEASE_STATUS.md), the
+[qualification plan](benchmark-reports/v1-qualification-plan.md), and the
+[operator runbook](docs/operator-runbook.md).
+
 A small, stateless policy proxy for OpenAI-compatible Chat Completions. It blocks repeated or
 stalled tool calls, requires verification after mutations, and corrects malformed terminal JSON
 within fixed retry limits. It never executes tools or changes model weights.
@@ -185,10 +196,14 @@ uv run mypy src
 ./scripts/docker-smoke.sh
 ```
 
-The current suite has 35 tests. Dependency and container scans found no known high/critical
-vulnerabilities, and the local multi-architecture build and hardened-container smoke test passed.
-Proxy-only timing and the deferred external comparison are documented in
-[benchmarking](docs/benchmarking.md).
+The release-candidate branch has 213 tests. CI also runs the near-body-limit admission soak,
+dependency audit, multi-architecture OCI build, hardened production-profile smoke, exact-image
+vulnerability/secret/misconfiguration scan, SBOM generation, release-manifest capture, and SLSA
+provenance attestation. The complete evidence boundary is summarized in
+[Release status](RELEASE_STATUS.md); benchmark methodology and frozen promotion gates are documented
+in [benchmarking](docs/benchmarking.md) and the
+[v1 qualification plan](benchmark-reports/v1-qualification-plan.md).
 
-This is an unreleased `0.1.0` implementation. No repository, package, or container image has been
-published; publication requires explicit owner authorization.
+This is an unreleased `0.1.0` release candidate. The source repository is suitable for review and
+evaluation, but no package or container image has been promoted as a stable public release.
+Publication and the final production decision require explicit owner authorization.

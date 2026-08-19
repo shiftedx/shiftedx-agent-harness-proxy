@@ -15,4 +15,7 @@ uv run mypy src
 ```
 
 Container changes should also pass `scripts/docker-smoke.sh` with the scripted fake upstream. A
-maintainer must explicitly authorize public release or registry publication.
+maintainer must explicitly authorize public release or registry publication. Before proposing a
+release-facing change, review [RELEASE_STATUS.md](RELEASE_STATUS.md), the
+[qualification plan](benchmark-reports/v1-qualification-plan.md), and the
+[operator runbook](docs/operator-runbook.md); do not weaken or silently move a preregistered gate.
