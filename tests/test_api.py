@@ -76,6 +76,51 @@ async def test_http_surface_auth_health_streaming_and_unknown_request_passthroug
 
 
 @pytest.mark.asyncio
+async def test_local_projection_marker_and_accounting_do_not_depend_on_telemetry_headers() -> None:
+    upstream = EchoUpstream()
+    app = create_app(Settings(upstream_base_url="http://upstream/v1", telemetry_enabled=False), upstream)
+    payload = {
+        "model": "model",
+        "messages": [
+            {"role": "user", "content": "report"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "v",
+                        "type": "function",
+                        "function": {"name": "run_tests", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "v", "content": "14 passed"},
+        ],
+        "tools": [{"type": "function", "function": {"name": "run_tests", "parameters": {}}}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "result",
+                "schema": {
+                    "type": "object",
+                    "properties": {"status": {"type": "string"}, "tests": {"type": "integer"}},
+                },
+            },
+        },
+    }
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
+            response = await client.post("/v1/chat/completions", json=payload)
+            metrics = await client.get("/metrics")
+    assert response.status_code == 200
+    assert response.json()["x-shiftedx-projection-v1"]["origin"] == "local_projection"
+    assert response.json()["usage"] == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    assert "x-shiftedx-upstream-calls" not in response.headers
+    assert upstream.requests == []
+    assert "shiftedx_proxy_receipt_projections_total 1" in metrics.text
+    assert "shiftedx_proxy_local_projection_upstream_calls_avoided_total 1" in metrics.text
+
+
+@pytest.mark.asyncio
 async def test_downstream_authorization_is_never_forwarded_upstream() -> None:
     captured: dict[str, str] = {}
 

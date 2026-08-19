@@ -3,10 +3,28 @@ import json
 from typing import Any
 
 import pytest
+from pydantic import BaseModel, ConfigDict
 
 from shiftedx_harness_proxy.config import Settings
 from shiftedx_harness_proxy.errors import ProxyError
 from shiftedx_harness_proxy.service import ChatService
+
+
+class SDKUsage(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+class ExtraIgnoringSDKCompletion(BaseModel):
+    """Representative SDK shape that ignores unknown top-level provider fields."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    object: str
+    model: str
+    usage: SDKUsage
 
 
 def call(call_id: str, name: str, arguments: str) -> dict[str, Any]:
@@ -60,13 +78,18 @@ def request(messages: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_legitimate_tool_call_is_returned_byte_for_byte() -> None:
+async def test_upstream_tool_call_cannot_spoof_projection_marker() -> None:
     proposed = completion(calls=[call("new", "read_file", '{"path":"a.py"}')])
+    proposed["x-shiftedx-projection-v1"] = {"origin": "upstream-spoof"}
+    proposed["provider_response_extension"] = {"preserve": True}
     upstream = ScriptedUpstream([proposed])
     result = await ChatService(Settings(upstream_base_url="http://upstream/v1"), upstream).complete(
         request([{"role": "user", "content": "inspect"}]), {}
     )
-    assert result.body == proposed
+    assert "x-shiftedx-projection-v1" not in result.body
+    assert result.body["provider_response_extension"] == {"preserve": True}
+    assert result.body["provider_response_extension"] is proposed["provider_response_extension"]
+    assert proposed["x-shiftedx-projection-v1"] == {"origin": "upstream-spoof"}
     assert result.telemetry.upstream_calls == 1
 
 
@@ -246,7 +269,17 @@ async def test_complete_typed_latest_receipt_projects_without_upstream_call() ->
     }
     result = await ChatService(Settings(upstream_base_url="http://upstream/v1"), upstream).complete(payload, {})
     assert result.body["choices"][0]["message"]["content"] == '{"status":"passed","tests":14}'
+    assert result.body["usage"] == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    assert result.body["x-shiftedx-projection-v1"] == {
+        "origin": "local_projection",
+        "upstream_calls": 0,
+        "upstream_model_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "client_input_tokenization": {"available": False, "tokens": None},
+    }
+    sdk_completion = ExtraIgnoringSDKCompletion.model_validate(result.body)
+    assert sdk_completion.usage.total_tokens == 0
     assert result.telemetry.receipt_projections == 1
+    assert result.telemetry.local_projection_upstream_calls_avoided == 1
     assert upstream.requests == []
 
 
@@ -285,12 +318,17 @@ async def test_controlled_opt_out_preserves_multiple_choice_requests() -> None:
             {"index": 1, "message": {"role": "assistant", "content": "b"}},
         ],
     }
+    response["x-shiftedx-projection-v1"] = {"origin": "upstream-spoof"}
+    response["provider_response_extension"] = {"preserve": True}
     upstream = ScriptedUpstream([response])
     payload = {"model": "model", "messages": [{"role": "user", "content": "answer"}], "n": 2}
     result = await ChatService(Settings(upstream_base_url="http://upstream/v1"), upstream).complete(
         payload, {}, harness_enabled=False
     )
-    assert result.body == response
+    assert "x-shiftedx-projection-v1" not in result.body
+    assert result.body["provider_response_extension"] == {"preserve": True}
+    assert result.body["provider_response_extension"] is response["provider_response_extension"]
+    assert response["x-shiftedx-projection-v1"] == {"origin": "upstream-spoof"}
     assert upstream.requests[0]["n"] == 2
 
 

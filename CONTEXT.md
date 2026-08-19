@@ -52,3 +52,8 @@ _Avoid_: Unbounded retry
 Policy state reconstructed from an incomplete or malformed public transcript, carrying reduced
 duplicate-detection guarantees.
 _Avoid_: Validated state
+
+**Local Projection**:
+A response synthesized solely from a current successful public receipt without an upstream model
+call.
+_Avoid_: Model completion, cached response
