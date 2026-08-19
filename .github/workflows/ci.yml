@@ -59,8 +59,6 @@ jobs:
           docker buildx build
           --platform linux/amd64
           --load
-          --provenance mode=max
-          --sbom=true
           --metadata-file artifacts/smoke-image-metadata.json
           --tag ${{ env.IMAGE }}
           .

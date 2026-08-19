@@ -49,6 +49,20 @@ def test_smoke_uses_the_production_profile_with_a_file_mounted_credential() -> N
     assert "grep --fixed-strings 'smoke-proxy-key'" in smoke
 
 
+def test_ci_attests_the_oci_archive_but_can_load_the_smoke_image() -> None:
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+    release_build, smoke_build = workflow.split("      - name: Load amd64 image for hardened smoke and scanning\n")
+    smoke_build, _ = smoke_build.split("      - name: Smoke loaded hardened image\n")
+    assert "--platform linux/amd64,linux/arm64" in release_build
+    assert "--provenance mode=max" in release_build
+    assert "--sbom=true" in release_build
+    assert "--platform linux/amd64" in smoke_build
+    assert "--load" in smoke_build
+    assert "--metadata-file artifacts/smoke-image-metadata.json" in smoke_build
+    assert "--provenance" not in smoke_build
+    assert "--sbom" not in smoke_build
+
+
 def test_release_manifest_distinguishes_release_candidate_from_smoke_image(tmp_path: Path) -> None:
     release_digest = "sha256:" + "a" * 64
     smoke_digest = "sha256:" + "b" * 64
