@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from shiftedx_harness_proxy.config import Settings, configured_roles
 
@@ -58,3 +58,63 @@ def test_yaml_roles_load_and_environment_style_values_override(tmp_path: Path) -
     assert roles.mutation == {"deploy"}
     assert roles.verification == {"healthcheck", "smoke"}
     assert roles.investigation == {"inspect"}
+
+
+def test_policy_extension_capabilities_are_explicit_server_configuration() -> None:
+    settings = Settings(
+        upstream_base_url="http://model/v1",
+        trusted_policy_extension_api_keys=SecretStr("extension-a, extension-b"),
+    )
+    assert settings.trusted_policy_extension_keys() == {"extension-a", "extension-b"}
+
+
+@pytest.mark.parametrize(
+    "configured_capabilities",
+    ["", "extension-a,,extension-b", "extension with space", "extension-a,second\nline"],
+)
+def test_policy_extension_capabilities_fail_closed_without_echoing_secret_values(
+    configured_capabilities: str,
+) -> None:
+    with pytest.raises(ValidationError) as raised:
+        Settings(
+            upstream_base_url="http://model/v1",
+            trusted_policy_extension_api_keys=SecretStr(configured_capabilities),
+        )
+    assert "HTTP-safe bearer tokens" in str(raised.value)
+    if configured_capabilities:
+        assert configured_capabilities not in str(raised.value)
+
+
+def test_trusted_policy_extension_capability_must_be_distinct_from_ordinary_principal() -> None:
+    ordinary_key = "ordinary-client-key"
+    with pytest.raises(ValidationError) as raised:
+        Settings(
+            upstream_base_url="http://model/v1",
+            deployment_profile="production",
+            proxy_api_key=SecretStr(ordinary_key),
+            trusted_policy_extension_api_keys=SecretStr(f"trusted-capability,{ordinary_key}"),
+        )
+    assert "must not include the ordinary PROXY_API_KEY" in str(raised.value)
+    assert ordinary_key not in str(raised.value)
+
+
+def test_production_profile_accepts_a_distinct_trusted_policy_extension_principal() -> None:
+    settings = Settings(
+        upstream_base_url="http://model/v1",
+        deployment_profile="production",
+        proxy_api_key=SecretStr("ordinary-client-key"),
+        trusted_policy_extension_api_keys=SecretStr("trusted-capability"),
+    )
+    assert settings.proxy_api_key is not None
+    assert settings.trusted_policy_extension_keys() == {"trusted-capability"}
+
+
+def test_overlapping_server_role_configuration_fails_closed() -> None:
+    with pytest.raises(ValueError, match="only one role"):
+        configured_roles(
+            Settings(
+                upstream_base_url="http://model/v1",
+                mutation_tools="deploy",
+                verification_tools="deploy",
+            )
+        )

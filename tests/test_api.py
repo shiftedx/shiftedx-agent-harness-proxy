@@ -184,3 +184,174 @@ async def test_incomplete_transcript_is_signaled_and_proxy_annotations_are_not_f
     assert response.headers["x-shiftedx-state"] == "degraded"
     assert "x-shiftedx-role" not in upstream.requests[0]["tools"][0]
     assert upstream.requests[0]["tools"][0]["vendor_extension"] == "keep"
+
+
+@pytest.mark.asyncio
+async def test_policy_extensions_require_a_server_configured_authenticated_capability() -> None:
+    upstream = EchoUpstream()
+    settings = Settings(
+        upstream_base_url="http://upstream/v1",
+        deployment_profile="production",
+        proxy_api_key=SecretStr("ordinary-client"),
+        trusted_policy_extension_api_keys=SecretStr("trusted-extension"),
+    )
+    app = create_app(settings, upstream)
+    payload = {
+        "model": "model",
+        "messages": [{"role": "user", "content": "refuse"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": "apply_patch", "parameters": {}},
+            }
+        ],
+        "x-shiftedx-require-receipt": False,
+    }
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client:
+            ordinary = await client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer ordinary-client"},
+                json=payload,
+            )
+            forged_header = await client.post(
+                "/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer ordinary-client",
+                    "X-Shiftedx-Policy-Extension": "trusted",
+                },
+                json=payload,
+            )
+            trusted = await client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer trusted-extension"},
+                json=payload,
+            )
+            metrics = await client.get("/metrics", headers={"Authorization": "Bearer ordinary-client"})
+    assert ordinary.status_code == 403
+    assert ordinary.json()["error"]["code"] == "receipt_override_denied"
+    assert forged_header.status_code == 403
+    assert trusted.status_code == 200
+    assert "x-shiftedx-require-receipt" not in upstream.requests[-1]
+    assert "shiftedx_proxy_policy_extension_allows_total 1" in metrics.text
+    assert "shiftedx_proxy_policy_extension_denials_total 2" in metrics.text
+
+
+@pytest.mark.asyncio
+async def test_harness_opt_out_requires_server_enablement_and_a_trusted_principal() -> None:
+    captured: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(dict(request.headers))
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl",
+                "choices": [
+                    {"message": {"role": "assistant", "content": "first"}},
+                    {"message": {"role": "assistant", "content": "second"}},
+                ],
+            },
+        )
+
+    settings = Settings(
+        upstream_base_url="http://upstream/v1",
+        deployment_profile="production",
+        proxy_api_key=SecretStr("ordinary-client"),
+        trusted_policy_extension_api_keys=SecretStr("trusted-extension"),
+        allow_harness_opt_out=True,
+    )
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    app = create_app(settings, HttpxUpstream(settings, mock_client))
+    payload = {"model": "model", "messages": [], "n": 2}
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client:
+            ordinary = await client.post(
+                "/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer ordinary-client",
+                    "X-Shiftedx-Harness": "off",
+                },
+                json=payload,
+            )
+            forged_header = await client.post(
+                "/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer ordinary-client",
+                    "X-Shiftedx-Harness": "off",
+                    "X-Shiftedx-Policy-Extension": "trusted",
+                },
+                json=payload,
+            )
+            assert captured == []
+            trusted = await client.post(
+                "/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer trusted-extension",
+                    "X-Shiftedx-Harness": "off",
+                },
+                json=payload,
+            )
+            metrics = await client.get("/metrics", headers={"Authorization": "Bearer ordinary-client"})
+    await mock_client.aclose()
+
+    assert ordinary.status_code == 403
+    assert ordinary.json()["error"]["code"] == "harness_opt_out_denied"
+    assert forged_header.status_code == 403
+    assert forged_header.json()["error"]["code"] == "harness_opt_out_denied"
+    assert trusted.status_code == 200
+    assert len(captured) == 1
+    assert captured[0].get("x-shiftedx-harness") is None
+    assert captured[0].get("x-shiftedx-policy-extension") is None
+    assert captured[0].get("authorization") is None
+    assert "shiftedx_proxy_policy_extension_allows_total 1" in metrics.text
+    assert "shiftedx_proxy_policy_extension_denials_total 2" in metrics.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("annotation", "expected_code"),
+    [
+        ({"x-shiftedx-role": "other"}, "protected_role_override_denied"),
+        (
+            {"x-shiftedx-role": "investigation", "name": "run_tests"},
+            "protected_role_override_denied",
+        ),
+        (
+            {
+                "x-shiftedx-role": "mutation",
+                "function_role": "verification",
+            },
+            "conflicting_role_annotation",
+        ),
+        ({"x-shiftedx-role": "not-a-role"}, "invalid_role_annotation"),
+    ],
+)
+async def test_policy_annotation_client_errors_are_stable(
+    annotation: dict[str, str], expected_code: str
+) -> None:
+    upstream = EchoUpstream()
+    app = create_app(Settings(upstream_base_url="http://upstream/v1"), upstream)
+    tool: dict[str, Any] = {
+        "type": "function",
+        "function": {"name": annotation.get("name", "apply_patch"), "parameters": {}},
+    }
+    if "x-shiftedx-role" in annotation:
+        tool["x-shiftedx-role"] = annotation["x-shiftedx-role"]
+    if "function_role" in annotation:
+        tool["function"]["x-shiftedx-role"] = annotation["function_role"]
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={"model": "model", "messages": [], "tools": [tool]},
+            )
+    assert response.status_code == (403 if expected_code.endswith("denied") else 400)
+    assert response.json()["error"]["code"] == expected_code
+    assert upstream.requests == []

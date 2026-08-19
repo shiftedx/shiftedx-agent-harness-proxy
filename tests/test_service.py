@@ -71,17 +71,31 @@ async def test_legitimate_tool_call_is_returned_byte_for_byte() -> None:
 
 
 @pytest.mark.asyncio
-async def test_request_can_declare_that_a_tool_receipt_is_not_required() -> None:
+async def test_ordinary_client_cannot_disable_the_receipt_requirement() -> None:
+    upstream = ScriptedUpstream([completion(content="refused")])
+    payload = request([{"role": "user", "content": "Do not perform the destructive action."}])
+    payload["x-shiftedx-require-receipt"] = False
+
+    with pytest.raises(ProxyError) as raised:
+        await ChatService(Settings(upstream_base_url="http://upstream/v1"), upstream).complete(payload, {})
+
+    assert raised.value.status_code == 403
+    assert raised.value.code == "receipt_override_denied"
+    assert upstream.requests == []
+
+
+@pytest.mark.asyncio
+async def test_trusted_policy_extension_can_disable_receipt_requirement_and_is_stripped() -> None:
     upstream = ScriptedUpstream([completion(content="refused")])
     payload = request([{"role": "user", "content": "Do not perform the destructive action."}])
     payload["x-shiftedx-require-receipt"] = False
 
     result = await ChatService(Settings(upstream_base_url="http://upstream/v1"), upstream).complete(
-        payload, {}
+        payload, {}, policy_extensions_allowed=True
     )
-
     assert result.body["choices"][0]["message"]["content"] == "refused"
     assert "x-shiftedx-require-receipt" not in upstream.requests[0]
+    assert result.telemetry.policy_extensions_used == 1
 
 
 @pytest.mark.asyncio
@@ -93,8 +107,34 @@ async def test_receipt_requirement_extension_must_be_boolean() -> None:
     with pytest.raises(ProxyError) as raised:
         await ChatService(Settings(upstream_base_url="http://upstream/v1"), upstream).complete(payload, {})
 
-    assert raised.value.code == "invalid_request"
+    assert raised.value.code == "invalid_receipt_override"
     assert upstream.requests == []
+
+
+@pytest.mark.asyncio
+async def test_trusted_extension_can_reclassify_a_protected_tool_only_when_authorised() -> None:
+    payload = request(
+        [
+            {"role": "user", "content": "repair"},
+            {"role": "assistant", "tool_calls": [call("m", "apply_patch", '{"patch":"x"}')]},
+            {"role": "tool", "tool_call_id": "m", "content": "Patch applied."},
+        ]
+    )
+    payload["tools"][1]["function"]["x-shiftedx-role"] = "other"
+    denied_upstream = ScriptedUpstream([])
+    with pytest.raises(ProxyError) as denied:
+        await ChatService(Settings(upstream_base_url="http://upstream/v1"), denied_upstream).complete(
+            payload, {}
+        )
+    assert denied.value.code == "protected_role_override_denied"
+
+    allowed_upstream = ScriptedUpstream([completion(content="done")])
+    result = await ChatService(Settings(upstream_base_url="http://upstream/v1"), allowed_upstream).complete(
+        payload, {}, policy_extensions_allowed=True
+    )
+    assert result.body["choices"][0]["message"]["content"] == "done"
+    assert result.telemetry.policy_extensions_used == 1
+    assert "x-shiftedx-role" not in str(allowed_upstream.requests[0]["tools"])
 
 
 @pytest.mark.asyncio

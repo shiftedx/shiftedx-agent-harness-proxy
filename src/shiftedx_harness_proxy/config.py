@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -11,6 +12,8 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .core import HARNESS_PROFILE, ToolRoles
+
+_HTTP_BEARER_TOKEN = re.compile(r"[A-Za-z0-9\-._~+/]+={0,}")
 
 
 class Settings(BaseSettings):
@@ -28,6 +31,7 @@ class Settings(BaseSettings):
     proxy_api_key: SecretStr | None = None
     listen_host: str = "0.0.0.0"  # noqa: S104 - container listener; Compose controls host exposure
     listen_port: int = Field(default=8090, ge=1, le=65535)
+    trusted_policy_extension_api_keys: SecretStr | None = None
     harness_profile: str = HARNESS_PROFILE
     harness_config_file: Path | None = None
     mutation_tools: str | None = None
@@ -74,10 +78,31 @@ class Settings(BaseSettings):
             raise ValueError("PROXY_API_KEY must be a non-empty visible ASCII bearer token")
         return value
 
+    @field_validator("trusted_policy_extension_api_keys")
+    @classmethod
+    def validate_trusted_policy_extension_api_keys(
+        cls, value: SecretStr | None
+    ) -> SecretStr | None:
+        if value is None:
+            return None
+        entries = [entry.strip() for entry in value.get_secret_value().split(",")]
+        if not entries or any(not _HTTP_BEARER_TOKEN.fullmatch(entry) for entry in entries):
+            raise ValueError(
+                "TRUSTED_POLICY_EXTENSION_API_KEYS must contain non-empty HTTP-safe bearer tokens"
+            )
+        return value
+
     @model_validator(mode="after")
     def validate_production_profile(self) -> Settings:
         if self.deployment_profile == "production" and self.proxy_api_key is None:
             raise ValueError("DEPLOYMENT_PROFILE=production requires PROXY_API_KEY")
+        if self.proxy_api_key is not None and any(
+            self.proxy_api_key.get_secret_value() == capability
+            for capability in self.trusted_policy_extension_keys()
+        ):
+            raise ValueError(
+                "TRUSTED_POLICY_EXTENSION_API_KEYS must not include the ordinary PROXY_API_KEY"
+            )
         return self
 
     @field_validator("log_level")
@@ -93,6 +118,12 @@ class Settings(BaseSettings):
 
     def allowed_origins(self) -> list[str]:
         return _csv(self.cors_allow_origins) if self.cors_allow_origins else []
+
+    def trusted_policy_extension_keys(self) -> frozenset[str]:
+        """Return opaque bearer capabilities authorized for policy extensions."""
+        if self.trusted_policy_extension_api_keys is None:
+            return frozenset()
+        return frozenset(_csv(self.trusted_policy_extension_api_keys.get_secret_value()))
 
 
 def _csv(value: str) -> list[str]:
@@ -116,7 +147,7 @@ def configured_roles(settings: Settings) -> ToolRoles:
             verification=_role_names(section, "verification", roles.verification),
             investigation=_role_names(section, "investigation", roles.investigation),
         )
-    return ToolRoles(
+    configured = ToolRoles(
         mutation=frozenset(_csv(settings.mutation_tools)) if settings.mutation_tools is not None else roles.mutation,
         verification=(
             frozenset(_csv(settings.verification_tools))
@@ -129,6 +160,8 @@ def configured_roles(settings: Settings) -> ToolRoles:
             else roles.investigation
         ),
     )
+    _validate_distinct_roles(configured)
+    return configured
 
 
 def _role_names(section: dict[str, Any], key: str, default: frozenset[str]) -> frozenset[str]:
@@ -138,3 +171,12 @@ def _role_names(section: dict[str, Any], key: str, default: frozenset[str]) -> f
     if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
         raise ValueError(f"Harness YAML roles.{key} must be a list of tool names")
     return frozenset(value)
+
+
+def _validate_distinct_roles(roles: ToolRoles) -> None:
+    assigned: set[str] = set()
+    for names in (roles.mutation, roles.verification, roles.investigation):
+        overlap = assigned & names
+        if overlap:
+            raise ValueError("Configured tool roles must assign each tool name to only one role")
+        assigned.update(names)

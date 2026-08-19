@@ -11,6 +11,8 @@ from .core import AgentHarness, ToolRoles
 
 JsonObject = dict[str, Any]
 _PRIMITIVE_TYPES = {"string", "integer", "number", "boolean"}
+_TOOL_ROLES = frozenset({"mutation", "verification", "investigation", "other"})
+_ANNOTATION_MISSING = object()
 
 
 @dataclass(frozen=True)
@@ -28,6 +30,15 @@ class Reconstruction:
     latest_result: str | None = None
 
 
+class PolicyAnnotationError(ValueError):
+    """A safe, stable client error arising from a proxy-owned annotation."""
+
+    def __init__(self, code: str, message: str, *, status_code: int = 400) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status_code = status_code
+
+
 def _tool_name(tool: JsonObject) -> str:
     function = tool.get("function")
     if not isinstance(function, dict) or not isinstance(function.get("name"), str):
@@ -37,30 +48,66 @@ def _tool_name(tool: JsonObject) -> str:
     return name
 
 
-def prepare_tools(raw_tools: Any, configured_roles: ToolRoles) -> tuple[list[JsonObject], ToolRoles]:
+def prepare_tools(
+    raw_tools: Any,
+    configured_roles: ToolRoles,
+    *,
+    policy_extensions_allowed: bool = False,
+) -> tuple[list[JsonObject], ToolRoles, bool]:
     """Strip proxy role annotations while retaining every unrelated upstream field."""
     if raw_tools is None:
-        return [], configured_roles
+        return [], configured_roles, False
     if not isinstance(raw_tools, list):
         raise ValueError("tools must be an array")
     forwarded = copy.deepcopy(raw_tools)
     roles = configured_roles
+    policy_extension_used = False
     for tool in forwarded:
         if not isinstance(tool, dict):
             raise ValueError("Every tool must be an object")
         name = _tool_name(tool)
-        top_role = tool.pop("x-shiftedx-role", None)
+        top_role = tool.pop("x-shiftedx-role", _ANNOTATION_MISSING)
         function = tool.get("function")
         assert isinstance(function, dict)
-        function_role = function.pop("x-shiftedx-role", None)
+        function_role = function.pop("x-shiftedx-role", _ANNOTATION_MISSING)
+        top_role = _annotation_role(top_role)
+        function_role = _annotation_role(function_role)
         if top_role is not None and function_role is not None and top_role != function_role:
-            raise ValueError(f"Conflicting x-shiftedx-role annotations for {name}")
+            raise PolicyAnnotationError(
+                "conflicting_role_annotation",
+                "Top-level and function x-shiftedx-role annotations must agree.",
+            )
         role = function_role if function_role is not None else top_role
         if role is not None:
-            if not isinstance(role, str):
-                raise ValueError(f"x-shiftedx-role for {name} must be a string")
-            roles = roles.with_annotation(name, role.strip().lower())
-    return forwarded, roles
+            protected_role = configured_roles.configured_role(name)
+            if protected_role is not None and role != protected_role:
+                if not policy_extensions_allowed:
+                    raise PolicyAnnotationError(
+                        "protected_role_override_denied",
+                        "A server-configured tool role cannot be changed by this principal.",
+                        status_code=403,
+                    )
+                policy_extension_used = True
+            if protected_role is None or role != protected_role:
+                roles = roles.with_annotation(name, role)
+    return forwarded, roles, policy_extension_used
+
+
+def _annotation_role(value: Any) -> str | None:
+    if value is _ANNOTATION_MISSING:
+        return None
+    if not isinstance(value, str):
+        raise PolicyAnnotationError(
+            "invalid_role_annotation",
+            "x-shiftedx-role must be a supported string when present.",
+        )
+    role = value.strip().lower()
+    if role not in _TOOL_ROLES:
+        raise PolicyAnnotationError(
+            "invalid_role_annotation",
+            "x-shiftedx-role must be a supported string when present.",
+        )
+    return role
 
 
 def response_schema_contract(response_format: Any) -> SchemaContract:
