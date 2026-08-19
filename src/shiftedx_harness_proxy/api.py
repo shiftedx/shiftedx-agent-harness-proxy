@@ -34,6 +34,7 @@ class Counters:
     blocked_stalls: int = 0
     correction_turns: int = 0
     receipt_projections: int = 0
+    local_projection_upstream_calls_avoided: int = 0
     errors: int = 0
     policy_extension_allows: int = 0
     policy_extension_denials: int = 0
@@ -47,6 +48,7 @@ class Counters:
         self.blocked_stalls += telemetry.blocked_stalls
         self.correction_turns += telemetry.corrections
         self.receipt_projections += telemetry.receipt_projections
+        self.local_projection_upstream_calls_avoided += telemetry.local_projection_upstream_calls_avoided
         self.policy_extension_allows += telemetry.policy_extensions_used
 
     def render(self) -> str:
@@ -57,6 +59,9 @@ class Counters:
             "shiftedx_proxy_blocked_stalls_total": self.blocked_stalls,
             "shiftedx_proxy_correction_turns_total": self.correction_turns,
             "shiftedx_proxy_receipt_projections_total": self.receipt_projections,
+            "shiftedx_proxy_local_projection_upstream_calls_avoided_total": (
+                self.local_projection_upstream_calls_avoided
+            ),
             "shiftedx_proxy_errors_total": self.errors,
             "shiftedx_proxy_policy_extension_allows_total": self.policy_extension_allows,
             "shiftedx_proxy_policy_extension_denials_total": self.policy_extension_denials,

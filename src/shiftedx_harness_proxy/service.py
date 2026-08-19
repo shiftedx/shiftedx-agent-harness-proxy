@@ -17,6 +17,7 @@ from .cache_policy import (
 from .config import Settings, configured_roles
 from .core import HARNESS_SYSTEM_SUFFIX, AgentHarness, normalize_bare_json
 from .errors import ProxyError, UpstreamFailure
+from .projection_accounting import LOCAL_PROJECTION_EXTENSION, local_projection_accounting
 from .transcript import (
     PolicyAnnotationError,
     Reconstruction,
@@ -39,6 +40,7 @@ class PolicyTelemetry:
     upstream_calls: int
     policy_wall_ms: float
     receipt_projections: int = 0
+    local_projection_upstream_calls_avoided: int = 0
     degraded_state: bool = False
     policy_extensions_used: int = 0
 
@@ -116,7 +118,7 @@ class ChatService:
         )
 
         if not harness_enabled:
-            body = await self.upstream.chat(forwarded, request_headers)
+            body = _without_reserved_projection_marker(await self.upstream.chat(forwarded, request_headers))
             return ChatResult(
                 body,
                 PolicyTelemetry(
@@ -159,6 +161,7 @@ class ChatService:
                     0,
                     rebuilt,
                     receipt_projections=1,
+                    local_projection_upstream_calls_avoided=1,
                     policy_extensions_used=int(policy_extension_used),
                 ),
             )
@@ -182,7 +185,7 @@ class ChatService:
                 rejected = _rejected_results(calls, harness)
                 if not rejected:
                     return ChatResult(
-                        response,
+                        _without_reserved_projection_marker(response),
                         _telemetry(
                             started,
                             harness,
@@ -220,7 +223,7 @@ class ChatService:
             issue = harness.terminal_issue(content)
             if issue is None:
                 return ChatResult(
-                    response,
+                    _without_reserved_projection_marker(response),
                     _telemetry(
                         started,
                         harness,
@@ -478,7 +481,15 @@ def _projected_response(model: str, content: str) -> JsonObject:
             }
         ],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        LOCAL_PROJECTION_EXTENSION: local_projection_accounting(),
     }
+
+
+def _without_reserved_projection_marker(response: JsonObject) -> JsonObject:
+    """Reserve the proxy-owned marker so an upstream cannot spoof Local Projection."""
+    sanitized = dict(response)
+    sanitized.pop(LOCAL_PROJECTION_EXTENSION, None)
+    return sanitized
 
 
 def _telemetry(
@@ -488,6 +499,7 @@ def _telemetry(
     rebuilt: Reconstruction,
     *,
     receipt_projections: int = 0,
+    local_projection_upstream_calls_avoided: int = 0,
     policy_extensions_used: int = 0,
 ) -> PolicyTelemetry:
     return PolicyTelemetry(
@@ -498,6 +510,7 @@ def _telemetry(
         upstream_calls=upstream_calls,
         policy_wall_ms=(time.perf_counter() - started) * 1000,
         receipt_projections=receipt_projections,
+        local_projection_upstream_calls_avoided=local_projection_upstream_calls_avoided,
         degraded_state=rebuilt.degraded,
         policy_extensions_used=policy_extensions_used,
     )

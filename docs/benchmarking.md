@@ -11,8 +11,9 @@ For each of at least three complete trials:
 3. Run the harness profile through this proxy with complete client transcripts and streaming off.
 4. Preserve raw transcripts privately. Publish only sanitized per-case and aggregate ledgers.
 5. Report cases passed/total, emitted/dispatched calls, blocked duplicate/stall counts,
-   corrections, projections, prompt/completion tokens, wall time, weighted decode throughput,
-   and upstream calls per downstream request.
+   corrections, projections, **upstream-model** prompt/completion tokens, wall time, weighted
+   decode throughput, and upstream calls per downstream request. Report client-input tokenization
+   separately only when it is actually available; a Local Projection never estimates it.
 6. Measure proxy-only processing latency around a scripted upstream and report p50/p95 separately
    from network and inference. The initial reference target is p95 under 15 ms, subject to measured
    revision rather than marketing claims.
@@ -34,6 +35,20 @@ Use a table like this for each profile and trial:
 
 Do not publish a benchmark report with missing trials, mismatched revisions, private prompts/raw
 model outputs, host paths, API keys, or holdout artifacts.
+
+`scripts/run_paired_agentic_trial.py` writes benchmark-source output and must remain private: it is
+not a public export or a sanitizer. To publish only Local Projection accounting from a private JSON
+array of **proxy-normalized** completion records, use the separate allowlist-only path:
+
+```bash
+uv run scripts/summarize_public_projection_accounting.py \
+  --completion-records benchmark-reports/private/completions.json \
+  --output benchmark-reports/public-projection-summary.json
+```
+
+The summary retains only record count, Local Projection count, avoided immediate upstream calls,
+zero upstream-model usage, and unavailable client-input tokenization. It never copies prompt
+content, tenant identifiers, transcripts, model names, arbitrary response fields, or credentials.
 
 The latest scripted proxy-only measurement is stored in
 [`benchmark-reports/proxy-overhead-2026-08-18.json`](../benchmark-reports/proxy-overhead-2026-08-18.json).

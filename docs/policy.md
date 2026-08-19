@@ -131,6 +131,37 @@ The proxy reads standard `response_format.json_schema`. Version 1 supports exact
 values, override failed verification, or project nested schemas. The narrow successful verifier
 receipt `N passed` can project into exactly `{status: string, tests: integer}`.
 
+### Local projection accounting
+
+A locally projected completion is a standard `chat.completion` response with an always-present
+top-level extension:
+
+```json
+"x-shiftedx-projection-v1": {
+  "origin": "local_projection",
+  "upstream_calls": 0,
+  "upstream_model_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+  "client_input_tokenization": {"available": false, "tokens": null}
+}
+```
+
+Its standard `usage` object has the same three zero counts. These are exact **upstream model**
+usage: no upstream call or model token occurred. They do not tokenize, estimate, or otherwise account
+for client-visible input; that value is explicitly unavailable. SDKs that ignore unknown top-level
+fields retain the ordinary completion shape, while extension-aware clients can distinguish the origin
+without inspecting content or telemetry headers. Ordinary upstream completions have no marker.
+`x-shiftedx-projection-v1` is reserved to the proxy: it is removed from every upstream-origin
+completion before release, so an upstream cannot spoof a Local Projection. Other compatible unknown
+upstream fields remain unchanged.
+
+For accounting, count downstream requests, upstream calls, upstream model tokens, and client-input
+tokenization separately. A local projection counts as one downstream request, zero upstream calls,
+zero upstream model tokens, and unavailable client-input tokenization. Metrics expose
+`shiftedx_proxy_receipt_projections_total` and
+`shiftedx_proxy_local_projection_upstream_calls_avoided_total`; each increments once per local
+projection, representing one immediate upstream request avoided. Neither counter is a billing,
+tenant, prompt, or transcript record.
+
 Requests containing tools require a paired tool receipt by default. Only a request authenticated as
 the configured trusted policy-extension principal can set the proxy-owned top-level boolean
 `x-shiftedx-require-receipt` to `false`; ordinary clients receive
