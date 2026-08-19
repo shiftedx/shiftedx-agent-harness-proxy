@@ -8,6 +8,42 @@ expected benchmark answers, hidden tests, required-call sets, grader results, ho
 private evaluation artifacts. The upstream URL is fixed at process start. The proxy never executes
 a tool or fabricates a successful receipt.
 
+## Transport and error contract
+
+The v1 surface is `/v1/models` and non-streaming `/v1/chat/completions`. The Chat Completions
+boundary validates a non-empty string `model`, an array of supported message shapes (`system`,
+`user`, `assistant`, and `tool`), function tools, and proxy-owned policy extensions before an
+upstream request. It preserves unrelated compatible JSON fields. `stream` must be a JSON boolean
+and `true` is rejected; with the harness enabled, `n` must be the JSON integer `1`, never a boolean.
+Content-part arrays must be non-empty arrays of objects with non-empty string `type` values, while
+unknown well-formed part types and fields are preserved. An assistant must have usable content or a
+non-empty valid function tool-call array. For `response_format.type=json_schema`, the wrapper and
+schema must be objects; object `properties`, when present, must also be an object. Well-formed
+schemas outside the v1 projection subset are forwarded without projection.
+
+Upstream response bodies are never returned. The stable mapping is:
+
+| Upstream condition | Downstream status and code |
+|---|---|
+| 400 | `400 upstream_bad_request` |
+| 401 or 403 | `502 upstream_authentication_failed` |
+| 404 | `502 upstream_not_found` |
+| 409 | `409 upstream_conflict` |
+| 422 | `422 upstream_unprocessable` |
+| 429 | `429 upstream_rate_limited` |
+| 5xx or redirect | `502 upstream_server_error` |
+| timeout | `504 upstream_timeout` |
+| disconnect | `502 upstream_connection_error` |
+| malformed JSON or oversized response | `502 upstream_malformed_json` or `502 upstream_response_too_large` |
+
+For an upstream 429, only a decimal `Retry-After` of at most 3600 seconds is returned. Safe,
+bounded upstream request/accounting IDs may be returned under `X-Shiftedx-Upstream-*`; cookies,
+credentials, arbitrary headers, and raw error bodies are discarded. The proxy accepts a client
+`X-Request-ID` only when it is a bounded token; otherwise it generates one. That correlation ID is
+sent upstream, returned downstream, and used as a scalar structured-log value.
+The credentialed upstream receives only that correlation header from the downstream header set;
+downstream authorization, cookies, `OpenAI-Organization`, and `OpenAI-Project` are never forwarded.
+
 ## Tool roles
 
 Compatibility defaults are:
