@@ -116,6 +116,10 @@ server-configured trusted policy-extension bearer capability. `X-Shiftedx-Harnes
 requires both that trusted capability and explicit server enablement; it is not an ordinary client
 escape hatch.
 
+Generic v1 cache namespace selection is disabled. Client top-level cache namespace fields are
+rejected before forwarding; see the policy contract for normalization and the process-fixed
+configuration controls reserved for future provider-native support.
+
 See [the exact policy contract](docs/policy.md) for role configuration, receipt semantics, schema
 projection, parallel calls, and degraded transcript behavior.
 
@@ -129,6 +133,8 @@ projection, parallel calls, and degraded transcript behavior.
 | `PROXY_API_KEY` | unset | Independent client-facing bearer token |
 | `TRUSTED_POLICY_EXTENSION_API_KEYS` | unset | Distinct comma-separated opaque bearer capabilities allowed to disable receipt requirements or override protected tool roles |
 | `ALLOW_HARNESS_OPT_OUT` | `false` | Allows only trusted policy-extension principals to send `X-Shiftedx-Harness: off` |
+| `UPSTREAM_CACHE_CAPABILITY_MODE` | `disabled` | Generic cache capability profile; `disabled` and `unknown` reject client namespace controls |
+| `UPSTREAM_CACHE_NAMESPACE_FIELDS` | unset | Comma-separated, nonblank additional top-level client cache namespace field names to reject |
 | `MAX_INTERNAL_RETRIES` | `4` | Internal policy retries per request |
 | `MAX_UPSTREAM_CALLS` | `7` | Total upstream-call ceiling per request |
 | `UPSTREAM_TIMEOUT_SECONDS` | `120` | Upstream timeout |

@@ -9,6 +9,11 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from .cache_policy import (
+    ClientCacheNamespaceError,
+    ServerCacheNamespace,
+    reject_client_cache_namespaces,
+)
 from .config import Settings, configured_roles
 from .core import HARNESS_SYSTEM_SUFFIX, AgentHarness, normalize_bare_json
 from .errors import ProxyError, UpstreamFailure
@@ -49,6 +54,7 @@ class ChatService:
         self.settings = settings
         self.upstream = upstream
         self.base_roles = configured_roles(settings)
+        self.cache_namespace_fields = settings.cache_namespace_fields()
 
     async def complete(
         self,
@@ -58,9 +64,23 @@ class ChatService:
         harness_enabled: bool = True,
         policy_extensions_allowed: bool = False,
         trusted_policy_extension_used: bool = False,
+        server_cache_namespace: ServerCacheNamespace | None = None,
     ) -> ChatResult:
         started = time.perf_counter()
         _validate_chat_payload(payload, harness_enabled=harness_enabled)
+        try:
+            reject_client_cache_namespaces(
+                payload,
+                mode=self.settings.upstream_cache_capability_mode,
+                denied_fields=self.cache_namespace_fields,
+                server_namespace=server_cache_namespace,
+            )
+        except ClientCacheNamespaceError as exc:
+            raise ProxyError(
+                400,
+                "untrusted_cache_namespace",
+                "Client-selected cache namespaces are not supported by this upstream profile.",
+            ) from exc
         if payload.get("stream") is True:
             raise ProxyError(400, "streaming_not_supported", "stream=true is not supported by this proxy version.")
 

@@ -16,6 +16,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
+from .cache_policy import ServerCacheNamespace
 from .config import Settings
 from .errors import ProxyError
 from .service import ChatResult, ChatService
@@ -36,6 +37,7 @@ class Counters:
     errors: int = 0
     policy_extension_allows: int = 0
     policy_extension_denials: int = 0
+    cache_namespace_rejections: int = 0
 
     def observe(self, result: ChatResult) -> None:
         telemetry = result.telemetry
@@ -58,6 +60,7 @@ class Counters:
             "shiftedx_proxy_errors_total": self.errors,
             "shiftedx_proxy_policy_extension_allows_total": self.policy_extension_allows,
             "shiftedx_proxy_policy_extension_denials_total": self.policy_extension_denials,
+            "shiftedx_proxy_cache_namespace_rejections_total": self.cache_namespace_rejections,
         }
         return "".join(f"# TYPE {key} counter\n{key} {value}\n" for key, value in values.items())
 
@@ -102,6 +105,8 @@ def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
             "harness_opt_out_denied",
         }:
             counters.policy_extension_denials += 1
+        if exc.code == "untrusted_cache_namespace":
+            counters.cache_namespace_rejections += 1
         correlation_id = getattr(request.state, "correlation_id", None) or _new_correlation_id(request)
         LOGGER.warning("proxy_request_failed code=%s correlation_id=%s", exc.code, correlation_id)
         headers = {"X-Request-ID": correlation_id, **exc.headers}
@@ -191,6 +196,7 @@ def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
                 harness_enabled=not opt_out,
                 policy_extensions_allowed=principal.policy_extensions_allowed,
                 trusted_policy_extension_used=opt_out,
+                server_cache_namespace=principal.server_cache_namespace,
             )
         counters.observe(result)
         headers = _telemetry_headers(result, settings)
@@ -203,6 +209,7 @@ def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
 @dataclass(frozen=True)
 class AuthenticatedPrincipal:
     policy_extensions_allowed: bool = False
+    server_cache_namespace: ServerCacheNamespace | None = None
 
 
 def _authenticate(request: Request, settings: Settings) -> AuthenticatedPrincipal:
