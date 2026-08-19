@@ -101,13 +101,18 @@ async def test_downstream_authorization_is_never_forwarded_upstream() -> None:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
             response = await client.post(
                 "/v1/chat/completions",
-                headers={"Authorization": "Bearer downstream-secret", "Cookie": "private=value"},
+                headers={
+                    "Authorization": "Bearer downstream-secret",
+                    "Cookie": "private=value",
+                    "X-Shiftedx-Cache-Namespace": "opaque-header-value",
+                },
                 json={"model": "model", "messages": [{"role": "user", "content": "hello"}]},
             )
     await mock_client.aclose()
     assert response.status_code == 200
     assert captured["authorization"] == "Bearer upstream-secret"
     assert "cookie" not in captured
+    assert "x-shiftedx-cache-namespace" not in captured
 
 
 @pytest.mark.asyncio
@@ -311,6 +316,158 @@ async def test_harness_opt_out_requires_server_enablement_and_a_trusted_principa
     assert captured[0].get("authorization") is None
     assert "shiftedx_proxy_policy_extension_allows_total 1" in metrics.text
     assert "shiftedx_proxy_policy_extension_denials_total 2" in metrics.text
+
+
+@pytest.mark.asyncio
+async def test_cache_namespace_controls_are_rejected_for_both_authenticated_principals(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    upstream = EchoUpstream()
+    settings = Settings(
+        upstream_base_url="http://upstream/v1",
+        deployment_profile="production",
+        proxy_api_key=SecretStr("ordinary-client"),
+        trusted_policy_extension_api_keys=SecretStr("trusted-extension"),
+    )
+    app = create_app(settings, upstream)
+    namespace_value = "opaque-namespace-test-value"
+    payload = {
+        "model": "model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "cache_salt": namespace_value,
+    }
+    caplog.set_level(logging.WARNING, logger="shiftedx_harness_proxy")
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client:
+            ordinary = await client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer ordinary-client"},
+                json=payload,
+            )
+            trusted = await client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer trusted-extension"},
+                json=payload,
+            )
+            metrics = await client.get("/metrics", headers={"Authorization": "Bearer ordinary-client"})
+    assert ordinary.status_code == trusted.status_code == 400
+    assert ordinary.json() == trusted.json()
+    assert ordinary.json()["error"]["code"] == "untrusted_cache_namespace"
+    assert ordinary.json()["error"]["message"] == (
+        "Client-selected cache namespaces are not supported by this upstream profile."
+    )
+    assert namespace_value not in ordinary.text
+    assert "cache_salt" not in ordinary.text
+    assert namespace_value not in caplog.text
+    assert "cache_salt" not in caplog.text
+    assert "x-shiftedx-harness-profile" not in ordinary.headers
+    assert upstream.requests == []
+    assert "shiftedx_proxy_cache_namespace_rejections_total 2" in metrics.text
+
+
+@pytest.mark.asyncio
+async def test_unknown_cache_profile_rejects_before_the_upstream_call() -> None:
+    upstream = EchoUpstream()
+    app = create_app(
+        Settings(upstream_base_url="http://upstream/v1", upstream_cache_capability_mode="unknown"),
+        upstream,
+    )
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "promptCacheKey": ["any", "value", "type"],
+                },
+            )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "untrusted_cache_namespace"
+    assert upstream.requests == []
+
+
+@pytest.mark.asyncio
+async def test_duplicate_cache_namespace_spellings_receive_the_same_stable_rejection() -> None:
+    upstream = EchoUpstream()
+    app = create_app(Settings(upstream_base_url="http://upstream/v1"), upstream)
+    first_value = "first-opaque-namespace"
+    second_value = "second-opaque-namespace"
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "cache_salt": first_value,
+                    "Cache-Salt": second_value,
+                },
+            )
+    assert response.status_code == 400
+    assert response.json()["error"] == {
+        "message": "Client-selected cache namespaces are not supported by this upstream profile.",
+        "type": "shiftedx_proxy_error",
+        "code": "untrusted_cache_namespace",
+    }
+    assert first_value not in response.text
+    assert second_value not in response.text
+    assert upstream.requests == []
+
+
+@pytest.mark.asyncio
+async def test_cache_policy_preserves_nested_lookalikes_and_unrelated_top_level_fields() -> None:
+    upstream = EchoUpstream()
+    app = create_app(
+        Settings(
+            upstream_base_url="http://upstream/v1",
+            upstream_cache_namespace_fields="provider_cache_scope",
+        ),
+        upstream,
+    )
+    preserved = {"number": 7, "items": [None, True, {"cache_salt": "nested-value"}]}
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client:
+            configured = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "Provider-CacheScope": {"not": "forwarded"},
+                },
+            )
+            permitted = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "model",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "hello",
+                            "prompt_cache_key": "nested-lookalike",
+                        }
+                    ],
+                    "vendor_extension": preserved,
+                },
+            )
+    assert configured.status_code == 400
+    assert configured.json()["error"]["code"] == "untrusted_cache_namespace"
+    assert permitted.status_code == 200
+    assert len(upstream.requests) == 1
+    assert upstream.requests[0]["vendor_extension"] == preserved
+    assert any(
+        message.get("prompt_cache_key") == "nested-lookalike"
+        for message in upstream.requests[0]["messages"]
+        if isinstance(message, dict)
+    )
 
 
 @pytest.mark.asyncio

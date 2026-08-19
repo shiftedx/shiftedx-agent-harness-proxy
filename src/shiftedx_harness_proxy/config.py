@@ -11,6 +11,7 @@ import yaml
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .cache_policy import CacheCapabilityMode, cache_namespace_field_names
 from .core import HARNESS_PROFILE, ToolRoles
 
 _HTTP_BEARER_TOKEN = re.compile(r"[A-Za-z0-9\-._~+/]+={0,}")
@@ -32,6 +33,8 @@ class Settings(BaseSettings):
     listen_host: str = "0.0.0.0"  # noqa: S104 - container listener; Compose controls host exposure
     listen_port: int = Field(default=8090, ge=1, le=65535)
     trusted_policy_extension_api_keys: SecretStr | None = None
+    upstream_cache_capability_mode: CacheCapabilityMode = "disabled"
+    upstream_cache_namespace_fields: str | None = None
     harness_profile: str = HARNESS_PROFILE
     harness_config_file: Path | None = None
     mutation_tools: str | None = None
@@ -92,6 +95,13 @@ class Settings(BaseSettings):
             )
         return value
 
+    @field_validator("upstream_cache_namespace_fields")
+    @classmethod
+    def validate_upstream_cache_namespace_fields(cls, value: str | None) -> str | None:
+        if value is not None:
+            cache_namespace_field_names(value)
+        return value
+
     @model_validator(mode="after")
     def validate_production_profile(self) -> Settings:
         if self.deployment_profile == "production" and self.proxy_api_key is None:
@@ -124,6 +134,10 @@ class Settings(BaseSettings):
         if self.trusted_policy_extension_api_keys is None:
             return frozenset()
         return frozenset(_csv(self.trusted_policy_extension_api_keys.get_secret_value()))
+
+    def cache_namespace_fields(self) -> frozenset[str]:
+        """Return the process-fixed normalized client namespace denylist."""
+        return cache_namespace_field_names(self.upstream_cache_namespace_fields)
 
 
 def _csv(value: str) -> list[str]:

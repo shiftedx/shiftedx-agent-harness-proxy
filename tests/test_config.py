@@ -68,6 +68,35 @@ def test_policy_extension_capabilities_are_explicit_server_configuration() -> No
     assert settings.trusted_policy_extension_keys() == {"extension-a", "extension-b"}
 
 
+def test_cache_capability_profiles_are_process_fixed_and_fail_closed() -> None:
+    default = Settings(upstream_base_url="http://model/v1")
+    unknown = Settings(
+        upstream_base_url="http://model/v1",
+        upstream_cache_capability_mode="unknown",
+        upstream_cache_namespace_fields="provider_cache_scope",
+    )
+    assert default.upstream_cache_capability_mode == "disabled"
+    assert unknown.upstream_cache_capability_mode == "unknown"
+    assert "providercachescope" in unknown.cache_namespace_fields()
+
+
+@pytest.mark.parametrize(
+    "configured_fields",
+    ["", "provider_cache_scope,,alternate_scope", "---"],
+)
+def test_cache_namespace_field_configuration_rejects_malformed_entries_without_echoing_input(
+    configured_fields: str,
+) -> None:
+    with pytest.raises(ValidationError) as raised:
+        Settings(
+            upstream_base_url="http://model/v1",
+            upstream_cache_namespace_fields=configured_fields,
+        )
+    assert "non-empty cache namespace field names" in str(raised.value)
+    if configured_fields:
+        assert configured_fields not in str(raised.value)
+
+
 @pytest.mark.parametrize(
     "configured_capabilities",
     ["", "extension-a,,extension-b", "extension with space", "extension-a,second\nline"],

@@ -44,6 +44,28 @@ sent upstream, returned downstream, and used as a scalar structured-log value.
 The credentialed upstream receives only that correlation header from the downstream header set;
 downstream authorization, cookies, `OpenAI-Organization`, and `OpenAI-Project` are never forwarded.
 
+## Cache namespace controls
+
+Generic v1 upstreams run with `UPSTREAM_CACHE_CAPABILITY_MODE=disabled` by default. The only other
+currently supported process-fixed profile is `unknown`; it fails closed identically. Neither profile
+accepts a client-selected cache namespace. The default top-level denylist is `cache_salt`,
+`prompt_cache_key`, `cache_namespace`, `cache_namespace_key`, `cache_key_version`,
+`cache_principal_id`, `cache_hmac_namespace`, `tenant_id`, `cache_tenant_id`, `cache_key`, and
+`prompt_cache_salt`; matching keys are rejected with `400 untrusted_cache_namespace` before any
+upstream call. The comparison case-folds names and removes separators, so snake-case, kebab-case,
+camel-case, and case variants are equivalent. Operators can extend this top-level denylist with
+comma-separated `UPSTREAM_CACHE_NAMESPACE_FIELDS` names, which use the same normalization; empty or
+separator-only configured entries fail process startup. The standard top-level OpenAI `user` field is
+not a cache authority and remains compatible.
+
+The response never identifies the rejected field or value, and the proxy never logs or labels either.
+Nested message, tool, and provider objects are not recursively scanned; only top-level client fields
+are cache controls in this compatibility mitigation. Other unknown top-level fields are forwarded
+unchanged. Cache namespace, principal, and key-version headers are not an authority source and are
+not forwarded. A future provider adapter may pass an internal server-derived opaque HMAC namespace and
+key version from authenticated principal context; v1 does not derive or accept those values from a
+request body or header and does not implement provider-native cache behavior.
+
 ## Tool roles
 
 Compatibility defaults are:
