@@ -39,10 +39,13 @@ def test_dockerfile_requires_the_checked_lockfile() -> None:
     assert "uv sync --locked --no-dev --no-editable" in dockerfile
 
 
-def test_release_manifest_records_immutable_inputs(tmp_path: Path) -> None:
-    image_digest = "sha256:" + "a" * 64
-    metadata = tmp_path / "metadata.json"
-    metadata.write_text(json.dumps({"containerimage.digest": image_digest}))
+def test_release_manifest_distinguishes_release_candidate_from_smoke_image(tmp_path: Path) -> None:
+    release_digest = "sha256:" + "a" * 64
+    smoke_digest = "sha256:" + "b" * 64
+    release_metadata = tmp_path / "multiarch-build-metadata.json"
+    release_metadata.write_text(json.dumps({"containerimage.digest": release_digest}))
+    smoke_metadata = tmp_path / "smoke-image-metadata.json"
+    smoke_metadata.write_text(json.dumps({"containerimage.digest": smoke_digest}))
     output = tmp_path / "release-manifest.json"
     subprocess.run(  # noqa: S603 - fixed local script and test-controlled arguments
         [
@@ -52,12 +55,20 @@ def test_release_manifest_records_immutable_inputs(tmp_path: Path) -> None:
             str(output),
             "--source-commit",
             "f" * 40,
-            "--image-reference",
+            "--release-reference",
+            "oci-archive:artifacts/shiftedx-proxy.oci.tar",
+            "--release-platform",
+            "linux/amd64",
+            "--release-platform",
+            "linux/arm64",
+            "--release-metadata",
+            str(release_metadata),
+            "--smoke-reference",
             "shiftedx-agent-harness-proxy:ci",
-            "--image-architecture",
+            "--smoke-architecture",
             "amd64",
-            "--image-metadata",
-            str(metadata),
+            "--smoke-metadata",
+            str(smoke_metadata),
             "--workflow-url",
             "https://github.example/actions/runs/1",
         ],
@@ -65,7 +76,17 @@ def test_release_manifest_records_immutable_inputs(tmp_path: Path) -> None:
         cwd=ROOT,
     )
     manifest = json.loads(output.read_text())
-    assert manifest["image"]["digest"] == image_digest
-    assert manifest["image"]["architecture"] == "amd64"
+    assert manifest["release_candidate"] == {
+        "digest": release_digest,
+        "platforms": ["linux/amd64", "linux/arm64"],
+        "reference": "oci-archive:artifacts/shiftedx-proxy.oci.tar",
+        "sbom": "embedded Buildx SBOM attestations in the OCI archive",
+    }
+    assert manifest["smoke_scan_image"] == {
+        "architecture": "amd64",
+        "digest": smoke_digest,
+        "reference": "shiftedx-agent-harness-proxy:ci",
+        "sbom": "artifacts/shiftedx-proxy-smoke-image.sbom.cdx.json",
+    }
     assert manifest["lock_digest"].startswith("sha256:")
     assert manifest["base_image_digest"].startswith("sha256:")

@@ -32,9 +32,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source-commit", required=True)
-    parser.add_argument("--image-reference", required=True)
-    parser.add_argument("--image-architecture", required=True)
-    parser.add_argument("--image-metadata", type=Path, required=True)
+    parser.add_argument("--release-reference", required=True)
+    parser.add_argument("--release-platform", action="append", required=True)
+    parser.add_argument("--release-metadata", type=Path, required=True)
+    parser.add_argument("--smoke-reference", required=True)
+    parser.add_argument("--smoke-architecture", required=True)
+    parser.add_argument("--smoke-metadata", type=Path, required=True)
     parser.add_argument("--lock", type=Path, default=Path("uv.lock"))
     parser.add_argument("--dockerfile", type=Path, default=Path("Dockerfile"))
     parser.add_argument("--workflow-url", required=True)
@@ -43,10 +46,17 @@ def main() -> None:
     document = {
         "schema_version": 1,
         "source_commit": args.source_commit,
-        "image": {
-            "reference": args.image_reference,
-            "digest": _image_digest(args.image_metadata),
-            "architecture": args.image_architecture,
+        "release_candidate": {
+            "reference": args.release_reference,
+            "digest": _image_digest(args.release_metadata),
+            "platforms": args.release_platform,
+            "sbom": "embedded Buildx SBOM attestations in the OCI archive",
+        },
+        "smoke_scan_image": {
+            "reference": args.smoke_reference,
+            "digest": _image_digest(args.smoke_metadata),
+            "architecture": args.smoke_architecture,
+            "sbom": "artifacts/shiftedx-proxy-smoke-image.sbom.cdx.json",
         },
         "base_image_digest": _base_digest(args.dockerfile),
         "lock_digest": _sha256(args.lock),

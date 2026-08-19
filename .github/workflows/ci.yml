@@ -81,28 +81,25 @@ jobs:
           image-ref: ${{ env.IMAGE }}
           scan-type: image
           format: cyclonedx
-          output: artifacts/shiftedx-proxy.sbom.cdx.json
+          output: artifacts/shiftedx-proxy-smoke-image.sbom.cdx.json
       - name: Record release-candidate manifest
         run: >-
           python scripts/release-manifest.py
           --output artifacts/release-manifest.json
           --source-commit "${GITHUB_SHA}"
-          --image-reference "${IMAGE}"
-          --image-architecture "$(docker image inspect "${IMAGE}" --format '{{.Architecture}}')"
-          --image-metadata artifacts/smoke-image-metadata.json
+          --release-reference "oci-archive:artifacts/shiftedx-proxy.oci.tar"
+          --release-platform linux/amd64
+          --release-platform linux/arm64
+          --release-metadata artifacts/multiarch-build-metadata.json
+          --smoke-reference "${IMAGE}"
+          --smoke-architecture "$(docker image inspect "${IMAGE}" --format '{{.Architecture}}')"
+          --smoke-metadata artifacts/smoke-image-metadata.json
           --workflow-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
       - name: Attest OCI release candidate provenance
         id: provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.1
         with:
           subject-path: artifacts/shiftedx-proxy.oci.tar
-          push-to-registry: false
-      - name: Attest OCI release candidate SBOM
-        id: sbom
-        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
-        with:
-          subject-path: artifacts/shiftedx-proxy.oci.tar
-          sbom-path: artifacts/shiftedx-proxy.sbom.cdx.json
           push-to-registry: false
       - name: Upload release-candidate evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -112,4 +109,3 @@ jobs:
           path: |
             artifacts/
             ${{ steps.provenance.outputs.bundle-path }}
-            ${{ steps.sbom.outputs.bundle-path }}
