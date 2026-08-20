@@ -1,17 +1,15 @@
 # Release status
 
-## v0.1 release candidate
+## v0.1 controlled-deployment candidate
 
-The v1 runtime is implementation-complete for its declared scope and ready for public review. The
-2026-08-20 model-backed qualification result is **DO NOT PROMOTE**: the candidate passed most
-operational gates but failed model quality and failure-path observability. It is not a generally
-available production release.
+The maintainer authorizes controlled, authenticated self-hosted deployment of the exact evaluated
+artifact described below. This is a documented exception, not a passing frozen-v1 promotion:
+there is no stable/public package, image, tag, support SLA, or production-certification claim.
 
-A later replacement-candidate experiment with the AEON historical sampler demonstrated a clear
-quality benefit: direct `99/180` versus proxy-assisted `158/180`, with the proxy winning all six
-cold/warm matched pairs. That evidence does not authorize promotion because it used temperature
-`1.0` rather than the frozen v1 temperature-0 contract, failed the full-agentic p95 gate in both
-cache lanes, and has no approved rollback target. See the
+The AEON campaign showed a clear quality benefit: direct `99/180` versus proxy-assisted `158/180`,
+with the proxy winning all six matched pairs. Full-agentic p95 nevertheless failed the `125%`
+ceiling: cold was `170.5%` of direct and warm-prefix was `145.6%`. Controlled deployments must use
+the [operator runbook](docs/operator-runbook.md) and accept the limits in the
 [historical-parity result](benchmark-reports/aeon-historical-parity-result-2026-08-20.md).
 
 Supported now:
@@ -38,6 +36,28 @@ candidate incomplete within its supported surface.
 
 ## Verified evidence
 
+The controlled-deployment authorization is limited to:
+
+- evaluated proxy source `75424328ce0dc0bcef6171b42e390c5ba8559471`;
+- signed ARM64 OCI root
+  `sha256:c673ec73ffded8d28200f6157b696fb451735a3416a55407e686587150fe4230`,
+  retained by [CI run 32413338369](https://github.com/shiftedx/shiftedx-agent-harness-proxy/actions/runs/32413338369);
+- the pinned AEON 27B model, revision, MTPLX 2.7.1 runtime, and `historical-aeon-v1` profile recorded
+  in the [sanitized report](benchmark-reports/aeon-historical-parity-result-2026-08-20.md).
+
+The exact image is a retained CI OCI artifact, not a generally pullable public registry image. An
+authorized operator must verify and preload it or mirror it to an approved internal registry,
+preserving its immutable digest. A source rebuild or later `main` commit is not the evaluated
+artifact.
+
+The replacement campaign passed 13/13 immutable events, six direct/proxy reconciliations, 360
+scored rows, and the executed exact-image operational matrix. It preserved weighted decode speed,
+bounded mean upstream amplification at `1.0631`, and passed proxy-only latency, steady load,
+overload, fault mapping, timeout, cancellation, readiness recovery, graceful restart, and RSS
+checks. Raw evidence remains private.
+
+### Historical failed candidate
+
 The original failed v1 source is commit `3d8805c1d96d0790526a333ca5074eea20b16b72`. Its post-merge
 [main CI run](https://github.com/shiftedx/shiftedx-agent-harness-proxy/actions/runs/32314958324)
 passed:
@@ -57,19 +77,18 @@ private.
 
 ## Promotion boundary
 
-Promotion remains blocked. The original three complete cold pairs scored direct `6/102` and proxy
-`0/102`; all proxy rows ended in bounded harness exhaustion. Failure-path request/upstream counters
-also omitted failed transactions and attempts. The warm lane was not run after the cold result made
-promotion impossible, so completeness is an additional failed gate. The replacement
-historical-parity experiment demonstrates that the remediated proxy restores the quality benefit
-and reconciled accounting for its named contract, but its sampler does not supersede the frozen v1
-plan and its full-agentic latency misses the promotion ceiling.
+Stable/public promotion remains blocked. The replacement campaign used the historical temperature-1
+sampler rather than the frozen temperature-0 contract; full-agentic p95 failed in both lanes;
+matched pass-through wall/TTFT was unavailable; four direct-only regressions have no critical-case
+classification; and rollback was not exercised because no approved predecessor was named.
 
-Use the repository as an unreleased evaluation candidate and describe it as “implementation-complete,
-qualification attempted, do not promote.” Do not describe it as production-certified. A new
-candidate must fix model/tool-acquisition compatibility and failed-attempt accounting, then rerun
-the full pre-registered cold/warm protocol. The final promotion decision remains human-owned and is
-tracked in [issue #19](https://github.com/shiftedx/shiftedx-agent-harness-proxy/issues/19).
+Controlled deployment therefore requires the exact artifact, MTPLX `phase_split`, authenticated
+loopback/private operation, a canary and end-to-end latency monitoring, and an operator-approved
+rollback target before production traffic. Without a retained predecessor, restrict use to
+evaluation/canary traffic that can be removed instead of claiming validated rollback. Do not call
+this candidate stable, generally available, production-certified, or compliant with the frozen
+latency SLO. The decision is tracked in
+[issue #19](https://github.com/shiftedx/shiftedx-agent-harness-proxy/issues/19).
 
 ## Public review map
 

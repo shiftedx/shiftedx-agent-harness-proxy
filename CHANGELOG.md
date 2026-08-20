@@ -24,3 +24,5 @@ public release.
 
 - The interrupted 2026-08-17 paired benchmark is retained only as a superseded historical audit
   note; it is not presented as release evidence.
+- The exact AEON-tested artifact is documented for controlled deployment under its latency
+  exception, and Compose can pass the required MTPLX `phase_split` capability mode.

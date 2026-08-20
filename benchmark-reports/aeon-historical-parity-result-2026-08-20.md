@@ -1,9 +1,10 @@
 # AEON 27B historical-parity proxy result — 2026-08-20
 
-Status: **QUALITY BENEFIT DEMONSTRATED; MAINTAINER DECISION PENDING**
+Status: **CONTROLLED DEPLOYMENT AUTHORIZED FOR THE EXACT ARTIFACT; FROZEN PROMOTION FAILED**
 
-Evaluator recommendation: **DO NOT PROMOTE FROM THIS EVIDENCE ALONE.** Until the maintainer records
-an explicit decision on issue #19, the repository's release status remains **DO NOT PROMOTE**.
+The maintainer authorizes controlled deployment of the exact evaluated artifact under a documented
+latency exception. This does not convert failed frozen gates into passes or authorize a stable/public
+release, tag, package, or registry publication.
 
 The replacement Harness Proxy produced a clear, repeated quality benefit with the pinned AEON 27B
 model. Across three cold and three proven warm-prefix matched pairs, the direct baseline passed
@@ -14,8 +15,8 @@ This is a historical-parity experiment, not a passing v1 promotion qualification
 used the earlier AEON sampler at temperature `1.0`; the frozen v1 promotion plan specifies
 temperature `0.0`. Full-agentic p95 wall time also exceeded the frozen `125%` ceiling in both cache
 lanes. Four paired positions passed direct and failed through the proxy, and the benchmark rows do
-not designate a critical-case subset. No stable release, tag, package, deployment, or registry
-publication follows from this result.
+not designate a critical-case subset. No deployment follows automatically from this result; the
+named controlled deployment is a later maintainer-owned exception.
 
 This report is an allowlist-only derivative. Raw prompts, transcripts, generated text, tool
 arguments or results, credentials, principal data, private endpoints, case identifiers, and
@@ -233,18 +234,21 @@ categories covered preflight credential validation, runtime inspection, prefligh
 evidence-gate defects. The correction-accounting and correction-run parity defects discovered by
 those attempts were fixed and reviewed before the fresh r6 manifest was frozen.
 
-## Recommendation
+## Maintainer decision
 
 The evidence supports a positive-impact claim for the named AEON historical-parity experiment: the
 proxy recovers nearly all of the previously observed in-process harness uplift while preserving
 decode throughput and bounded request amplification.
 
-It does **not** support production promotion. The experiment differs from the frozen temperature-0
-promotion contract, misses the full-agentic latency gate in both cache lanes, cannot classify four
-paired regressions for criticality, lacks a separately retained pass-through subset, and has no
-approved rollback target. The existing failed v1 result remains historical evidence rather than
-being rewritten.
+It does **not** support frozen-v1 or stable/public promotion. The experiment differs from the
+frozen temperature-0 promotion contract, misses the full-agentic latency gate in both cache lanes,
+cannot classify four paired regressions for criticality, lacks a separately retained pass-through
+subset, and has no approved rollback target. The existing failed v1 result remains historical
+evidence rather than being rewritten.
 
-Evaluator recommendation: **RECOGNIZE THE QUALITY BENEFIT; DO NOT PROMOTE FROM THIS EVIDENCE
-ALONE.** The final promotion decision remains maintainer-owned and is pending on
+Decision: **authorize controlled, authenticated self-hosted deployment of proxy source
+`75424328ce0dc0bcef6171b42e390c5ba8559471` and its signed ARM64 OCI root recorded above, under the
+latency exception.** Require the tested MTPLX `phase_split` contract, a canary, end-to-end latency
+monitoring, and an operator-approved rollback target before production traffic. This is not
+production certification or a stable/public release. The handoff decision is tracked in
 [issue #19](https://github.com/shiftedx/shiftedx-agent-harness-proxy/issues/19).
