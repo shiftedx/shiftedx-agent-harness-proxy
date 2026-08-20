@@ -217,6 +217,16 @@ def advance_qualification_campaign(
             previous_event_sha256=events[-1][1] if events else None,
         )
         event_sha256 = _write_event(events_dir, heads_dir, request.sequence, event)
+        if request.sequence == 13 and result.status == "passed":
+            if result.model_runtime_instance_sha256 is None:
+                raise CampaignFailure("campaign_model_instance_invalid")
+            used_instances.add(result.model_runtime_instance_sha256)
+            return _complete_campaign(
+                spec,
+                private_campaign_dir,
+                [*events, (event, event_sha256)],
+                used_instances,
+            )
         kind: AdvanceKind = "stage_completed" if result.status == "passed" else "campaign_failed"
         return CampaignAdvance(
             kind=kind,

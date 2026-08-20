@@ -252,9 +252,12 @@ def test_campaign_runs_one_preflight_then_six_direct_proxy_pairs_and_finalizes(t
         advance_qualification_campaign(manifest, private, stage_runner=runner, readiness_probe=_ReadyProbe())
         for _ in range(13)
     ]
-    final = advance_qualification_campaign(manifest, private, stage_runner=runner, readiness_probe=_ReadyProbe())
+    final = results[-1]
+    repeated = advance_qualification_campaign(
+        manifest, private, stage_runner=runner, readiness_probe=_ReadyProbe()
+    )
 
-    assert [(item.slot.cache_lane, item.slot.pair_index, item.stage) for item in results if item.slot] == [
+    assert [(item.slot.cache_lane, item.slot.pair_index, item.stage) for item in runner.requests] == [
         ("preflight", 0, "preflight"),
         *(item for lane in ("cold", "warm-prefix") for pair in range(1, 4) for item in (
             (lane, pair, "score-direct"),
@@ -264,6 +267,9 @@ def test_campaign_runs_one_preflight_then_six_direct_proxy_pairs_and_finalizes(t
     assert final.kind == "campaign_passed"
     outcome = private / "qualification-campaign-outcome.json"
     assert outcome.stat().st_mode & 0o777 == 0o600
+    assert repeated.kind == "campaign_passed"
+    assert repeated.campaign_outcome_sha256 == final.campaign_outcome_sha256
+    assert len(runner.requests) == 13
     document = json.loads(outcome.read_text(encoding="utf-8"))
     assert document["event_count"] == 13
     assert document["scored_stage_count"] == document["scored_model_instance_count"] == 12
@@ -274,11 +280,10 @@ def test_final_outcome_is_idempotent_but_cannot_be_replaced(tmp_path: Path) -> N
     manifest = _campaign_manifest(tmp_path / "manifest.json")
     private = _private_campaign(tmp_path / "campaign")
     runner = _FakeStageRunner()
-    for _ in range(13):
+    first = [
         advance_qualification_campaign(manifest, private, stage_runner=runner, readiness_probe=_ReadyProbe())
-    first = advance_qualification_campaign(
-        manifest, private, stage_runner=runner, readiness_probe=_ReadyProbe()
-    )
+        for _ in range(13)
+    ][-1]
     outcome = private / "qualification-campaign-outcome.json"
     inode = outcome.stat().st_ino
 
