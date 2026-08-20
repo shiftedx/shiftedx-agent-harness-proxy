@@ -630,6 +630,11 @@ def model_boundary_fingerprint(payload: JsonObject, *, scenario_order: list[str]
     request body.
     """
     fields = _model_boundary_fields(payload)
+    fields["compatibility"] = {
+        "mode": COMPATIBILITY_MODE,
+        "version": COMPATIBILITY_VERSION,
+        "phase": _observed_model_boundary_phase(payload),
+    }
     fields["declared_policy_deltas"] = _observed_harness_policy_delta(payload)
     if scenario_order is not None:
         fields.update(_model_boundary_context(scenario_order))
@@ -809,6 +814,25 @@ def _safe_model_boundary_fields(fields: dict[str, Any]) -> bool:
         return False
     if fields["cache_mode_policy"] not in {None, "bypass"}:
         return False
+    compatibility = fields["compatibility"]
+    if compatibility not in (
+        {
+            "mode": COMPATIBILITY_MODE,
+            "version": COMPATIBILITY_VERSION,
+            "phase": "acquisition",
+        },
+        {
+            "mode": COMPATIBILITY_MODE,
+            "version": COMPATIBILITY_VERSION,
+            "phase": "finalization",
+        },
+        {
+            "mode": COMPATIBILITY_MODE,
+            "version": COMPATIBILITY_VERSION,
+            "phase": "terminal",
+        },
+    ):
+        return False
     policy_delta = fields["declared_policy_deltas"]
     return policy_delta in ({}, _expected_harness_policy_delta(), {"harness_system_suffix_sha256": "invalid"})
 
@@ -926,6 +950,7 @@ def _model_boundary_field_keys() -> tuple[str, ...]:
         "reasoning",
         "token_budget",
         "cache_mode_policy",
+        "compatibility",
         "declared_policy_deltas",
     )
 
@@ -979,10 +1004,23 @@ def _observed_harness_policy_delta(payload: JsonObject) -> dict[str, str]:
 
 def _model_boundary_context(scenario_order: list[str]) -> dict[str, Any]:
     return {
-        "compatibility": {"mode": COMPATIBILITY_MODE, "version": COMPATIBILITY_VERSION},
         "benchmark_revision": BENCHMARK_REVISION,
         "scenario_order": {"sha256": _sha256(scenario_order), "count": len(scenario_order)},
     }
+
+
+def _observed_model_boundary_phase(payload: JsonObject) -> Phase:
+    """Classify only shapes emitted by the frozen qualification phase planner."""
+
+    has_tools = bool(payload.get("tools"))
+    has_response_format = bool(payload.get("response_format"))
+    if has_tools and has_response_format:
+        raise PreflightFailure("model-boundary phase is ambiguous")
+    if has_tools:
+        return "acquisition"
+    if has_response_format:
+        return "finalization"
+    return "terminal"
 
 
 def qualification_contract_digest(

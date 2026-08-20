@@ -73,7 +73,13 @@ def test_observer_retains_only_model_boundary_component_hashes(tmp_path) -> None
     assert set(row) == {"record_type", "sequence", "digest", "fields", "response"}
     assert row["record_type"] == "qualification_model_boundary"
     assert row["sequence"] == 1
+    assert row["fields"]["compatibility"] == {
+        "mode": "phase_split",
+        "version": "shiftedx-phase-plan-v1",
+        "phase": "acquisition",
+    }
     assert [item["sequence"] for item in rows] == [1, 2]
+    assert rows[1]["fields"]["compatibility"]["phase"] == "terminal"
     assert row["response"] == {
         "status_code": 200,
         "cache": {

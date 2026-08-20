@@ -543,8 +543,12 @@ def test_model_boundary_fingerprint_binds_only_safe_cache_mode_policy(monkeypatc
     bypass = copy.deepcopy(normal)
     bypass["metadata"] = {"cache_mode": "bypass"}
 
-    normal_fingerprint = runner.model_boundary_fingerprint(normal)
-    bypass_fingerprint = runner.model_boundary_fingerprint(bypass)
+    normal_fingerprint = runner.model_boundary_fingerprint(
+        runner.PhasePlanner().plan(normal, phase="acquisition")
+    )
+    bypass_fingerprint = runner.model_boundary_fingerprint(
+        runner.PhasePlanner().plan(bypass, phase="acquisition")
+    )
 
     assert normal_fingerprint.fields["cache_mode_policy"] is None
     assert bypass_fingerprint.fields["cache_mode_policy"] == "bypass"

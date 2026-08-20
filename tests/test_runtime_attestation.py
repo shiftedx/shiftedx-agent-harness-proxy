@@ -16,6 +16,7 @@ from shiftedx_harness_proxy.qualification_contract import (
     RuntimeAttestationFailure,
     RuntimeOutcome,
     RuntimeOutcomeFailure,
+    bind_model_boundary_context,
     cache_observation_from_response,
     load_model_evidence,
     load_runtime_attestation,
@@ -81,6 +82,50 @@ def test_missing_postcommit_snapshot_does_not_relax_warm_or_malformed_cache_evid
     }
 
     assert cache_observation_from_response({"mtplx_stats": stats}) is None
+
+
+def test_model_boundary_fingerprint_classifies_only_exact_observed_phase_shapes() -> None:
+    acquisition = model_boundary_fingerprint(
+        {"model": "model", "messages": [], "tools": [{"type": "function", "function": {}}]}
+    )
+    finalization = model_boundary_fingerprint(
+        {"model": "model", "messages": [], "response_format": {"type": "json_schema"}}
+    )
+    terminal = model_boundary_fingerprint({"model": "model", "messages": []})
+
+    assert acquisition.fields["compatibility"] == {
+        "mode": "phase_split",
+        "version": "shiftedx-phase-plan-v1",
+        "phase": "acquisition",
+    }
+    assert finalization.fields["compatibility"] == {
+        "mode": "phase_split",
+        "version": "shiftedx-phase-plan-v1",
+        "phase": "finalization",
+    }
+    assert terminal.fields["compatibility"] == {
+        "mode": "phase_split",
+        "version": "shiftedx-phase-plan-v1",
+        "phase": "terminal",
+    }
+    bound = bind_model_boundary_context((acquisition,), ["case-a"])[0]
+    assert bound.fields["compatibility"] == acquisition.fields["compatibility"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "model": "model",
+            "messages": [],
+            "tools": [{"type": "function", "function": {}}],
+            "response_format": {"type": "json_schema"},
+        },
+    ],
+)
+def test_model_boundary_fingerprint_rejects_ambiguous_observed_phase(payload) -> None:
+    with pytest.raises(PreflightFailure, match="model-boundary phase is ambiguous"):
+        model_boundary_fingerprint(payload)
 
 
 def test_model_boundary_records_load_exact_safe_response_cache_projection(tmp_path) -> None:
