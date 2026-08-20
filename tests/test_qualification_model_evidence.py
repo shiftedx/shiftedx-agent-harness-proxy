@@ -295,6 +295,24 @@ def _record_row(root: Path, path: Path) -> str:
     return f"{path.relative_to(root).as_posix()},sha256={digest},{path.stat().st_size}"
 
 
+def _replace_distribution_metadata(contract: ModelEvidenceContract, value: str) -> None:
+    root = contract.mtplx_distribution_root
+    metadata = root / "mtplx-2.7.1.dist-info" / "METADATA"
+    module = root / "mtplx.py"
+    metadata.write_text(value, encoding="utf-8")
+    contract.mtplx_record.write_text(
+        "\n".join(
+            (
+                _record_row(root, module),
+                _record_row(root, metadata),
+                "mtplx-2.7.1.dist-info/RECORD,,",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+
 def _distribution_digest(contract: ModelEvidenceContract) -> str:
     root = contract.mtplx_distribution_root
     rows: list[tuple[str, str]] = []
@@ -659,8 +677,7 @@ def test_record_aggregate_ignores_pycache_but_rejects_metadata_version_drift(tmp
     session.complete([])
 
     bad = _contract(tmp_path / "bad-metadata")
-    metadata = bad.mtplx_distribution_root / "mtplx-2.7.1.dist-info" / "METADATA"
-    metadata.write_text("Name: mtplx\nVersion: 2.7.2\n\n", encoding="utf-8")
+    _replace_distribution_metadata(bad, "Name: mtplx\nVersion: 2.7.2\n\n")
     credential = _private(tmp_path / "bad-metadata" / "credential", b"model-api-token")
     with pytest.raises(ModelEvidenceFailure, match="model_package_invalid"):
         ModelEvidenceSession.begin(
@@ -671,6 +688,79 @@ def test_record_aggregate_ignores_pycache_but_rejects_metadata_version_drift(tmp
             credential_file=credential,
             probe=_probe_for(bad),
         )
+
+
+def test_distribution_accepts_real_wheel_metadata_with_repeated_unrelated_headers(tmp_path: Path) -> None:
+    contract = _contract(tmp_path)
+    _replace_distribution_metadata(
+        contract,
+        "\n".join(
+            (
+                "Metadata-Version: 2.4",
+                "Name: mtplx",
+                "Version: 2.7.1",
+                "Project-URL: Homepage, https://example.invalid/mtplx",
+                "Project-URL: Source, https://example.invalid/mtplx/source",
+                "Classifier: Programming Language :: Python :: 3",
+                "Classifier: Operating System :: MacOS",
+                "Requires-Dist: mlx>=0.31",
+                "Requires-Dist: pydantic>=2",
+                "",
+                "Private package description is not parsed as identity metadata.",
+                "",
+            )
+        ),
+    )
+    probe = _probe_for(contract, before_requests=0, after_requests=0)
+
+    session = ModelEvidenceSession.begin(
+        contract,
+        stage="preflight",
+        run_manifest_sha256="f" * 64,
+        evidence_path=tmp_path / "real-wheel-metadata.json",
+        credential_file=_private(tmp_path / "credential", b"model-api-token"),
+        probe=probe,
+    )
+
+    assert session.complete([]).status == "passed"
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        "Name: mtplx\nName: mtplx\nVersion: 2.7.1\n\n",
+        "Name: mtplx\nVersion: 2.7.1\nVersion: 2.7.1\n\n",
+        "Name: mtplx\nname: spoofed\nVersion: 2.7.1\n\n",
+        "Name: mtplx\nversion: 2.7.1\n\n",
+        "Name: mtplx\n Version: 2.7.1\nVersion: 2.7.1\n\n",
+        "Name: mtplx\nVersion: 2.7.1\nMalformed header\n\n",
+        "Name: mtplx\nVersion: 2.7.1\nSummary: \n\n",
+        "Name: mtplx\nVersion: 2.7.1\nSummary: safe\x00spoof\n\n",
+        "Name : mtplx\nVersion: 2.7.1\n\n",
+        "Name:\tmtplx\nVersion: 2.7.1\n\n",
+        "Name: mtplx \nVersion: 2.7.1\n\n",
+        "Name: other-package\nVersion: 2.7.1\n\n",
+        "Name: mtplx\nVersion: 2.7.2\n\n",
+    ],
+)
+def test_distribution_rejects_duplicate_folded_malformed_or_wrong_identity_metadata(
+    tmp_path: Path, metadata: str
+) -> None:
+    contract = _contract(tmp_path)
+    _replace_distribution_metadata(contract, metadata)
+    probe = _probe_for(contract)
+
+    with pytest.raises(ModelEvidenceFailure, match="model_package_invalid"):
+        ModelEvidenceSession.begin(
+            contract,
+            stage="preflight",
+            run_manifest_sha256="f" * 64,
+            evidence_path=tmp_path / "invalid-metadata.json",
+            credential_file=_private(tmp_path / "credential", b"model-api-token"),
+            probe=probe,
+        )
+
+    assert probe.calls == []
 
 
 def test_record_aggregate_binds_but_does_not_read_standard_console_script_rows(tmp_path: Path) -> None:

@@ -1030,16 +1030,26 @@ def _urlsafe_digest(value: str) -> bytes:
 
 
 def _metadata_fields(value: str) -> dict[str, str]:
+    identity_headers = {"name": "Name", "version": "Version"}
     result: dict[str, str] = {}
     for line in value.splitlines():
         if not line:
             break
-        if ":" not in line:
+        if line[0].isspace() or ":" not in line:
             raise ModelEvidenceFailure("model_package_invalid")
         key, item = line.split(":", 1)
-        if key in result or not item.startswith(" "):
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", key) is None or not item.startswith(" "):
             raise ModelEvidenceFailure("model_package_invalid")
-        result[key] = item.strip()
+        field_value = item[1:]
+        if not field_value or field_value != field_value.strip() or not field_value.isprintable():
+            raise ModelEvidenceFailure("model_package_invalid")
+        normalized = key.casefold()
+        canonical = identity_headers.get(normalized)
+        if canonical is None:
+            continue
+        if key != canonical or canonical in result:
+            raise ModelEvidenceFailure("model_package_invalid")
+        result[canonical] = field_value
     return result
 
 
