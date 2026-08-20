@@ -176,6 +176,11 @@ class RuntimeOutcome:
     model_evidence_sha256: str
     output_ledger_sha256: str
     output_record_count: int
+    proxy_reconciliation_sha256: str | None
+    campaign_id_sha256: str
+    slot_ordinal: int
+    cache_lane: Literal["preflight", "cold", "warm-prefix"]
+    pair_index: int
     file_sha256: str
 
 
@@ -363,6 +368,11 @@ def load_runtime_outcome(
     output_ledger: Path,
     expected_output_record_count: int,
     model_contract_sha256: str | None = None,
+    proxy_reconciliation: Path | None = None,
+    campaign_id_sha256: str | None = None,
+    slot_ordinal: int | None = None,
+    cache_lane: Literal["preflight", "cold", "warm-prefix"] | None = None,
+    pair_index: int | None = None,
 ) -> RuntimeOutcome:
     """Load a passed outcome bound to the exact private attestation and output bytes."""
 
@@ -399,6 +409,11 @@ def load_runtime_outcome(
         "model_evidence_sha256",
         "output_ledger_sha256",
         "output_record_count",
+        "proxy_reconciliation_sha256",
+        "campaign_id_sha256",
+        "slot_ordinal",
+        "cache_lane",
+        "pair_index",
     }
     attestation_sha256 = hashlib.sha256(attestation_bytes).hexdigest()
     output_ledger_sha256 = hashlib.sha256(output_bytes).hexdigest()
@@ -429,6 +444,26 @@ def load_runtime_outcome(
         or not output_bytes.endswith(b"\n")
         or len(output_bytes.splitlines()) != expected_output_record_count
         or any(not line for line in output_bytes.splitlines())
+        or not _valid_outcome_campaign_identity(
+            document,
+            expected_stage=expected_stage,
+            campaign_id_sha256=campaign_id_sha256,
+            slot_ordinal=slot_ordinal,
+            cache_lane=cache_lane,
+            pair_index=pair_index,
+        )
+        or not _valid_outcome_reconciliation(
+            document,
+            expected_stage=expected_stage,
+            reconciliation_path=proxy_reconciliation,
+            run_manifest_sha256=run_manifest_sha256,
+            attestation_sha256=attestation_sha256,
+            model_evidence_sha256=loaded_model_evidence.file_sha256,
+            campaign_id_sha256=campaign_id_sha256,
+            slot_ordinal=slot_ordinal,
+            cache_lane=cache_lane,
+            pair_index=pair_index,
+        )
     ):
         raise RuntimeOutcomeFailure("runtime_outcome_invalid")
     return RuntimeOutcome(
@@ -438,7 +473,93 @@ def load_runtime_outcome(
         model_evidence_sha256=loaded_model_evidence.file_sha256,
         output_ledger_sha256=output_ledger_sha256,
         output_record_count=expected_output_record_count,
+        proxy_reconciliation_sha256=cast(str | None, document["proxy_reconciliation_sha256"]),
+        campaign_id_sha256=cast(str, document["campaign_id_sha256"]),
+        slot_ordinal=cast(int, document["slot_ordinal"]),
+        cache_lane=cast(Literal["preflight", "cold", "warm-prefix"], document["cache_lane"]),
+        pair_index=cast(int, document["pair_index"]),
         file_sha256=hashlib.sha256(serialized).hexdigest(),
+    )
+
+
+def _valid_outcome_campaign_identity(
+    document: dict[str, Any],
+    *,
+    expected_stage: Literal["preflight", "scored-direct", "scored-proxy"],
+    campaign_id_sha256: str | None,
+    slot_ordinal: int | None,
+    cache_lane: Literal["preflight", "cold", "warm-prefix"] | None,
+    pair_index: int | None,
+) -> bool:
+    actual = (
+        document.get("campaign_id_sha256"),
+        document.get("slot_ordinal"),
+        document.get("cache_lane"),
+        document.get("pair_index"),
+    )
+    expected = (campaign_id_sha256, slot_ordinal, cache_lane, pair_index)
+    if (
+        not isinstance(actual[0], str)
+        or _SHA256_HEX.fullmatch(actual[0]) is None
+        or not isinstance(actual[1], int)
+        or isinstance(actual[1], bool)
+        or not isinstance(actual[3], int)
+        or isinstance(actual[3], bool)
+        or actual[2] not in {"preflight", "cold", "warm-prefix"}
+    ):
+        return False
+    if expected_stage == "preflight":
+        if (actual[1], actual[2], actual[3]) != (0, "preflight", 0):
+            return False
+    elif actual[2] == "cold":
+        if not (actual[1] in {1, 2, 3} and actual[3] == actual[1]):
+            return False
+    elif actual[2] == "warm-prefix":
+        if not (actual[1] in {4, 5, 6} and actual[3] == actual[1] - 3):
+            return False
+    else:
+        return False
+    if all(value is None for value in expected):
+        return True
+    return not any(value is None for value in expected) and actual == expected
+
+
+def _valid_outcome_reconciliation(
+    document: dict[str, Any],
+    *,
+    expected_stage: Literal["preflight", "scored-direct", "scored-proxy"],
+    reconciliation_path: Path | None,
+    run_manifest_sha256: str,
+    attestation_sha256: str,
+    model_evidence_sha256: str,
+    campaign_id_sha256: str | None,
+    slot_ordinal: int | None,
+    cache_lane: Literal["preflight", "cold", "warm-prefix"] | None,
+    pair_index: int | None,
+) -> bool:
+    recorded = document.get("proxy_reconciliation_sha256")
+    if expected_stage != "scored-proxy":
+        return reconciliation_path is None and recorded is None
+    if reconciliation_path is None:
+        return False
+    if not _sha256_value(recorded):
+        return False
+    try:
+        from .qualification_reconciliation import load_passed_proxy_reconciliation
+
+        reconciliation = load_passed_proxy_reconciliation(reconciliation_path)
+    except Exception:
+        return False
+    context = reconciliation.context
+    return (
+        reconciliation.file_sha256 == recorded
+        and context.run_manifest_sha256 == run_manifest_sha256
+        and context.attestation_sha256 == attestation_sha256
+        and context.model_evidence_sha256 == model_evidence_sha256
+        and context.campaign_id_sha256 == campaign_id_sha256
+        and context.slot_ordinal == slot_ordinal
+        and context.cache_lane == cache_lane
+        and context.pair_index == pair_index
     )
 
 
@@ -1171,13 +1292,14 @@ def write_preflight_ledger(
     *,
     source_commit: str,
     image_digest: str,
-    contract_digests: dict[str, str],
+    contract_digests: dict[str, dict[str, str]],
     run_manifest_sha256: str,
     runtime_attestation: RuntimeAttestation | None = None,
     failure_reason: str | None = None,
 ) -> None:
     """Atomically retain safe evidence for both passed and failed preflights."""
     validate_run_manifest_sha256(run_manifest_sha256)
+    normalized_contract_digests = _normalize_qualification_contract_digests(contract_digests)
     records = [item.to_dict() for item in observations]
     status = "passed"
     failure = failure_reason
@@ -1202,7 +1324,7 @@ def write_preflight_ledger(
             "source_commit": source_commit,
             "image_digest": image_digest,
             "run_manifest_sha256": run_manifest_sha256,
-            "qualification_contract_digests": dict(sorted(contract_digests.items())),
+            "qualification_contract_digests": normalized_contract_digests,
             "arm_identity_digests": _arm_identity_digests(observations, run_manifest_sha256),
             "runtime_attestation_sha256": (
                 runtime_attestation.file_sha256 if runtime_attestation is not None else None
@@ -1224,6 +1346,24 @@ def write_preflight_ledger(
         raise PreflightFailure(raised_failure or failure)
 
 
+def _normalize_qualification_contract_digests(value: object) -> dict[str, dict[str, str]]:
+    """Require the two frozen scored cache lanes for both treatment arms."""
+
+    if not isinstance(value, dict) or set(value) != {"cold", "warm-prefix"}:
+        raise PreflightFailure("qualification contract digests are invalid")
+    normalized: dict[str, dict[str, str]] = {}
+    for lane in ("cold", "warm-prefix"):
+        arms = value.get(lane)
+        if (
+            not isinstance(arms, dict)
+            or set(arms) != {"direct", "proxy"}
+            or any(not _sha256_value(arms.get(arm)) for arm in ("direct", "proxy"))
+        ):
+            raise PreflightFailure("qualification contract digests are invalid")
+        normalized[lane] = {"direct": cast(str, arms["direct"]), "proxy": cast(str, arms["proxy"])}
+    return normalized
+
+
 def require_scoring_gate(
     *,
     output: Path,
@@ -1232,6 +1372,7 @@ def require_scoring_gate(
     candidate_image_digest: str,
     contract_digest: str,
     arm: Literal["direct", "proxy"],
+    cache_lane: Literal["cold", "warm-prefix"],
     model: str,
     run_manifest_sha256: str,
     scenario_order: list[str] | None = None,
@@ -1259,7 +1400,17 @@ def require_scoring_gate(
     expected_identity = _identity_digest(_sha256(model), run_manifest_sha256)
     if (summary.get("arm_identity_digests") or {}).get(arm) != expected_identity:
         raise SystemExit("scored mode model identity does not match the paired preflight")
-    if (summary.get("qualification_contract_digests") or {}).get(arm) != contract_digest:
+    try:
+        summary_contract_digests = _normalize_qualification_contract_digests(
+            cast(dict[str, dict[str, str]], summary.get("qualification_contract_digests"))
+        )
+    except PreflightFailure:
+        raise SystemExit("scored mode qualification contract does not match the paired preflight") from None
+    if (
+        cache_lane not in {"cold", "warm-prefix"}
+        or not _sha256_value(contract_digest)
+        or summary_contract_digests[cache_lane][arm] != contract_digest
+    ):
         raise SystemExit("scored mode qualification contract does not match the paired preflight")
     try:
         if runtime_attestation is None or scenario_order is None:

@@ -24,6 +24,15 @@ from shiftedx_harness_proxy.qualification_contract import (
     model_boundary_fingerprint,
     read_model_boundary_observer_records,
     write_model_boundary_attempt_ledger,
+    write_preflight_ledger,
+)
+from shiftedx_harness_proxy.qualification_reconciliation import (
+    MetricsSnapshot,
+    ModelOperationSummary,
+    ProxyReconciliationSession,
+    ReconciliationContext,
+    ReconciliationIdentity,
+    RequestAccountingRecord,
 )
 
 
@@ -42,7 +51,6 @@ def test_bypass_cache_observation_accepts_exact_mtplx_shape_without_postcommit_s
             }
         }
     )
-
     assert observation == CacheObservation(
         prompt_tokens=31,
         cached_tokens=0,
@@ -55,6 +63,21 @@ def test_bypass_cache_observation_accepts_exact_mtplx_shape_without_postcommit_s
         postcommit_stored=False,
     )
 
+
+def test_preflight_writer_rejects_flat_cache_lane_contract_digests_before_creating_evidence(tmp_path) -> None:
+    output = tmp_path / "preflight.jsonl"
+
+    with pytest.raises(PreflightFailure, match="qualification contract digest"):
+        write_preflight_ledger(
+            output,
+            [],
+            source_commit="a" * 40,
+            image_digest="sha256:" + "b" * 64,
+            contract_digests={"direct": "c" * 64, "proxy": "d" * 64},
+            run_manifest_sha256="e" * 64,
+        )
+
+    assert not output.exists()
 
 @pytest.mark.parametrize(
     "stats_override",
@@ -320,6 +343,11 @@ def test_runtime_outcome_loads_exact_private_evidence_identity(tmp_path) -> None
         "model_evidence_sha256": hashlib.sha256(evidence.read_bytes()).hexdigest(),
         "output_ledger_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
         "output_record_count": 5,
+        "proxy_reconciliation_sha256": None,
+        "campaign_id_sha256": "a" * 64,
+        "slot_ordinal": 0,
+        "cache_lane": "preflight",
+        "pair_index": 0,
     }
     serialized = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
     path.write_bytes(serialized)
@@ -343,6 +371,155 @@ def test_runtime_outcome_loads_exact_private_evidence_identity(tmp_path) -> None
     assert outcome.model_evidence_sha256 == document["model_evidence_sha256"]
     assert outcome.output_ledger_sha256 == document["output_ledger_sha256"]
     assert outcome.output_record_count == 5
+
+
+def test_passed_runtime_outcome_rejects_absent_campaign_identity(tmp_path) -> None:
+    path, attestation, evidence, output, document = _runtime_outcome_fixture(tmp_path)
+    document.update(
+        {
+            "campaign_id_sha256": None,
+            "slot_ordinal": None,
+            "cache_lane": None,
+            "pair_index": None,
+        }
+    )
+    path.write_text(json.dumps(document), encoding="utf-8")
+    path.chmod(0o600)
+
+    with pytest.raises(RuntimeOutcomeFailure, match="runtime_outcome_invalid"):
+        load_runtime_outcome(
+            path,
+            expected_stage="preflight",
+            run_manifest_sha256="c" * 64,
+            attestation=attestation,
+            model_evidence=evidence,
+            model_identity_sha256="f" * 64,
+            model_contract_sha256="f" * 64,
+            output_ledger=output,
+            expected_output_record_count=5,
+        )
+
+
+def test_scored_proxy_outcome_requires_a_matching_passed_reconciliation_artifact(tmp_path) -> None:
+    attestation = tmp_path / "scored-proxy-runtime-attestation.json"
+    attestation.write_text('{"model_identity_sha256":"' + "f" * 64 + '"}\n', encoding="utf-8")
+    attestation.chmod(0o600)
+    output = tmp_path / "scored-proxy.jsonl"
+    output.write_text('{"record":1}\n', encoding="utf-8")
+    output.chmod(0o600)
+    evidence = _write_model_evidence(tmp_path / "scored-proxy-model-cache-evidence.json", stage="score-proxy")
+    context = ReconciliationContext(
+        run_manifest_sha256="c" * 64,
+        campaign_id_sha256="d" * 64,
+        slot_ordinal=1,
+        cache_lane="cold",
+        pair_index=1,
+        attestation_sha256=hashlib.sha256(attestation.read_bytes()).hexdigest(),
+        model_evidence_sha256=hashlib.sha256(evidence.read_bytes()).hexdigest(),
+        observer_ledger_sha256="1" * 64,
+        request_ledger_sha256="2" * 64,
+    )
+    zero = _metrics_snapshot()
+    after = MetricsSnapshot(**{**zero.to_dict(), "downstream_requests": 1, "upstream_calls": 1, "phase_acquisition": 1})
+
+    class Reader:
+        snapshots = [zero, after]
+
+        def snapshot(self):
+            return self.snapshots.pop(0)
+
+    observer = ModelBoundaryRecord(
+        sequence=1,
+        digest="3" * 64,
+        fields={"compatibility": {"phase": "acquisition"}},
+        status_code=200,
+        cache=None,
+    )
+    request = RequestAccountingRecord(
+        sequence=1,
+        outcome="succeeded",
+        local_projection=False,
+        attempt_sequence_start=1,
+        attempt_sequence_end=1,
+        attempt_count=1,
+        successful_attempt_count=1,
+        phase_counts={"acquisition": 1, "finalization": 0},
+        retry_attempt_count=0,
+        blocked_duplicate_count=0,
+        blocked_stall_count=0,
+    )
+    reconciliation_path = tmp_path / "scored-proxy-reconciliation.json"
+    reconciliation = ProxyReconciliationSession.begin(
+        ReconciliationIdentity(
+            run_manifest_sha256=context.run_manifest_sha256,
+            campaign_id_sha256=context.campaign_id_sha256,
+            slot_ordinal=context.slot_ordinal,
+            cache_lane=context.cache_lane,
+            pair_index=context.pair_index,
+            attestation_sha256=context.attestation_sha256,
+        ),
+        Reader(),
+    ).complete(context, [observer], [request], ModelOperationSummary(1, 0), reconciliation_path)
+    path = tmp_path / "scored-proxy-runtime-outcome.json"
+    document = {
+        "schema_version": "1.0",
+        "record_type": "qualification_runtime_outcome",
+        "stage": "scored-proxy",
+        "status": "passed",
+        "action_exit_code": 0,
+        "failure_category": None,
+        "run_manifest_sha256": "c" * 64,
+        "attestation_sha256": context.attestation_sha256,
+        "model_evidence_sha256": context.model_evidence_sha256,
+        "output_ledger_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+        "output_record_count": 1,
+        "proxy_reconciliation_sha256": reconciliation.file_sha256,
+        "campaign_id_sha256": context.campaign_id_sha256,
+        "slot_ordinal": 1,
+        "cache_lane": "cold",
+        "pair_index": 1,
+    }
+    path.write_text(json.dumps(document), encoding="utf-8")
+    path.chmod(0o600)
+
+    outcome = load_runtime_outcome(
+        path,
+        expected_stage="scored-proxy",
+        run_manifest_sha256="c" * 64,
+        attestation=attestation,
+        model_evidence=evidence,
+        model_identity_sha256="f" * 64,
+        model_contract_sha256="f" * 64,
+        output_ledger=output,
+        expected_output_record_count=1,
+        proxy_reconciliation=reconciliation_path,
+        campaign_id_sha256=context.campaign_id_sha256,
+        slot_ordinal=1,
+        cache_lane="cold",
+        pair_index=1,
+    )
+
+    assert outcome.proxy_reconciliation_sha256 == reconciliation.file_sha256
+
+
+def _metrics_snapshot() -> MetricsSnapshot:
+    return MetricsSnapshot(
+        downstream_requests=0,
+        upstream_calls=0,
+        blocked_duplicates=0,
+        blocked_stalls=0,
+        correction_turns=0,
+        receipt_projections=0,
+        local_projection_upstream_calls_avoided=0,
+        errors=0,
+        deadline_expiries=0,
+        cancellations=0,
+        phase_acquisition=0,
+        phase_finalization=0,
+        phase_schema_rejections=0,
+        admission_rejections=0,
+        rate_rejections=0,
+    )
 
 
 @pytest.mark.parametrize(
@@ -656,6 +833,11 @@ def _runtime_outcome_fixture(tmp_path):
         "model_evidence_sha256": hashlib.sha256(evidence.read_bytes()).hexdigest(),
         "output_ledger_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
         "output_record_count": 5,
+        "proxy_reconciliation_sha256": None,
+        "campaign_id_sha256": "a" * 64,
+        "slot_ordinal": 0,
+        "cache_lane": "preflight",
+        "pair_index": 0,
     }
     path.write_text(json.dumps(document), encoding="utf-8")
     path.chmod(0o600)
