@@ -3,17 +3,11 @@
 [![CI](https://github.com/shiftedx/shiftedx-agent-harness-proxy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/shiftedx/shiftedx-agent-harness-proxy/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Status: v0.1 release candidate — do not promote.** The supported v1 surface is
-implementation-complete, covered by 754 automated tests, and verified by hardened
-multi-architecture image CI, dependency and image scanning, SBOM generation, provenance
-attestation, and bounded-load checks. The first complete cold model-backed qualification missed
-the quality and observability gates. A later AEON historical-parity campaign demonstrated a large
-proxy quality benefit but missed the frozen full-agentic latency gate and did not use the frozen
-temperature-0 promotion contract, so no stable package or container release has been promoted.
-See [Release status](RELEASE_STATUS.md), the original
-[qualification result](benchmark-reports/v1-qualification-result-2026-08-20.md), the
-[historical-parity result](benchmark-reports/aeon-historical-parity-result-2026-08-20.md), and the
-[operator runbook](docs/operator-runbook.md).
+**Status: approved for controlled deployment of the exact AEON-tested artifact; not a stable or
+public release.** The proxy improved pass rate from `55.0%` to `87.8%`, but full-agentic p95 was
+`170.5%` of direct when cold and `145.6%` when warm-prefix, failing the `125%` ceiling. See
+[release status](RELEASE_STATUS.md), [evidence](benchmark-reports/aeon-historical-parity-result-2026-08-20.md),
+and the [operator runbook](docs/operator-runbook.md).
 
 A small, stateless policy proxy for OpenAI-compatible Chat Completions. It blocks repeated or
 stalled tool calls, requires verification after mutations, and corrects malformed terminal JSON
@@ -95,6 +89,7 @@ UPSTREAM_BASE_URL=http://host.docker.internal:8000/v1 \
 ```
 
 Clients must use `CLIENT_PROXY_KEY` as their bearer token in this mode.
+The `production` profile is a hardened configuration mode, not production certification.
 Downstream credentials, cookies, and arbitrary forwarding headers are never sent upstream.
 The proxy sends only its validated or generated `X-Request-ID` correlation ID to the credentialed
 upstream; downstream `OpenAI-Organization` and `OpenAI-Project` headers are not forwarded.
@@ -210,8 +205,7 @@ in [benchmarking](docs/benchmarking.md), the
 [v1 qualification plan](benchmark-reports/v1-qualification-plan.md), and the
 [qualification result](benchmark-reports/v1-qualification-result-2026-08-20.md). The separate
 [AEON historical-parity result](benchmark-reports/aeon-historical-parity-result-2026-08-20.md)
-records the later positive quality evidence and its non-promotion limitations.
+records the later positive quality evidence and controlled-deployment limits.
 
-This is an unreleased `0.1.0` release candidate. The source repository is suitable for review and
-evaluation, but no package or container image has been promoted as a stable public release.
-Publication and the final production decision require explicit owner authorization.
+This is an unreleased `0.1.0` candidate. Authorized operators may deploy the exact evaluated image
+under the documented exception; no package or container image is a stable public release.

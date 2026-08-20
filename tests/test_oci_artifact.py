@@ -46,11 +46,20 @@ def test_release_compose_overlay_requires_an_exact_image_and_disables_build() ->
     assert "build: !reset null" in overlay
 
 
+def test_compose_can_select_the_tested_phase_split_mode() -> None:
+    compose = (ROOT / "docker-compose.yml").read_text()
+    assert (
+        'UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE: '
+        '"${UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE:-passthrough}"'
+    ) in compose
+
+
 def test_ci_validates_the_merged_exact_image_compose_configuration() -> None:
     workflow = (ROOT / ".github/workflows/ci.yml").read_text()
     assert "Validate exact-image Compose configuration" in workflow
     assert 'assert "build" not in proxy' in workflow
     assert 'assert proxy["image"] == expected_image' in workflow
+    assert 'assert proxy["environment"]["UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE"] == "phase_split"' in workflow
 
 
 def test_smoke_uses_the_production_profile_with_a_file_mounted_credential() -> None:

@@ -53,6 +53,7 @@ jobs:
         env:
           PROXY_IMAGE: registry.example/shiftedx-agent-harness-proxy@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
           UPSTREAM_BASE_URL: http://model.internal:8000/v1
+          UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE: phase_split
         run: |
           docker compose \
             -f docker-compose.yml \
@@ -68,6 +69,7 @@ jobs:
           proxy = yaml.safe_load(Path("release-compose.example.yml").read_text())["services"]["proxy"]
           assert proxy["image"] == expected_image
           assert "build" not in proxy
+          assert proxy["environment"]["UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE"] == "phase_split"
           PY
       - uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
       - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0

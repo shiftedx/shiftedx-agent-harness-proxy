@@ -4,6 +4,9 @@ This runbook covers the authenticated, non-streaming v1 Chat Completions release
 Harness Proxy is policy middleware: it does not provide TLS, execute tools, select arbitrary
 upstreams, or sandbox the Downstream Client's tool runner.
 
+The exact AEON-tested artifact is authorized for controlled deployment under the latency exception
+in [Release status](../RELEASE_STATUS.md). It is not a stable/public release or production-certified.
+
 ## Supported topology
 
 ```text
@@ -33,6 +36,13 @@ Record and retain:
 
 For production qualification or promotion, deploy an exact approved image. Do not rebuild from a
 floating branch or use an unverified local tag.
+
+The controlled-deployment candidate is source
+`75424328ce0dc0bcef6171b42e390c5ba8559471`, signed ARM64 OCI root
+`sha256:c673ec73ffded8d28200f6157b696fb451735a3416a55407e686587150fe4230`.
+That digest identifies the retained CI artifact; it is not a registry URL. Verify and preload the
+artifact or mirror it to an approved internal registry, then use that registry's immutable digest
+reference. A source build does not reproduce the evaluated bytes.
 
 ## Secrets
 
@@ -74,6 +84,7 @@ reference available to Docker, then add the no-build release overlay:
 APPROVED_PROXY_IMAGE='registry.example/shiftedx-agent-harness-proxy@sha256:<digest>'
 PROXY_IMAGE="$APPROVED_PROXY_IMAGE" \
 UPSTREAM_BASE_URL=http://host.docker.internal:8000/v1 \
+UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE=phase_split \
   docker compose \
   -f docker-compose.yml \
   -f docker-compose.production.yml \
@@ -85,6 +96,8 @@ Inspect the rendered configuration. Production must retain:
 
 - `DEPLOYMENT_PROFILE=production`;
 - an explicit fixed `UPSTREAM_BASE_URL` ending at the intended `/v1` base;
+- the preflight-approved `UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE`; the tested AEON/MTPLX contract
+  requires `phase_split`;
 - loopback/private publication rather than `0.0.0.0:8090`;
 - non-root UID/GID `10001:10001`, read-only root filesystem, all capabilities dropped, and
   `no-new-privileges`;
@@ -110,6 +123,7 @@ Exact-image qualification or release operation:
 APPROVED_PROXY_IMAGE='registry.example/shiftedx-agent-harness-proxy@sha256:<digest>'
 PROXY_IMAGE="$APPROVED_PROXY_IMAGE" \
 UPSTREAM_BASE_URL=http://host.docker.internal:8000/v1 \
+UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE=phase_split \
   docker compose \
   -f docker-compose.yml \
   -f docker-compose.production.yml \
@@ -119,6 +133,10 @@ UPSTREAM_BASE_URL=http://host.docker.internal:8000/v1 \
 
 If an upstream secret is required, include `-f docker-compose.secrets.yml` in the same ordered file
 list. Save the exact rendered configuration digest with the deployment record.
+
+The quality result also binds the client-side `historical-aeon-v1` sampler: temperature `1.0`,
+top-p `0.95`, top-k `20`, thinking enabled at medium effort, and a 1024-token response limit.
+Changing that profile is allowed operationally but is not covered by the reported quality evidence.
 
 ## Preflight
 
@@ -164,6 +182,12 @@ Scrape `/metrics` through the authenticated management path. At minimum alert on
 
 Metrics intentionally have no prompt, tool, credential, tenant, or principal labels. Do not add
 request-derived labels in downstream monitoring relabel rules.
+
+For the tested AEON profile, alert on complete agentic case latency, not only proxy service time.
+Proxy-only p95 was `7.783 ms`, but full-agentic p95 was `170.5%` of direct when cold and `145.6%`
+when warm-prefix, failing the `125%` ceiling because the policy can add bounded model turns. Canary
+before broader traffic and stop expansion if end-to-end latency or correction tails exceed the
+deployment's accepted budget.
 
 ## Public error and retry behavior
 

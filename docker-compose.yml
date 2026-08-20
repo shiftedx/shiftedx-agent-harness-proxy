@@ -8,6 +8,7 @@ services:
     environment:
       DEPLOYMENT_PROFILE: "development"
       UPSTREAM_BASE_URL: "${UPSTREAM_BASE_URL:-http://host.docker.internal:8000/v1}"
+      UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE: "${UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE:-passthrough}"
       HARNESS_PROFILE: "shiftedx-harness-v1"
       TELEMETRY_ENABLED: "true"
     extra_hosts:
