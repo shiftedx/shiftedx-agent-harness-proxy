@@ -4,12 +4,15 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 **Status: v0.1 release candidate — do not promote.** The supported v1 surface is
-implementation-complete, covered by 214 automated tests, and verified by hardened
+implementation-complete, covered by 754 automated tests, and verified by hardened
 multi-architecture image CI, dependency and image scanning, SBOM generation, provenance
 attestation, and bounded-load checks. The first complete cold model-backed qualification missed
-the quality and observability gates, so no stable package or container release has been promoted.
-See [Release status](RELEASE_STATUS.md), the
-[qualification result](benchmark-reports/v1-qualification-result-2026-08-20.md), and the
+the quality and observability gates. A later AEON historical-parity campaign demonstrated a large
+proxy quality benefit but missed the frozen full-agentic latency gate and did not use the frozen
+temperature-0 promotion contract, so no stable package or container release has been promoted.
+See [Release status](RELEASE_STATUS.md), the original
+[qualification result](benchmark-reports/v1-qualification-result-2026-08-20.md), the
+[historical-parity result](benchmark-reports/aeon-historical-parity-result-2026-08-20.md), and the
 [operator runbook](docs/operator-runbook.md).
 
 A small, stateless policy proxy for OpenAI-compatible Chat Completions. It blocks repeated or
@@ -198,14 +201,16 @@ uv run mypy src
 ./scripts/docker-smoke.sh
 ```
 
-The release-candidate branch has 214 tests. CI also runs the near-body-limit admission soak,
+The current release-candidate branch has 754 tests. CI also runs the near-body-limit admission soak,
 dependency audit, multi-architecture OCI build, hardened production-profile smoke, exact-image
 vulnerability/secret/misconfiguration scan, SBOM generation, release-manifest capture, and SLSA
 provenance attestation. The complete evidence boundary is summarized in
 [Release status](RELEASE_STATUS.md); benchmark methodology and frozen promotion gates are documented
 in [benchmarking](docs/benchmarking.md), the
 [v1 qualification plan](benchmark-reports/v1-qualification-plan.md), and the
-[qualification result](benchmark-reports/v1-qualification-result-2026-08-20.md).
+[qualification result](benchmark-reports/v1-qualification-result-2026-08-20.md). The separate
+[AEON historical-parity result](benchmark-reports/aeon-historical-parity-result-2026-08-20.md)
+records the later positive quality evidence and its non-promotion limitations.
 
 This is an unreleased `0.1.0` release candidate. The source repository is suitable for review and
 evaluation, but no package or container image has been promoted as a stable public release.

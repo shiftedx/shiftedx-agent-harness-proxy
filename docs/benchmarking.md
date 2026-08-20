@@ -360,3 +360,9 @@ handling are frozen in the
 smoke produced no benchmark row and is retained only as a
 [`historical audit note`](../benchmark-reports/historical/paired-benchmark-interruption-2026-08-17.md);
 it is not the current release status or a quality result.
+
+The separate
+[`AEON historical-parity result`](../benchmark-reports/aeon-historical-parity-result-2026-08-20.md)
+records the completed temperature-1.0 replacement-candidate experiment. It demonstrates a large
+proxy-assisted quality gain under the historical sampler, but it does not supersede the frozen
+temperature-0 promotion plan or waive failed and unavailable promotion gates.

@@ -7,6 +7,13 @@ The v1 runtime is implementation-complete for its declared scope and ready for p
 operational gates but failed model quality and failure-path observability. It is not a generally
 available production release.
 
+A later replacement-candidate experiment with the AEON historical sampler demonstrated a clear
+quality benefit: direct `99/180` versus proxy-assisted `158/180`, with the proxy winning all six
+cold/warm matched pairs. That evidence does not authorize promotion because it used temperature
+`1.0` rather than the frozen v1 temperature-0 contract, failed the full-agentic p95 gate in both
+cache lanes, and has no approved rollback target. See the
+[historical-parity result](benchmark-reports/aeon-historical-parity-result-2026-08-20.md).
+
 Supported now:
 
 - authenticated, non-streaming OpenAI-compatible `GET /v1/models` and
@@ -31,7 +38,7 @@ candidate incomplete within its supported surface.
 
 ## Verified evidence
 
-The evaluated source is commit `3d8805c1d96d0790526a333ca5074eea20b16b72`. Its post-merge
+The original failed v1 source is commit `3d8805c1d96d0790526a333ca5074eea20b16b72`. Its post-merge
 [main CI run](https://github.com/shiftedx/shiftedx-agent-harness-proxy/actions/runs/32314958324)
 passed:
 
@@ -43,17 +50,20 @@ passed:
 - vulnerability, secret, and misconfiguration scanning;
 - CycloneDX SBOM, immutable release manifest, SLSA provenance, and retained evidence upload.
 
-The exact candidate, model, benchmark, runtime, host contract, results, and limitations are recorded
+That exact candidate, model, benchmark, runtime, host contract, results, and limitations are recorded
 in the sanitized
 [qualification result](benchmark-reports/v1-qualification-result-2026-08-20.md). Raw evidence stays
 private.
 
 ## Promotion boundary
 
-Promotion is blocked. Three complete cold pairs scored direct `6/102` and proxy `0/102`; all proxy
-rows ended in bounded harness exhaustion. Failure-path request/upstream counters also omitted failed
-transactions and attempts. The warm lane was not run after the cold result made promotion
-impossible, so completeness is an additional failed gate.
+Promotion remains blocked. The original three complete cold pairs scored direct `6/102` and proxy
+`0/102`; all proxy rows ended in bounded harness exhaustion. Failure-path request/upstream counters
+also omitted failed transactions and attempts. The warm lane was not run after the cold result made
+promotion impossible, so completeness is an additional failed gate. The replacement
+historical-parity experiment demonstrates that the remediated proxy restores the quality benefit
+and reconciled accounting for its named contract, but its sampler does not supersede the frozen v1
+plan and its full-agentic latency misses the promotion ceiling.
 
 Use the repository as an unreleased evaluation candidate and describe it as “implementation-complete,
 qualification attempted, do not promote.” Do not describe it as production-certified. A new
@@ -69,5 +79,6 @@ tracked in [issue #19](https://github.com/shiftedx/shiftedx-agent-harness-proxy/
 - [Benchmark protocol](docs/benchmarking.md): paired-run methodology and sanitization boundary
 - [Qualification plan](benchmark-reports/v1-qualification-plan.md): frozen promotion gates
 - [Qualification result](benchmark-reports/v1-qualification-result-2026-08-20.md): sanitized result and remediation
+- [AEON historical-parity result](benchmark-reports/aeon-historical-parity-result-2026-08-20.md): positive quality evidence and non-promotion limits
 - [Changelog](CHANGELOG.md): release-candidate capabilities
 - [Security policy](SECURITY.md): deployment boundary and private reporting

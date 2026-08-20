@@ -137,3 +137,9 @@ the metrics discrepancy as a release blocker.
 
 Evaluator recommendation: **DO NOT PROMOTE `3d8805c`**. The maintainer's final decision remains
 human-owned; absent an explicit `PROMOTE`, this candidate stays unreleased.
+
+Later replacement work and the completed temperature-1.0 historical-parity campaign are reported
+separately in the
+[`AEON historical-parity result`](aeon-historical-parity-result-2026-08-20.md). That experiment
+demonstrates positive quality impact without rewriting this result or superseding the frozen
+temperature-0 promotion contract.
