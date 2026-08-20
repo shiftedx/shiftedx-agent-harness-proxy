@@ -2,8 +2,10 @@
 
 ## v0.1 release candidate
 
-The v1 runtime is implementation-complete for its declared scope and ready for public review and
-operator-controlled qualification. It is not yet a generally available production release.
+The v1 runtime is implementation-complete for its declared scope and ready for public review. The
+2026-08-20 model-backed qualification result is **DO NOT PROMOTE**: the candidate passed most
+operational gates but failed model quality and failure-path observability. It is not a generally
+available production release.
 
 Supported now:
 
@@ -29,12 +31,11 @@ candidate incomplete within its supported surface.
 
 ## Verified evidence
 
-The latest runtime-changing baseline is source commit
-`106910410ccda393b5d9a7ecb6c0615fa5d82b29`. Its post-merge
-[main CI run](https://github.com/shiftedx/shiftedx-agent-harness-proxy/actions/runs/32300168490)
+The evaluated source is commit `3d8805c1d96d0790526a333ca5074eea20b16b72`. Its post-merge
+[main CI run](https://github.com/shiftedx/shiftedx-agent-harness-proxy/actions/runs/32314958324)
 passed:
 
-- 211 tests, Ruff, strict mypy, lock validation, and dependency audit;
+- 214 tests, Ruff, strict mypy, lock validation, and dependency audit;
 - a three-wave, near-`MAX_REQUEST_BYTES` admission soak with bounded RSS and real TCP upstream
   connections;
 - multi-architecture OCI construction;
@@ -42,22 +43,23 @@ passed:
 - vulnerability, secret, and misconfiguration scanning;
 - CycloneDX SBOM, immutable release manifest, SLSA provenance, and retained evidence upload.
 
-Subsequent public-readiness documentation does not alter the runtime. The exact source commit,
-image digest, model/runtime contract, thresholds, and host profile used for production qualification
-must nevertheless be frozen together immediately before trial 1. The resulting immutable manifest
-belongs in the sanitized qualification report and release notes, not in an editable “latest” claim.
+The exact candidate, model, benchmark, runtime, host contract, results, and limitations are recorded
+in the sanitized
+[qualification result](benchmark-reports/v1-qualification-result-2026-08-20.md). Raw evidence stays
+private.
 
 ## Promotion boundary
 
-The remaining gate is the human-owned model-backed qualification tracked in
-[issue #19](https://github.com/shiftedx/shiftedx-agent-harness-proxy/issues/19). The pre-registered
-[qualification plan](benchmark-reports/v1-qualification-plan.md) requires three complete paired
-direct/proxy trials, distinct proven cold/warm lanes, declared load and fault scenarios, a verified
-rollback exercise, and an explicit maintainer decision.
+Promotion is blocked. Three complete cold pairs scored direct `6/102` and proxy `0/102`; all proxy
+rows ended in bounded harness exhaustion. Failure-path request/upstream counters also omitted failed
+transactions and attempts. The warm lane was not run after the cold result made promotion
+impossible, so completeness is an additional failed gate.
 
-Until that evidence exists, use the repository as a release candidate and describe it as
-“implementation-complete and qualification-ready.” Do not describe it as production-certified,
-publish private transcripts, or infer model-quality claims from scripted proxy-only measurements.
+Use the repository as an unreleased evaluation candidate and describe it as “implementation-complete,
+qualification attempted, do not promote.” Do not describe it as production-certified. A new
+candidate must fix model/tool-acquisition compatibility and failed-attempt accounting, then rerun
+the full pre-registered cold/warm protocol. The final promotion decision remains human-owned and is
+tracked in [issue #19](https://github.com/shiftedx/shiftedx-agent-harness-proxy/issues/19).
 
 ## Public review map
 
@@ -66,5 +68,6 @@ publish private transcripts, or infer model-quality claims from scripted proxy-o
 - [Operator runbook](docs/operator-runbook.md): production topology, monitoring, and rollback
 - [Benchmark protocol](docs/benchmarking.md): paired-run methodology and sanitization boundary
 - [Qualification plan](benchmark-reports/v1-qualification-plan.md): frozen promotion gates
+- [Qualification result](benchmark-reports/v1-qualification-result-2026-08-20.md): sanitized result and remediation
 - [Changelog](CHANGELOG.md): release-candidate capabilities
 - [Security policy](SECURITY.md): deployment boundary and private reporting
