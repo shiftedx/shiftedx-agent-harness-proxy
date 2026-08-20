@@ -89,6 +89,41 @@ Each implementation packet starts with a red test or a failing measurement, ends
 full validation, and returns a commit. Keep file ownership disjoint within a wave. Ask Sol to settle
 ambiguous policy or evidence semantics before Terra implements them.
 
+## Transport decision
+
+Retain pooled HTTP/1.1 over TCP as the qualified downstream and upstream transport. WebSocket is
+layered over TCP and is not a latency optimization by itself. The current proxy already owns one
+long-lived HTTPX client with bounded connection pooling and keep-alive, while the pinned MTPLX
+contract exposes HTTP Chat Completions and SSE rather than a versioned WebSocket Chat Completions
+endpoint. Do not add a proxy-only WebSocket protocol or represent it as OpenAI-compatible transport.
+
+The demonstrated latency gap is not transport-sized: exact-image proxy-only p95 is `7.783 ms`, while
+the full-agentic p95 deltas are `26.182 s` cold and `12.946 s` warm-prefix. Prioritize avoided model
+turns, corrections, repeated phases, safe Local Projection, and cache reuse over alternate framing.
+SSE may be evaluated separately for perceived time-to-first-byte, but it cannot satisfy the
+time-to-final-valid-outcome gate and must not release content before the policy can uphold its
+terminal-schema, correction, cancellation, and accounting contract.
+
+Instrument connection establishment and reuse in the diagnosis workstream. Record aggregate-only
+fresh-versus-reused connection counts and connect, pool-wait, request-write, response-header, and
+response-read timing where the libraries expose them without raw content. Run a bounded HTTP
+transport micro-probe comparing the current pool with an explicitly declared keep-alive expiry under
+identical concurrency and request spacing. Accept a pool-setting change only when it improves the
+predeclared pass-through wall/TTFT measurements without weakening deadlines, cancellation,
+connection limits, readiness, error mapping, or qualification reproducibility.
+
+Reopen an alternate-transport design only if both conditions hold:
+
+- retained evidence attributes at least the larger of `5 ms` or `5%` of matched pass-through p95 to
+  avoidable HTTP transport overhead after connection-pool tuning; and
+- authoritative MTPLX exposes a versioned native transport contract with equivalent authentication,
+  request semantics, concurrency, cancellation, errors, observability, and cache behavior.
+
+Any such experiment is a separate HTTP-versus-candidate A/B against the pinned runtime. It requires
+direct/proxy semantic parity, operational and privacy gates, a rollback path, and measured end-to-end
+improvement before it may replace the HTTP comparator. HTTP/2, Unix-domain sockets, SSE, and
+WebSocket are candidates only under this evidence gate; none is assumed faster in advance.
+
 ## Execution sequence
 
 ### 1. Freeze the diagnosis contract
@@ -99,7 +134,8 @@ Extend private qualification evidence so every scored downstream request can be 
 raw content by:
 
 - downstream wall time and outcome;
-- proxy policy time, admission/queue time, and transport time where observable;
+- proxy policy time, admission/queue time, and transport time where observable, including aggregate
+  connection reuse and connect/pool-wait/write/response-header/read partitions;
 - ordered upstream attempt count and acquisition/finalization phase;
 - per-attempt wall time, TTFT, decode time/rate, cache result, and status;
 - correction, repeated-phase retry, duplicate/stall block, and Local Projection counts;
