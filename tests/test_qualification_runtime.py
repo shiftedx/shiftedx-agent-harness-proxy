@@ -778,7 +778,15 @@ class _FakeRuntimeRunner:
             elif self.drift == "image":
                 document["Image"] = "sha256:" + "d" * 64
             elif self.drift == "stop_timeout":
-                document["HostConfig"]["StopTimeout"] = 1
+                document["Config"]["StopTimeout"] = 1
+            elif self.drift == "stop_timeout_missing":
+                document["Config"].pop("StopTimeout")
+            elif self.drift == "stop_timeout_string":
+                document["Config"]["StopTimeout"] = "20"
+            elif self.drift == "stop_timeout_float":
+                document["Config"]["StopTimeout"] = 20.0
+            elif self.drift == "stop_timeout_boolean":
+                document["Config"]["StopTimeout"] = True
             return SimpleNamespace(
                 returncode=0,
                 stdout=json.dumps(document),
@@ -943,6 +951,8 @@ def _runtime_inspect(labels: dict[str, str], volume_name: str, *, running: bool 
         "Image": "sha256:" + "c" * 64,
         "Config": {
             "User": "10001:10001",
+            # Docker 29 stores --stop-timeout on Config, not HostConfig.
+            "StopTimeout": 20,
             "Env": [
                 "DEPLOYMENT_PROFILE=production",
                 "HARNESS_PROFILE=shiftedx-harness-v1",
@@ -961,7 +971,7 @@ def _runtime_inspect(labels: dict[str, str], volume_name: str, *, running: bool 
             "CapDrop": ["ALL"],
             "SecurityOpt": ["no-new-privileges:true"],
             "PidsLimit": 128,
-            "StopTimeout": 20,
+            "StopTimeout": None,
             "Memory": 536870912,
             "NanoCpus": 1000000000,
             "Init": True,
@@ -2100,7 +2110,20 @@ def test_setup_failures_never_invoke_action_and_clean_only_created_resources(
         assert container_cleanup < volume_cleanup
 
 
-@pytest.mark.parametrize("drift", ["resources", "bind", "settings", "image", "stop_timeout"])
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "resources",
+        "bind",
+        "settings",
+        "image",
+        "stop_timeout",
+        "stop_timeout_missing",
+        "stop_timeout_string",
+        "stop_timeout_float",
+        "stop_timeout_boolean",
+    ],
+)
 def test_inspect_drift_fails_closed_before_action_and_cleans(drift, tmp_path) -> None:
     manifest = _manifest(tmp_path)
     private_run_dir = _private_run(tmp_path)
