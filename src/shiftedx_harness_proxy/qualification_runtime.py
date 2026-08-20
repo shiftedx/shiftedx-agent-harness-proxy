@@ -133,10 +133,22 @@ _CHECK_KEYS = (
 _LABEL_PREFIX = "io.shiftedx.qualification"
 _CONTAINER_LISTEN_HOST = "0.0.0.0"  # noqa: S104 - proxy is published only on a loopback host binding
 _MAX_HTTP_RESPONSE_BYTES = 1 << 20
-_FROZEN_HOST_TOOLS = {
-    "docker": Path("/usr/local/bin/docker"),
-    "git": Path("/usr/bin/git"),
-}
+# These are trusted locations, not a search path.  The small platform-specific
+# allowlist supports the qualification hosts without permitting PATH lookup at
+# command execution time.  Tests may replace this mapping with dedicated,
+# absolute fixture executables.
+if sys.platform == "darwin":
+    _FROZEN_HOST_TOOLS: dict[str, tuple[Path, ...]] = {
+        "docker": (Path("/usr/local/bin/docker"), Path("/opt/homebrew/bin/docker")),
+        "git": (Path("/usr/bin/git"), Path("/opt/homebrew/bin/git"), Path("/usr/local/bin/git")),
+    }
+elif sys.platform.startswith("linux"):
+    _FROZEN_HOST_TOOLS = {
+        "docker": (Path("/usr/bin/docker"), Path("/usr/local/bin/docker")),
+        "git": (Path("/usr/bin/git"), Path("/usr/local/bin/git")),
+    }
+else:
+    _FROZEN_HOST_TOOLS = {"docker": (), "git": ()}
 
 
 class QualificationRuntimeFailure(RuntimeError):
@@ -185,19 +197,37 @@ def _frozen_host_command(
 
     if not argv:
         return None
-    executable = next(
-        (path for name, path in _FROZEN_HOST_TOOLS.items() if argv[0] in {name, str(path)}),
-        None,
-    )
-    if executable is None:
+    requested = argv[0]
+    tool_name = requested if requested in _FROZEN_HOST_TOOLS else Path(requested).name
+    candidates = _FROZEN_HOST_TOOLS.get(tool_name)
+    if candidates is None:
         return argv, env
-    try:
-        executable_status = executable.stat()
-    except OSError:
-        return None
-    if not stat.S_ISREG(executable_status.st_mode) or not os.access(executable, os.X_OK):
+
+    # An explicit Docker/Git path is acceptable only when it is one of the
+    # frozen locations.  This rejects an attacker-controlled absolute path as
+    # well as a relative path such as ``./docker``.
+    if requested != tool_name:
+        explicit = Path(requested)
+        if not explicit.is_absolute() or explicit not in candidates:
+            return None
+        candidates = (explicit,)
+
+    executable = next((path for path in candidates if _is_trusted_host_tool(path)), None)
+    if executable is None:
         return None
     return (str(executable), *argv[1:]), {}
+
+
+def _is_trusted_host_tool(path: Path) -> bool:
+    """Require an allowlisted absolute regular executable without PATH resolution."""
+
+    if not path.is_absolute():
+        return False
+    try:
+        status = path.stat()
+    except OSError:
+        return False
+    return stat.S_ISREG(status.st_mode) and os.access(path, os.X_OK)
 
 
 def _safe_http_response(

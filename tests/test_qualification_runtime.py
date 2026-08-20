@@ -1115,10 +1115,17 @@ def test_in_container_metrics_probe_rejects_redirects_before_replaying_trusted_o
     assert {request.full_url for request in requests} == {"http://127.0.0.1:8090/metrics"}
 
 
-def test_subprocess_runtime_command_runner_freezes_host_tools_and_scrubs_ambient_environment(monkeypatch) -> None:
+def test_subprocess_runtime_command_runner_freezes_host_tools_and_scrubs_ambient_environment(
+    monkeypatch, tmp_path
+) -> None:
     """Docker/Git commands cannot inherit proxy, credential, or context configuration."""
 
     calls: list[tuple[list[str], dict[str, object]]] = []
+    docker = tmp_path / "docker"
+    git = tmp_path / "git"
+    for tool in (docker, git):
+        tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        tool.chmod(0o700)
 
     def fake_run(argv, **kwargs):
         calls.append((list(argv), kwargs))
@@ -1128,6 +1135,7 @@ def test_subprocess_runtime_command_runner_freezes_host_tools_and_scrubs_ambient
     monkeypatch.setenv("DOCKER_CONTEXT", "private-context-marker")
     monkeypatch.setenv("HTTPS_PROXY", "http://private-proxy.invalid")
     monkeypatch.setenv("UPSTREAM_API_KEY", "private-upstream-token")
+    monkeypatch.setattr(runtime_module, "_FROZEN_HOST_TOOLS", {"docker": (docker,), "git": (git,)})
     monkeypatch.setattr(runtime_module.subprocess, "run", fake_run)
     command_runner = runtime_module.SubprocessRuntimeCommandRunner()
 
@@ -1135,13 +1143,56 @@ def test_subprocess_runtime_command_runner_freezes_host_tools_and_scrubs_ambient
     assert command_runner.run(("git", "rev-parse", "HEAD")).returncode == 0
 
     assert [argv for argv, _kwargs in calls] == [
-        ["/usr/local/bin/docker", "version"],
-        ["/usr/bin/git", "rev-parse", "HEAD"],
+        [str(docker), "version"],
+        [str(git), "rev-parse", "HEAD"],
     ]
     for _argv, kwargs in calls:
         environment = kwargs["env"]
         assert environment == {}
         assert not {"DOCKER_HOST", "DOCKER_CONTEXT", "HTTPS_PROXY", "UPSTREAM_API_KEY"} & set(environment)
+
+
+def test_subprocess_runtime_command_runner_fails_closed_when_no_pinned_tool_exists(monkeypatch, tmp_path) -> None:
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((list(argv), kwargs))
+        return SimpleNamespace(returncode=0, stdout="unsafe", stderr="")
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_FROZEN_HOST_TOOLS",
+        {"docker": (tmp_path / "missing-docker",), "git": (tmp_path / "missing-git",)},
+    )
+    monkeypatch.setattr(runtime_module.subprocess, "run", fake_run)
+
+    result = runtime_module.SubprocessRuntimeCommandRunner().run(("docker", "version"))
+
+    assert result.returncode == 125
+    assert calls == []
+
+
+def test_subprocess_runtime_command_runner_rejects_an_unallowlisted_absolute_tool(monkeypatch, tmp_path) -> None:
+    """An absolute caller-provided Docker path cannot bypass the frozen locations."""
+
+    calls: list[tuple[list[str], dict[str, object]]] = []
+    trusted = tmp_path / "trusted-docker"
+    untrusted = tmp_path / "docker"
+    for tool in (trusted, untrusted):
+        tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        tool.chmod(0o700)
+
+    def fake_run(argv, **kwargs):
+        calls.append((list(argv), kwargs))
+        return SimpleNamespace(returncode=0, stdout="unsafe", stderr="")
+
+    monkeypatch.setattr(runtime_module, "_FROZEN_HOST_TOOLS", {"docker": (trusted,), "git": ()})
+    monkeypatch.setattr(runtime_module.subprocess, "run", fake_run)
+
+    result = runtime_module.SubprocessRuntimeCommandRunner().run((str(untrusted), "version"))
+
+    assert result.returncode == 125
+    assert calls == []
 
 
 def test_runtime_private_evidence_reader_rejects_a_rename_swap(monkeypatch, tmp_path) -> None:
