@@ -86,7 +86,10 @@ def test_client_failure_is_recorded_without_response_body_and_run_continues(monk
         [git, "rev-parse", "HEAD"], capture_output=True, text=True, check=True
     ).stdout.strip()
     image_digest = "sha256:" + "0" * 64
-    _write_passing_preflight(runner, preflight, source_commit, image_digest)
+    preflight_attestation = _write_passing_preflight(runner, preflight, source_commit, image_digest)
+    preflight_outcome, direct_outcome = _write_passing_scored_prerequisites(
+        tmp_path, preflight, preflight_attestation
+    )
     runtime_attestation = _write_runtime_attestation(
         tmp_path / "scored-proxy-runtime-attestation.json",
         stage="scored_proxy",
@@ -122,6 +125,10 @@ def test_client_failure_is_recorded_without_response_body_and_run_continues(monk
             _RUN_MANIFEST_SHA256,
             "--runtime-attestation",
             str(runtime_attestation),
+            "--preflight-runtime-outcome",
+            str(preflight_outcome),
+            "--direct-runtime-outcome",
+            str(direct_outcome),
             "--proxy-observer-ledger",
             str(tmp_path / "scored-observer.jsonl"),
         ],
@@ -184,6 +191,111 @@ def test_scored_mode_rejects_missing_runtime_attestation_before_client_or_output
     )
 
     with pytest.raises(SystemExit, match="--runtime-attestation"):
+        runner.main()
+    assert not output.exists()
+
+
+def test_scored_mode_requires_preflight_runtime_outcome_before_client_or_output(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    source_commit = _source_commit()
+    image_digest = "sha256:" + "0" * 64
+    preflight = tmp_path / "preflight.jsonl"
+    runtime_attestation = _write_passing_preflight(runner, preflight, source_commit, image_digest)
+    output = tmp_path / "scored.jsonl"
+
+    class UnexpectedClient:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("runtime outcome must be required before client construction")
+
+    runner.ProjectionAwareOpenAIClient = UnexpectedClient
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_paired_agentic_trial.py",
+            "--base-url",
+            "http://direct.invalid/v1",
+            "--model",
+            "model",
+            "--output",
+            str(output),
+            "--variant",
+            "direct",
+            "--preflight-ledger",
+            str(preflight),
+            "--candidate-source-commit",
+            source_commit,
+            "--candidate-image-digest",
+            image_digest,
+            "--run-manifest-sha256",
+            _RUN_MANIFEST_SHA256,
+            "--runtime-attestation",
+            str(runtime_attestation),
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="--preflight-runtime-outcome"):
+        runner.main()
+    assert not output.exists()
+
+
+def test_scored_proxy_mode_requires_direct_runtime_outcome_before_client_or_output(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    source_commit = _source_commit()
+    image_digest = "sha256:" + "0" * 64
+    preflight = tmp_path / "preflight.jsonl"
+    preflight_attestation = _write_passing_preflight(runner, preflight, source_commit, image_digest)
+    preflight_outcome = _write_runtime_outcome(
+        tmp_path / "preflight-runtime-outcome.json",
+        stage="preflight",
+        attestation=preflight_attestation,
+        output=preflight,
+        output_record_count=5,
+    )
+    runtime_attestation = _write_runtime_attestation(
+        tmp_path / "scored-proxy-runtime-attestation.json",
+        stage="scored_proxy",
+        source_commit=source_commit,
+        image_digest=image_digest,
+        runtime_instance_sha256="5" * 64,
+    )
+    output = tmp_path / "scored.jsonl"
+
+    class UnexpectedClient:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("direct runtime outcome must be required before client construction")
+
+    runner.ProjectionAwareOpenAIClient = UnexpectedClient
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_paired_agentic_trial.py",
+            "--base-url",
+            "http://proxy.invalid/v1",
+            "--model",
+            "model",
+            "--output",
+            str(output),
+            "--variant",
+            "proxy",
+            "--proxy-policy",
+            "--preflight-ledger",
+            str(preflight),
+            "--candidate-source-commit",
+            source_commit,
+            "--candidate-image-digest",
+            image_digest,
+            "--run-manifest-sha256",
+            _RUN_MANIFEST_SHA256,
+            "--runtime-attestation",
+            str(runtime_attestation),
+            "--preflight-runtime-outcome",
+            str(preflight_outcome),
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="--direct-runtime-outcome"):
         runner.main()
     assert not output.exists()
 
@@ -779,6 +891,13 @@ def test_direct_scoring_requires_the_exact_preflight_runtime_attestation(monkeyp
     image_digest = "sha256:" + "0" * 64
     ledger = tmp_path / "preflight.jsonl"
     runtime_attestation = _write_passing_preflight(runner, ledger, source_commit, image_digest)
+    preflight_outcome = _write_runtime_outcome(
+        tmp_path / "preflight-runtime-outcome.json",
+        stage="preflight",
+        attestation=runtime_attestation,
+        output=ledger,
+        output_record_count=5,
+    )
     summary = next(
         json.loads(line)
         for line in ledger.read_text(encoding="utf-8").splitlines()
@@ -796,6 +915,7 @@ def test_direct_scoring_requires_the_exact_preflight_runtime_attestation(monkeyp
         run_manifest_sha256=_RUN_MANIFEST_SHA256,
         scenario_order=["case-1", "case-2"],
         runtime_attestation=runtime_attestation,
+        preflight_runtime_outcome=preflight_outcome,
     )
 
     document = json.loads(runtime_attestation.read_text(encoding="utf-8"))
@@ -812,8 +932,159 @@ def test_direct_scoring_requires_the_exact_preflight_runtime_attestation(monkeyp
             run_manifest_sha256=_RUN_MANIFEST_SHA256,
             scenario_order=["case-1", "case-2"],
             runtime_attestation=runtime_attestation,
+            preflight_runtime_outcome=preflight_outcome,
         )
     assert not (tmp_path / "tampered.jsonl").exists()
+
+
+@pytest.mark.parametrize("kind", ["missing", "failed", "tampered", "incomplete"])
+def test_scoring_gate_rejects_invalid_preflight_runtime_outcome(monkeypatch, tmp_path, kind):
+    runner = load_runner(monkeypatch)
+    source_commit = _source_commit()
+    image_digest = "sha256:" + "0" * 64
+    ledger = tmp_path / "preflight.jsonl"
+    runtime_attestation = _write_passing_preflight(runner, ledger, source_commit, image_digest)
+    outcome = _write_runtime_outcome(
+        tmp_path / "preflight-runtime-outcome.json",
+        stage="preflight",
+        attestation=runtime_attestation,
+        output=ledger,
+        output_record_count=5,
+    )
+    summary = json.loads(ledger.read_text(encoding="utf-8").splitlines()[-1])
+    if kind == "missing":
+        outcome.unlink()
+    elif kind == "failed":
+        document = json.loads(outcome.read_text(encoding="utf-8"))
+        document.update(status="failed", action_exit_code=1, failure_category="runtime_cleanup_failed")
+        outcome.write_text(json.dumps(document), encoding="utf-8")
+    elif kind == "tampered":
+        document = json.loads(outcome.read_text(encoding="utf-8"))
+        document["private_prompt"] = "must never enter an error"
+        outcome.write_text(json.dumps(document), encoding="utf-8")
+    else:
+        ledger.write_text("\n".join(ledger.read_text(encoding="utf-8").splitlines()[1:]) + "\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="passed matching preflight runtime outcome") as raised:
+        runner.require_scoring_gate(
+            output=tmp_path / "scored.jsonl",
+            preflight_ledger=ledger,
+            candidate_source_commit=source_commit,
+            candidate_image_digest=image_digest,
+            contract_digest=summary["qualification_contract_digests"]["direct"],
+            arm="direct",
+            model="model",
+            run_manifest_sha256=_RUN_MANIFEST_SHA256,
+            scenario_order=["case-1", "case-2"],
+            runtime_attestation=runtime_attestation,
+            preflight_runtime_outcome=outcome,
+        )
+
+    assert "must never enter an error" not in str(raised.value)
+    assert not (tmp_path / "scored.jsonl").exists()
+
+
+@pytest.mark.parametrize("kind", ["missing", "failed", "tampered", "incomplete"])
+def test_proxy_scoring_requires_a_passed_direct_runtime_outcome(monkeypatch, tmp_path, kind):
+    runner = load_runner(monkeypatch)
+    source_commit = _source_commit()
+    image_digest = "sha256:" + "0" * 64
+    ledger = tmp_path / "preflight.jsonl"
+    preflight_attestation = _write_passing_preflight(runner, ledger, source_commit, image_digest)
+    preflight_outcome = _write_runtime_outcome(
+        tmp_path / "preflight-runtime-outcome.json",
+        stage="preflight",
+        attestation=preflight_attestation,
+        output=ledger,
+        output_record_count=5,
+    )
+    scored_attestation = _write_runtime_attestation(
+        tmp_path / "scored-proxy-runtime-attestation.json",
+        stage="scored_proxy",
+        source_commit=source_commit,
+        image_digest=image_digest,
+        runtime_instance_sha256="5" * 64,
+    )
+    direct_output = tmp_path / "scored-direct.jsonl"
+    direct_output.write_text('{"case_id":"case-1"}\n{"case_id":"case-2"}\n', encoding="utf-8")
+    direct_output.chmod(0o600)
+    direct_outcome = _write_runtime_outcome(
+        tmp_path / "scored-direct-runtime-outcome.json",
+        stage="scored-direct",
+        attestation=preflight_attestation,
+        output=direct_output,
+        output_record_count=2,
+    )
+    if kind == "missing":
+        direct_outcome.unlink()
+    elif kind == "failed":
+        document = json.loads(direct_outcome.read_text(encoding="utf-8"))
+        document.update(status="failed", action_exit_code=1, failure_category="action_failed")
+        direct_outcome.write_text(json.dumps(document), encoding="utf-8")
+    elif kind == "tampered":
+        direct_output.write_text('{"case_id":"changed"}\n{"case_id":"case-2"}\n', encoding="utf-8")
+    else:
+        direct_output.write_text('{"case_id":"case-1"}\n', encoding="utf-8")
+    summary = json.loads(ledger.read_text(encoding="utf-8").splitlines()[-1])
+
+    with pytest.raises(SystemExit, match="passed matching direct runtime outcome"):
+        runner.require_scoring_gate(
+            output=tmp_path / "proxy.jsonl",
+            preflight_ledger=ledger,
+            candidate_source_commit=source_commit,
+            candidate_image_digest=image_digest,
+            contract_digest=summary["qualification_contract_digests"]["proxy"],
+            arm="proxy",
+            model="model",
+            run_manifest_sha256=_RUN_MANIFEST_SHA256,
+            scenario_order=["case-1", "case-2"],
+            runtime_attestation=scored_attestation,
+            preflight_runtime_outcome=preflight_outcome,
+            direct_runtime_outcome=direct_outcome,
+        )
+
+    assert not (tmp_path / "proxy.jsonl").exists()
+
+
+def test_proxy_scoring_rejects_coordinated_preflight_attestation_and_outcome_replacement(
+    monkeypatch, tmp_path
+):
+    runner = load_runner(monkeypatch)
+    source_commit = _source_commit()
+    image_digest = "sha256:" + "0" * 64
+    ledger = tmp_path / "preflight.jsonl"
+    preflight_attestation = _write_passing_preflight(runner, ledger, source_commit, image_digest)
+    document = json.loads(preflight_attestation.read_text(encoding="utf-8"))
+    preflight_attestation.write_text(json.dumps(document, indent=2), encoding="utf-8")
+    preflight_outcome, direct_outcome = _write_passing_scored_prerequisites(
+        tmp_path, ledger, preflight_attestation
+    )
+    scored_attestation = _write_runtime_attestation(
+        tmp_path / "scored-proxy-runtime-attestation.json",
+        stage="scored_proxy",
+        source_commit=source_commit,
+        image_digest=image_digest,
+        runtime_instance_sha256="5" * 64,
+    )
+    summary = json.loads(ledger.read_text(encoding="utf-8").splitlines()[-1])
+
+    with pytest.raises(SystemExit, match="passed matching preflight runtime outcome"):
+        runner.require_scoring_gate(
+            output=tmp_path / "proxy.jsonl",
+            preflight_ledger=ledger,
+            candidate_source_commit=source_commit,
+            candidate_image_digest=image_digest,
+            contract_digest=summary["qualification_contract_digests"]["proxy"],
+            arm="proxy",
+            model="model",
+            run_manifest_sha256=_RUN_MANIFEST_SHA256,
+            scenario_order=["case-1", "case-2"],
+            runtime_attestation=scored_attestation,
+            preflight_runtime_outcome=preflight_outcome,
+            direct_runtime_outcome=direct_outcome,
+        )
+
+    assert not (tmp_path / "proxy.jsonl").exists()
 
 
 @pytest.mark.parametrize(
@@ -960,7 +1231,10 @@ def test_scored_proxy_cli_requires_a_new_observer_ledger(monkeypatch, tmp_path):
     source_commit = _source_commit()
     image_digest = "sha256:" + "0" * 64
     preflight = tmp_path / "preflight.jsonl"
-    _write_passing_preflight(runner, preflight, source_commit, image_digest)
+    preflight_attestation = _write_passing_preflight(runner, preflight, source_commit, image_digest)
+    preflight_outcome, direct_outcome = _write_passing_scored_prerequisites(
+        tmp_path, preflight, preflight_attestation
+    )
     runtime_attestation = _write_runtime_attestation(
         tmp_path / "scored-proxy-runtime-attestation.json",
         stage="scored_proxy",
@@ -994,6 +1268,10 @@ def test_scored_proxy_cli_requires_a_new_observer_ledger(monkeypatch, tmp_path):
             _RUN_MANIFEST_SHA256,
             "--runtime-attestation",
             str(runtime_attestation),
+            "--preflight-runtime-outcome",
+            str(preflight_outcome),
+            "--direct-runtime-outcome",
+            str(direct_outcome),
         ],
     )
 
@@ -1008,7 +1286,10 @@ def test_scored_proxy_rows_use_actual_observer_fingerprints_and_failures_keep_sa
     preflight = tmp_path / "preflight.jsonl"
     observer_path = tmp_path / "scored-observer.jsonl"
     output = tmp_path / "scored.jsonl"
-    _write_passing_preflight(runner, preflight, source_commit, image_digest)
+    preflight_attestation = _write_passing_preflight(runner, preflight, source_commit, image_digest)
+    preflight_outcome, direct_outcome = _write_passing_scored_prerequisites(
+        tmp_path, preflight, preflight_attestation
+    )
     runtime_attestation = _write_runtime_attestation(
         tmp_path / "scored-proxy-runtime-attestation.json",
         stage="scored_proxy",
@@ -1067,6 +1348,10 @@ def test_scored_proxy_rows_use_actual_observer_fingerprints_and_failures_keep_sa
             _RUN_MANIFEST_SHA256,
             "--runtime-attestation",
             str(runtime_attestation),
+            "--preflight-runtime-outcome",
+            str(preflight_outcome),
+            "--direct-runtime-outcome",
+            str(direct_outcome),
             "--proxy-observer-ledger",
             str(observer_path),
         ],
@@ -1096,7 +1381,10 @@ def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_re
     preflight = tmp_path / "preflight.jsonl"
     observer_path = tmp_path / "scored-observer.jsonl"
     output = tmp_path / "scored.jsonl"
-    _write_passing_preflight(runner, preflight, source_commit, image_digest)
+    preflight_attestation = _write_passing_preflight(runner, preflight, source_commit, image_digest)
+    preflight_outcome, direct_outcome = _write_passing_scored_prerequisites(
+        tmp_path, preflight, preflight_attestation
+    )
     runtime_attestation = _write_runtime_attestation(
         tmp_path / "scored-proxy-runtime-attestation.json",
         stage="scored_proxy",
@@ -1147,6 +1435,10 @@ def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_re
             _RUN_MANIFEST_SHA256,
             "--runtime-attestation",
             str(runtime_attestation),
+            "--preflight-runtime-outcome",
+            str(preflight_outcome),
+            "--direct-runtime-outcome",
+            str(direct_outcome),
             "--proxy-observer-ledger",
             str(observer_path),
         ],
@@ -1492,7 +1784,57 @@ def _write_runtime_attestation(
         },
     }
     path.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    path.chmod(0o600)
     return path
+
+
+def _write_runtime_outcome(
+    path,
+    *,
+    stage,
+    attestation,
+    output,
+    output_record_count,
+    status="passed",
+    action_exit_code=0,
+    failure_category=None,
+):
+    document = {
+        "schema_version": "1.0",
+        "record_type": "qualification_runtime_outcome",
+        "stage": stage,
+        "status": status,
+        "action_exit_code": action_exit_code,
+        "failure_category": failure_category,
+        "run_manifest_sha256": _RUN_MANIFEST_SHA256,
+        "attestation_sha256": hashlib.sha256(attestation.read_bytes()).hexdigest(),
+        "output_ledger_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+        "output_record_count": output_record_count,
+    }
+    path.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
+
+def _write_passing_scored_prerequisites(tmp_path, preflight, preflight_attestation):
+    preflight_outcome = _write_runtime_outcome(
+        tmp_path / "preflight-runtime-outcome.json",
+        stage="preflight",
+        attestation=preflight_attestation,
+        output=preflight,
+        output_record_count=5,
+    )
+    direct_output = tmp_path / "scored-direct.jsonl"
+    direct_output.write_text('{"case_id":"case-1"}\n{"case_id":"case-2"}\n', encoding="utf-8")
+    direct_output.chmod(0o600)
+    direct_outcome = _write_runtime_outcome(
+        tmp_path / "scored-direct-runtime-outcome.json",
+        stage="scored-direct",
+        attestation=preflight_attestation,
+        output=direct_output,
+        output_record_count=2,
+    )
+    return preflight_outcome, direct_outcome
 
 
 def _write_passing_preflight(runner, output, source_commit, image_digest, contract_digests=None):

@@ -532,6 +532,16 @@ def main() -> None:
         type=Path,
         help="Supervisor-issued allowlisted runtime evidence bound to this exact qualification invocation.",
     )
+    parser.add_argument(
+        "--preflight-runtime-outcome",
+        type=Path,
+        help="Passed supervisor outcome bound to the exact preflight attestation and ledger.",
+    )
+    parser.add_argument(
+        "--direct-runtime-outcome",
+        type=Path,
+        help="Passed direct-treatment outcome required before proxy scoring.",
+    )
     args = parser.parse_args()
 
     selected = scenario_set(args.agentic_set)
@@ -553,11 +563,14 @@ def main() -> None:
         or args.candidate_image_digest is None
         or args.run_manifest_sha256 is None
         or args.runtime_attestation is None
+        or args.preflight_runtime_outcome is None
     ):
         raise SystemExit(
             "scored mode requires --preflight-ledger, --candidate-source-commit, --candidate-image-digest, "
-            "--run-manifest-sha256, and --runtime-attestation"
+            "--run-manifest-sha256, --runtime-attestation, and --preflight-runtime-outcome"
         )
+    if args.proxy_policy and args.direct_runtime_outcome is None:
+        raise SystemExit("scored proxy mode requires --direct-runtime-outcome")
     try:
         validate_run_manifest_sha256(args.run_manifest_sha256)
     except PreflightFailure as error:
@@ -578,6 +591,8 @@ def main() -> None:
         run_manifest_sha256=args.run_manifest_sha256,
         scenario_order=[item.case_id for item in selected],
         runtime_attestation=args.runtime_attestation,
+        preflight_runtime_outcome=args.preflight_runtime_outcome,
+        direct_runtime_outcome=args.direct_runtime_outcome,
     )
     api_key = args.api_key_file.read_text().strip() if args.api_key_file is not None else None
     if args.api_key_file is not None and not api_key:

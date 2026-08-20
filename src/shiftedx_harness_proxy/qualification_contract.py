@@ -43,6 +43,10 @@ class RuntimeAttestationFailure(PreflightFailure):
     """Raised when qualification runtime evidence is missing or invalid."""
 
 
+class RuntimeOutcomeFailure(PreflightFailure):
+    """Raised when a prior supervised stage did not produce exact passing evidence."""
+
+
 @dataclass(frozen=True)
 class SafeFingerprint:
     """A hash-only contract fingerprint suitable for an allowlisted ledger."""
@@ -100,6 +104,105 @@ class RuntimeAttestation:
     runtime_instance_sha256: str
     checks: dict[str, bool]
     file_sha256: str
+
+
+@dataclass(frozen=True)
+class RuntimeOutcome:
+    """Validated hash-only identity of one completed qualification runtime stage."""
+
+    stage: Literal["preflight", "scored-direct", "scored-proxy"]
+    run_manifest_sha256: str
+    attestation_sha256: str
+    output_ledger_sha256: str
+    output_record_count: int
+    file_sha256: str
+
+
+def load_runtime_outcome(
+    path: Path,
+    *,
+    expected_stage: Literal["preflight", "scored-direct", "scored-proxy"],
+    run_manifest_sha256: str,
+    attestation: Path,
+    output_ledger: Path,
+    expected_output_record_count: int,
+) -> RuntimeOutcome:
+    """Load a passed outcome bound to the exact private attestation and output bytes."""
+
+    try:
+        serialized = _read_private_regular_file(path)
+        attestation_bytes = _read_private_regular_file(attestation)
+        output_bytes = _read_private_regular_file(output_ledger)
+        document = json.loads(serialized, object_pairs_hook=_unique_json_object)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise RuntimeOutcomeFailure("runtime_outcome_invalid") from error
+    root_keys = {
+        "schema_version",
+        "record_type",
+        "stage",
+        "status",
+        "action_exit_code",
+        "failure_category",
+        "run_manifest_sha256",
+        "attestation_sha256",
+        "output_ledger_sha256",
+        "output_record_count",
+    }
+    attestation_sha256 = hashlib.sha256(attestation_bytes).hexdigest()
+    output_ledger_sha256 = hashlib.sha256(output_bytes).hexdigest()
+    if (
+        not isinstance(document, dict)
+        or set(document) != root_keys
+        or document.get("schema_version") != "1.0"
+        or document.get("record_type") != "qualification_runtime_outcome"
+        or document.get("stage") != expected_stage
+        or document.get("status") != "passed"
+        or not isinstance(document.get("action_exit_code"), int)
+        or document.get("action_exit_code") != 0
+        or isinstance(document.get("action_exit_code"), bool)
+        or document.get("failure_category") is not None
+        or _SHA256_HEX.fullmatch(run_manifest_sha256) is None
+        or document.get("run_manifest_sha256") != run_manifest_sha256
+        or document.get("attestation_sha256") != attestation_sha256
+        or document.get("output_ledger_sha256") != output_ledger_sha256
+        or not isinstance(expected_output_record_count, int)
+        or isinstance(expected_output_record_count, bool)
+        or expected_output_record_count <= 0
+        or not isinstance(document.get("output_record_count"), int)
+        or document.get("output_record_count") != expected_output_record_count
+        or isinstance(document.get("output_record_count"), bool)
+        or not output_bytes.endswith(b"\n")
+        or len(output_bytes.splitlines()) != expected_output_record_count
+        or any(not line for line in output_bytes.splitlines())
+    ):
+        raise RuntimeOutcomeFailure("runtime_outcome_invalid")
+    return RuntimeOutcome(
+        stage=expected_stage,
+        run_manifest_sha256=run_manifest_sha256,
+        attestation_sha256=attestation_sha256,
+        output_ledger_sha256=output_ledger_sha256,
+        output_record_count=expected_output_record_count,
+        file_sha256=hashlib.sha256(serialized).hexdigest(),
+    )
+
+
+def _read_private_regular_file(path: Path) -> bytes:
+    file_status = path.lstat()
+    if path.is_symlink() or not stat.S_ISREG(file_status.st_mode) or stat.S_IMODE(file_status.st_mode) != 0o600:
+        raise ValueError("private qualification evidence is invalid")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened_status = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened_status.st_mode)
+            or stat.S_IMODE(opened_status.st_mode) != 0o600
+            or (opened_status.st_dev, opened_status.st_ino) != (file_status.st_dev, file_status.st_ino)
+        ):
+            raise ValueError("private qualification evidence is invalid")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            return handle.read()
+    finally:
+        os.close(descriptor)
 
 
 def load_runtime_attestation(
@@ -722,6 +825,8 @@ def require_scoring_gate(
     run_manifest_sha256: str,
     scenario_order: list[str] | None = None,
     runtime_attestation: Path | None = None,
+    preflight_runtime_outcome: Path | None = None,
+    direct_runtime_outcome: Path | None = None,
 ) -> None:
     """Prohibit scored writes unless a matching paired preflight and immutable provenance exist."""
     if output.exists():
@@ -770,6 +875,40 @@ def require_scoring_gate(
             raise SystemExit("scored proxy runtime contract does not match the paired preflight")
         if summary.get("runtime_instance_sha256") == attestation.runtime_instance_sha256:
             raise SystemExit("scored proxy requires a fresh runtime instance")
+    try:
+        if preflight_runtime_outcome is None:
+            raise RuntimeOutcomeFailure("runtime_outcome_invalid")
+        if arm == "direct":
+            assert runtime_attestation is not None
+            preflight_attestation = runtime_attestation
+        else:
+            preflight_attestation = preflight_ledger.with_name("preflight-runtime-attestation.json")
+        preflight_outcome = load_runtime_outcome(
+            preflight_runtime_outcome,
+            expected_stage="preflight",
+            run_manifest_sha256=run_manifest_sha256,
+            attestation=preflight_attestation,
+            output_ledger=preflight_ledger,
+            expected_output_record_count=5,
+        )
+        if summary.get("runtime_attestation_sha256") != preflight_outcome.attestation_sha256:
+            raise RuntimeOutcomeFailure("runtime_outcome_invalid")
+    except RuntimeOutcomeFailure as error:
+        raise SystemExit("scored mode requires a passed matching preflight runtime outcome") from error
+    if arm == "proxy":
+        try:
+            if direct_runtime_outcome is None or scenario_order is None:
+                raise RuntimeOutcomeFailure("runtime_outcome_invalid")
+            load_runtime_outcome(
+                direct_runtime_outcome,
+                expected_stage="scored-direct",
+                run_manifest_sha256=run_manifest_sha256,
+                attestation=preflight_attestation,
+                output_ledger=preflight_ledger.with_name("scored-direct.jsonl"),
+                expected_output_record_count=len(scenario_order),
+            )
+        except RuntimeOutcomeFailure as error:
+            raise SystemExit("scored proxy requires a passed matching direct runtime outcome") from error
     require_candidate_provenance(candidate_source_commit, candidate_image_digest)
 
 
