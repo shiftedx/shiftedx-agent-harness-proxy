@@ -29,6 +29,8 @@ def paired_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
         lease.agentic_set,
         "--output",
         str(lease.output_ledger),
+        "--run-id",
+        lease.trial_run_id,
         "--candidate-source-commit",
         lease.source_commit,
         "--candidate-image-digest",
@@ -37,24 +39,26 @@ def paired_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
         lease.run_manifest_sha256,
     ]
     if lease.stage == "preflight":
-        _require_proxy_lease(lease)
+        proxy_base_url, proxy_metrics_url, proxy_api_key_file, observer_ledger, attestation_path = _require_proxy_lease(
+            lease
+        )
         argv = [
             *common,
             "--paired-preflight",
             "--variant",
-            "preflight",
+            _variant(lease, "preflight"),
             "--direct-base-url",
             lease.direct_base_url,
             "--proxy-base-url",
-            lease.proxy_base_url,
+            proxy_base_url,
             "--proxy-metrics-url",
-            lease.proxy_metrics_url,
+            proxy_metrics_url,
             "--proxy-observer-ledger",
-            str(lease.observer_ledger),
+            str(observer_ledger),
             "--proxy-api-key-file",
-            str(lease.proxy_api_key_file),
+            str(proxy_api_key_file),
             "--runtime-attestation",
-            str(lease.attestation_path),
+            str(attestation_path),
         ]
         if lease.direct_api_key_file is not None:
             argv.extend(("--direct-api-key-file", str(lease.direct_api_key_file)))
@@ -66,32 +70,44 @@ def paired_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
             "--base-url",
             lease.direct_base_url,
             "--variant",
-            "direct",
+            _variant(lease, "direct"),
             "--preflight-ledger",
             str(lease.preflight_ledger),
             "--runtime-attestation",
             str(lease.attestation_path),
+            "--preflight-runtime-outcome",
+            str(lease.preflight_ledger.with_name("preflight-runtime-outcome.json")),
         ]
         if lease.direct_api_key_file is not None:
             argv.extend(("--api-key-file", str(lease.direct_api_key_file)))
         return tuple(argv)
     if lease.stage == "score-proxy":
-        _require_proxy_lease(lease)
+        (
+            proxy_base_url,
+            _proxy_metrics_url,
+            proxy_api_key_file,
+            observer_ledger,
+            attestation_path,
+        ) = _require_proxy_lease(lease)
         argv = [
             *common,
             "--base-url",
-            lease.proxy_base_url,
+            proxy_base_url,
             "--variant",
-            "proxy",
+            _variant(lease, "proxy"),
             "--proxy-policy",
             "--api-key-file",
-            str(lease.proxy_api_key_file),
+            str(proxy_api_key_file),
             "--proxy-observer-ledger",
-            str(lease.observer_ledger),
+            str(observer_ledger),
             "--preflight-ledger",
             str(lease.preflight_ledger),
             "--runtime-attestation",
-            str(lease.attestation_path),
+            str(attestation_path),
+            "--preflight-runtime-outcome",
+            str(lease.preflight_ledger.with_name("preflight-runtime-outcome.json")),
+            "--direct-runtime-outcome",
+            str(lease.preflight_ledger.with_name("scored-direct-runtime-outcome.json")),
         ]
         return tuple(argv)
     raise ValueError("unsupported qualification runtime stage")
@@ -100,7 +116,19 @@ def paired_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
 def invoke_paired_runner(lease: RuntimeLease) -> int:
     """Run the child without injecting secret values into argv or environment."""
 
-    return subprocess.run(list(paired_runner_argv(lease)), check=False).returncode  # noqa: S603
+    return subprocess.run(  # noqa: S603 - argv and environment are derived exclusively from a validated lease
+        list(paired_runner_argv(lease)),
+        check=False,
+        env={
+            "PYTHONPATH": str(lease.benchmark_source_path),
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+    ).returncode
+
+
+def _variant(lease: RuntimeLease, treatment: str) -> str:
+    return f"{lease.cache_lane}-pair{lease.pair_index}-{treatment}-{lease.agentic_set}"
 
 
 def main(
@@ -124,7 +152,7 @@ def main(
     return 0 if outcome.status == "passed" else 1
 
 
-def _require_proxy_lease(lease: RuntimeLease) -> None:
+def _require_proxy_lease(lease: RuntimeLease) -> tuple[str, str, Path, Path, Path]:
     if (
         lease.proxy_base_url is None
         or lease.proxy_metrics_url is None
@@ -133,6 +161,13 @@ def _require_proxy_lease(lease: RuntimeLease) -> None:
         or lease.attestation_path is None
     ):
         raise ValueError("proxy lease is incomplete")
+    return (
+        lease.proxy_base_url,
+        lease.proxy_metrics_url,
+        lease.proxy_api_key_file,
+        lease.observer_ledger,
+        lease.attestation_path,
+    )
 
 
 def _require_attestation(lease: RuntimeLease) -> None:

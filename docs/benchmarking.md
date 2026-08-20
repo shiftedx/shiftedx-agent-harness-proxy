@@ -99,44 +99,83 @@ ledger.
 
 ### Private manifest v1
 
-The manifest may have project-owned top-level material, but its `qualification_runtime` section is
-strict. It uses `schema_version: "1.0"` and exactly these keys:
+The manifest is duplicate-rejecting JSON; YAML and JSON last-key-wins parsing are not accepted.
+It may have project-owned top-level material, but its `qualification_runtime` section is strict. It
+uses `"schema_version": "1.0"` and exactly these keys:
 
-```yaml
-qualification_runtime:
-  schema_version: "1.0"
-  source_commit: "<exact 40-lowercase-hex checked-out commit>"
-  image:
-    reference: "registry.example/shiftedx/proxy@sha256:<64-lowercase-hex>"
-    digest: "sha256:<same 64-lowercase-hex>"
-    uid: 10001
-    gid: 10001
-  model:
-    public_id: "<approved public model identifier>"
-    upstream_url: "https://private-model.example/v1"
-    upstream_authenticated: true
-  benchmark:
-    revision: "335e6694e4aec13e9370af8a993d8c8f14d7ffb5"
-    agentic_set: expanded
-    scenario_order_sha256: "<canonical JSON SHA-256 of the exact selected case-id list>"
-    scenario_count: 0
-  observer:
-    host: "127.0.0.1"
-    port: 18092
-    container_url: "http://host.docker.internal:18092/v1"
-  proxy:
-    host: "127.0.0.1"
-    port: 8090
-    container_port: 8090
-    cpus: 1.0
-    memory_bytes: 536870912
-    pids_limit: 128
-    stop_timeout_seconds: 20
-    settings: { ...exact settings object below... }
-  credentials:
-    ordinary_proxy_api_key_file: "/absolute/private/path/proxy_server_key"
-    qualification_policy_api_key_file: "/absolute/private/path/qualification_policy_key"
-    upstream_model_api_key_file: "/absolute/private/path/upstream_model_key"
+```json
+{
+  "qualification_runtime": {
+    "schema_version": "1.0",
+    "source_commit": "0123456789abcdef0123456789abcdef01234567",
+    "image": {
+      "reference": "registry.example/shiftedx/proxy@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "uid": 10001,
+      "gid": 10001
+    },
+    "model": {
+      "public_id": "approved-public-model-id",
+      "upstream_url": "https://private-model.example/v1",
+      "upstream_authenticated": true
+    },
+    "benchmark": {
+      "revision": "335e6694e4aec13e9370af8a993d8c8f14d7ffb5",
+      "tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "package": "shiftedx-bench==0.5.1",
+      "checkout_path": "/absolute/private/path/shiftedx-bench",
+      "interpreter_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "agentic_set": "expanded",
+      "scenario_order_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "scenario_count": 12
+    },
+    "trial": {
+      "run_id": "qualification-2026-08-20-a",
+      "cache_lane": "cold",
+      "pair_index": 1,
+      "treatment_order": ["direct", "proxy"],
+      "cache_proof_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    },
+    "observer": {
+      "host": "127.0.0.1",
+      "port": 18092,
+      "container_url": "http://host.docker.internal:18092/v1"
+    },
+    "proxy": {
+      "host": "127.0.0.1",
+      "port": 8090,
+      "container_port": 8090,
+      "cpus": 1.0,
+      "memory_bytes": 536870912,
+      "pids_limit": 128,
+      "stop_timeout_seconds": 20,
+      "settings": {
+        "deployment_profile": "production",
+        "harness_profile": "shiftedx-harness-v1",
+        "upstream_tool_response_capability_mode": "phase_split",
+        "upstream_cache_capability_mode": "disabled",
+        "telemetry_enabled": true,
+        "metrics_enabled": true,
+        "max_internal_retries": 4,
+        "max_upstream_calls": 7,
+        "upstream_timeout_seconds": 120.0,
+        "total_request_deadline_seconds": 180.0,
+        "server_connection_limit": 24,
+        "admission_limit": 16,
+        "principal_concurrency_limit": 4,
+        "concurrency_limit": 32,
+        "require_receipt_when_tools_present": true,
+        "allow_harness_opt_out": false,
+        "log_level": "INFO"
+      }
+    },
+    "credentials": {
+      "ordinary_proxy_api_key_file": "/absolute/private/path/proxy_server_key",
+      "qualification_policy_api_key_file": "/absolute/private/path/qualification_policy_key",
+      "upstream_model_api_key_file": "/absolute/private/path/upstream_model_key"
+    }
+  }
+}
 ```
 
 `image` is the local exact digest image (`--pull never`) and UID/GID must be `10001`. The model
@@ -156,34 +195,29 @@ limits, and a read-only `/run/secrets` mount. The observer forwards any upstream
 never loads that credential itself. Secret values never appear in argv, environment, Docker
 inspect, attestation, outcome, or public evidence.
 
-`proxy.settings` is also exact, with no extra/missing key:
+`proxy.settings` is the exact JSON object in the manifest above: it has no extra or missing
+keys, is validated by `Settings`, and carries only the reviewed production values. Do not create a
+second hand-maintained settings file or substitute environment overrides.
 
-```yaml
-deployment_profile: production
-harness_profile: shiftedx-harness-v1
-upstream_tool_response_capability_mode: phase_split
-upstream_cache_capability_mode: disabled
-telemetry_enabled: true
-metrics_enabled: true
-max_internal_retries: <reviewed integer>
-max_upstream_calls: <reviewed integer>
-upstream_timeout_seconds: <reviewed positive number>
-total_request_deadline_seconds: <reviewed positive number>
-server_connection_limit: <reviewed integer>
-admission_limit: <reviewed integer>
-principal_concurrency_limit: <reviewed integer>
-concurrency_limit: <reviewed integer>
-require_receipt_when_tools_present: true
-allow_harness_opt_out: false
-log_level: <reviewed level>
-```
-
-The supervisor validates this object through `Settings`, starts a fresh identity-bound observer,
+The supervisor validates this object through `Settings`, verifies the benchmark checkout's pinned
+HEAD/tree, tracked-clean state, pinned package import rooted under `checkout_path/src`, and the
+current interpreter SHA-256. It gives the paired child only that source tree on `PYTHONPATH` with
+user site packages and bytecode writes disabled; an ambient `shiftedx-bench` installation cannot
+qualify. It starts a fresh identity-bound observer,
 checks local exact-image metadata, Docker inspect hardening/bind/mount/resources, effective
 non-secret settings, trusted metrics authorization, and `/healthz` plus `/readyz` before it writes
 the attestation or invokes the paired benchmark child. It verifies the owned observer and container
 again after the child returns, then only cleans the captured labelled IDs and volume. Cleanup failure
-fails the stage. SIGINT/SIGTERM records an interruption outcome after the same scoped cleanup.
+fails the stage. SIGINT/SIGTERM records an interruption outcome after the same scoped cleanup;
+additional interrupts are held until that cleanup and the atomic outcome write finish.
+
+The outcome is a mode-`600`, no-clobber JSON record written only after cleanup. Its exact fields
+bind the manifest, attestation, output-ledger SHA-256, and output count. A passed preflight requires
+five complete ledger rows; a passed scored treatment requires exactly the manifest's positive
+`scenario_count`. `score-direct` requires a passed preflight outcome and attestation, while
+`score-proxy` additionally requires the passed direct outcome and ledger. The supervisor supplies
+the same manifest `trial.run_id` to both treatments and derives their child variants as
+`<cache_lane>-pair<pair_index>-direct|proxy-<agentic_set>`.
 
 The paired child still fails before any scored row when either arm produces zero native acquisition
 calls, phase/field fingerprints differ outside the declared proxy receipt policy, proxy phase
