@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import signal
 import socket
 import stat
@@ -19,6 +20,12 @@ from types import SimpleNamespace
 import pytest
 
 import shiftedx_harness_proxy.qualification_runtime as runtime_module
+from shiftedx_harness_proxy.qualification_campaign import (
+    CampaignSlot,
+    ReadinessResult,
+    StageRequest,
+    advance_qualification_campaign,
+)
 from shiftedx_harness_proxy.qualification_contract import (
     BENCHMARK_REVISION,
     CacheObservation,
@@ -27,7 +34,11 @@ from shiftedx_harness_proxy.qualification_contract import (
     write_model_boundary_attempt_ledger,
 )
 from shiftedx_harness_proxy.qualification_model_evidence import model_endpoint_contract_hashes
-from shiftedx_harness_proxy.qualification_runtime import Outcome, RuntimeLease, supervise_qualification_runtime
+from shiftedx_harness_proxy.qualification_reconciliation import (
+    RequestAccountingRecord,
+    write_request_accounting_ledger,
+)
+from shiftedx_harness_proxy.qualification_runtime import RuntimeLease
 
 
 def _canonical_sha256(value: object) -> str:
@@ -223,11 +234,32 @@ def _manifest(tmp_path: Path) -> Path:
                 "scenario_order_sha256": _canonical_sha256(scenario_order),
                 "scenario_count": len(scenario_order),
             },
-            "trial": {
-                "run_id": "qualification-run-1",
-                "cache_lane": "cold",
-                "pair_index": 1,
+            "campaign": {
+                "campaign_id": "qualification-campaign-1",
+                "slots": [
+                    {"cache_lane": "cold", "pair_index": 1, "run_id": "qualification-cold-pair-1"},
+                    {"cache_lane": "cold", "pair_index": 2, "run_id": "qualification-cold-pair-2"},
+                    {"cache_lane": "cold", "pair_index": 3, "run_id": "qualification-cold-pair-3"},
+                    {
+                        "cache_lane": "warm-prefix",
+                        "pair_index": 1,
+                        "run_id": "qualification-warm-pair-1",
+                    },
+                    {
+                        "cache_lane": "warm-prefix",
+                        "pair_index": 2,
+                        "run_id": "qualification-warm-pair-2",
+                    },
+                    {
+                        "cache_lane": "warm-prefix",
+                        "pair_index": 3,
+                        "run_id": "qualification-warm-pair-3",
+                    },
+                ],
+                "stage_order": ["preflight", "score-direct", "score-proxy"],
                 "treatment_order": ["direct", "proxy"],
+                "model_instance_policy": "fresh-per-scored-treatment",
+                "failure_policy": "terminal-no-rerun",
             },
             "observer": {
                 "host": "127.0.0.1",
@@ -268,6 +300,169 @@ def _manifest(tmp_path: Path) -> Path:
     path = tmp_path / "approved-manifest.json"
     path.write_text(json.dumps(document), encoding="utf-8")
     return path
+
+
+def _supervise(
+    *,
+    manifest: Path,
+    stage: str,
+    private_run_dir: Path,
+    action,
+    command_runner=None,
+    cache_lane: str = "cold",
+    pair_index: int = 1,
+):
+    """Exercise the internal per-stage primitive through an explicit StageRequest.
+
+    Production reaches this primitive only through the campaign adapter.  The
+    test adapter creates that same strict slot topology, then mirrors only
+    fixture evidence into the historical compact assertion directory.
+    """
+
+    document = json.loads(manifest.read_text(encoding="utf-8"))
+    runtime = document["qualification_runtime"]
+    assert isinstance(runtime, dict)
+    campaign = runtime["campaign"]
+    assert isinstance(campaign, dict)
+    manifest_sha256 = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    slots_dir = private_run_dir / "slots"
+    slots_dir.mkdir(mode=0o700, exist_ok=True)
+    slots_dir.chmod(0o700)
+    preflight_dir = slots_dir / "00-preflight-pair0"
+    preflight_dir.mkdir(mode=0o700, exist_ok=True)
+    preflight_dir.chmod(0o700)
+    if stage == "preflight":
+        slot = CampaignSlot(0, "preflight", 0, f"{campaign['campaign_id']}-preflight")
+        sequence = 1
+        stage_dir = preflight_dir
+    else:
+        slots = campaign["slots"]
+        assert isinstance(slots, list)
+        ordinal, selected = next(
+            (index, value)
+            for index, value in enumerate(slots, start=1)
+            if isinstance(value, dict)
+            and value.get("cache_lane") == cache_lane
+            and value.get("pair_index") == pair_index
+        )
+        assert isinstance(selected, dict)
+        slot = CampaignSlot(ordinal, cache_lane, pair_index, selected["run_id"])
+        sequence = 2 + (ordinal - 1) * 2 + (0 if stage == "score-direct" else 1)
+        stage_dir = slots_dir / f"{ordinal:02d}-{cache_lane}-pair{pair_index}"
+        stage_dir.mkdir(mode=0o700, exist_ok=True)
+        stage_dir.chmod(0o700)
+        _sync_fixture_stage(private_run_dir, preflight_dir, "preflight")
+        _sync_fixture_stage(private_run_dir, stage_dir, "scored-direct")
+        _sync_fixture_stage(private_run_dir, stage_dir, "scored-proxy")
+    _sync_fixture_stage(private_run_dir, stage_dir, "preflight" if stage == "preflight" else "")
+    outcome_name = {
+        "preflight": "preflight-runtime-outcome.json",
+        "score-direct": "scored-direct-runtime-outcome.json",
+        "score-proxy": "scored-proxy-runtime-outcome.json",
+    }[stage]
+    request = StageRequest(
+        manifest=manifest,
+        manifest_sha256=manifest_sha256,
+        sequence=sequence,
+        slot=slot,
+        stage=stage,
+        private_run_dir=stage_dir,
+        outcome_path=stage_dir / outcome_name,
+    )
+    result = runtime_module.supervise_qualification_runtime(
+        manifest=manifest,
+        stage=stage,
+        private_run_dir=stage_dir,
+        action=action,
+        command_runner=command_runner,
+        stage_request=request,
+    )
+    _mirror_fixture_stage(stage_dir, private_run_dir)
+    return result
+
+
+def _campaign_stage_request(
+    manifest: Path,
+    private_campaign_dir: Path,
+    *,
+    stage: str,
+    cache_lane: str = "cold",
+    pair_index: int = 1,
+) -> StageRequest:
+    """Build one exact core-derived request without a stage-selection fallback."""
+
+    runtime = _manifest_document(manifest)["qualification_runtime"]
+    assert isinstance(runtime, dict)
+    campaign = runtime["campaign"]
+    assert isinstance(campaign, dict)
+    slots_dir = private_campaign_dir / "slots"
+    slots_dir.mkdir(mode=0o700, exist_ok=True)
+    slots_dir.chmod(0o700)
+    manifest_sha256 = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    outcome_names = {
+        "preflight": "preflight-runtime-outcome.json",
+        "score-direct": "scored-direct-runtime-outcome.json",
+        "score-proxy": "scored-proxy-runtime-outcome.json",
+    }
+    assert stage in outcome_names
+    if stage == "preflight":
+        private_run_dir = slots_dir / "00-preflight-pair0"
+        return StageRequest(
+            manifest,
+            manifest_sha256,
+            1,
+            CampaignSlot(0, "preflight", 0, f"{campaign['campaign_id']}-preflight"),
+            "preflight",
+            private_run_dir,
+            private_run_dir / outcome_names[stage],
+        )
+    slots = campaign["slots"]
+    assert isinstance(slots, list)
+    ordinal, selected = next(
+        (index, value)
+        for index, value in enumerate(slots, start=1)
+        if isinstance(value, dict)
+        and value.get("cache_lane") == cache_lane
+        and value.get("pair_index") == pair_index
+    )
+    assert isinstance(selected, dict)
+    private_run_dir = slots_dir / f"{ordinal:02d}-{cache_lane}-pair{pair_index}"
+    sequence = 2 + (ordinal - 1) * 2 + (0 if stage == "score-direct" else 1)
+    return StageRequest(
+        manifest,
+        manifest_sha256,
+        sequence,
+        CampaignSlot(ordinal, cache_lane, pair_index, selected["run_id"]),
+        stage,
+        private_run_dir,
+        private_run_dir / outcome_names[stage],
+    )
+
+
+def _fixture_stage_name(name: str, prefix: str) -> bool:
+    if prefix == "preflight":
+        return name == "preflight.jsonl" or name.startswith("preflight-")
+    return bool(prefix) and name.startswith(prefix)
+
+
+def _sync_fixture_stage(root: Path, target: Path, prefix: str) -> None:
+    for source in root.iterdir():
+        if source.is_file() and _fixture_stage_name(source.name, prefix):
+            destination = target / source.name
+            shutil.copyfile(source, destination)
+            destination.chmod(source.stat().st_mode & 0o777)
+
+
+def _mirror_fixture_stage(source_dir: Path, root: Path) -> None:
+    for source in source_dir.iterdir():
+        if source.is_file() and (
+            source.name == "preflight.jsonl"
+            or source.name.startswith(("preflight-", "scored-direct-", "scored-proxy-"))
+            or source.name in {"scored-direct.jsonl", "scored-proxy.jsonl"}
+        ):
+            destination = root / source.name
+            shutil.copyfile(source, destination)
+            destination.chmod(source.stat().st_mode & 0o777)
 
 
 def _benchmark_checkout(tmp_path: Path) -> dict[str, str]:
@@ -385,6 +580,26 @@ class _FakeProcess:
         self.terminated = True
 
 
+def _zero_proxy_metrics() -> dict[str, int]:
+    return {
+        "downstream_requests": 0,
+        "upstream_calls": 0,
+        "blocked_duplicates": 0,
+        "blocked_stalls": 0,
+        "correction_turns": 0,
+        "receipt_projections": 0,
+        "local_projection_upstream_calls_avoided": 0,
+        "errors": 0,
+        "deadline_expiries": 0,
+        "cancellations": 0,
+        "phase_acquisition": 0,
+        "phase_finalization": 0,
+        "phase_schema_rejections": 0,
+        "admission_rejections": 0,
+        "rate_rejections": 0,
+    }
+
+
 class _FakeRuntimeRunner:
     _next_model_started_at = 1712345678
 
@@ -399,6 +614,8 @@ class _FakeRuntimeRunner:
         self.container_running = True
         self.model_contract = None
         self.model_requests_completed = 0
+        self.metrics_snapshots: list[dict[str, int]] = [_zero_proxy_metrics(), _zero_proxy_metrics()]
+        self.metrics_reads = 0
         type(self)._next_model_started_at += 1
         self.model_started_at = float(type(self)._next_model_started_at)
 
@@ -568,6 +785,18 @@ class _FakeRuntimeRunner:
             if "{{json .Labels}}" in argv:
                 return SimpleNamespace(returncode=0, stdout=json.dumps(labels), stderr="")
             return SimpleNamespace(returncode=0, stdout=json.dumps({"Labels": labels}), stderr="")
+        if (
+            argv[:3] == ("docker", "exec", "--user")
+            and isinstance(argv[-1], str)
+            and "qualification-reconciliation-metrics" in argv[-1]
+        ):
+            index = min(self.metrics_reads, len(self.metrics_snapshots) - 1)
+            self.metrics_reads += 1
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(self.metrics_snapshots[index], sort_keys=True, separators=(",", ":")),
+                stderr="",
+            )
         if argv[:3] == ("docker", "exec", "--user"):
             if self.failure == "auth":
                 return SimpleNamespace(returncode=1, stdout="", stderr="")
@@ -748,7 +977,7 @@ def test_preflight_supervisor_writes_safe_attestation_before_action_and_cleans(m
         assert lease.attestation_path.exists()
         return _write_complete_ledger(lease)
 
-    outcome = supervise_qualification_runtime(
+    outcome = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=private_run_dir,
@@ -809,7 +1038,7 @@ def test_in_container_metrics_probe_rejects_redirects_before_replaying_trusted_o
     """The emitted container probe must not follow a redirect with either credential role."""
 
     runner = _FakeRuntimeRunner()
-    outcome = supervise_qualification_runtime(
+    outcome = _supervise(
         manifest=_manifest(tmp_path),
         stage="preflight",
         private_run_dir=_private_run(tmp_path),
@@ -953,6 +1182,8 @@ def _write_complete_ledger(lease: RuntimeLease) -> int:
     if lease.direct_model_attempt_ledger is not None:
         lease.direct_model_attempt_ledger.write_text("", encoding="utf-8")
         lease.direct_model_attempt_ledger.chmod(0o600)
+    if lease.proxy_request_ledger is not None:
+        write_request_accounting_ledger(lease.proxy_request_ledger, ())
     return 0
 
 
@@ -971,7 +1202,12 @@ def _model_attempt(
     status_code: int | None = 200,
 ) -> ModelBoundaryRecord:
     fingerprint = model_boundary_fingerprint(
-        {"model": "private-model-id", "messages": [{"role": "user", "content": "private"}]}
+        {
+            "model": "private-model-id",
+            "messages": [{"role": "user", "content": "private"}],
+            # Reconciliation accepts the frozen two-phase proxy contract only.
+            "tools": [{"type": "function", "function": {"name": "safe"}}],
+        }
     )
     return ModelBoundaryRecord(sequence, fingerprint.digest, fingerprint.fields, status_code, cache)
 
@@ -1046,7 +1282,7 @@ def test_production_model_probe_uses_c1_hardened_transport_not_runtime_urlopen(m
 def test_post_cleanup_outcome_is_exact_hash_only_and_binds_complete_preflight_ledger(tmp_path) -> None:
     manifest = _manifest(tmp_path)
     private_run_dir = _private_run(tmp_path)
-    outcome = supervise_qualification_runtime(
+    outcome = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=private_run_dir,
@@ -1069,6 +1305,11 @@ def test_post_cleanup_outcome_is_exact_hash_only_and_binds_complete_preflight_le
         "model_evidence_sha256",
         "output_ledger_sha256",
         "output_record_count",
+        "proxy_reconciliation_sha256",
+        "campaign_id_sha256",
+        "slot_ordinal",
+        "cache_lane",
+        "pair_index",
     }
     assert record["stage"] == "preflight"
     assert record["status"] == "passed"
@@ -1079,6 +1320,10 @@ def test_post_cleanup_outcome_is_exact_hash_only_and_binds_complete_preflight_le
     assert record["model_evidence_sha256"] == _sha256_file(private_run_dir / "preflight-model-cache-evidence.json")
     assert record["output_ledger_sha256"] == _sha256_file(private_run_dir / "preflight.jsonl")
     assert record["output_record_count"] == 5
+    assert record["proxy_reconciliation_sha256"] is None
+    assert record["slot_ordinal"] == 0
+    assert record["cache_lane"] == "preflight"
+    assert record["pair_index"] == 0
     assert stat.S_IMODE(outcome.outcome_path.stat().st_mode) == 0o600
     serialized = outcome.outcome_path.read_text(encoding="utf-8")
     assert str(tmp_path) not in serialized
@@ -1088,7 +1333,7 @@ def test_post_cleanup_outcome_is_exact_hash_only_and_binds_complete_preflight_le
 def test_scoring_gate_rejects_a_preflight_without_a_passed_complete_outcome(tmp_path) -> None:
     manifest = _manifest(tmp_path)
     private_run_dir = _private_run(tmp_path)
-    preflight = supervise_qualification_runtime(
+    preflight = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=private_run_dir,
@@ -1099,7 +1344,7 @@ def test_scoring_gate_rejects_a_preflight_without_a_passed_complete_outcome(tmp_
     (private_run_dir / "preflight-runtime-outcome.json").write_text("{}\n", encoding="utf-8")
     (private_run_dir / "preflight-runtime-outcome.json").chmod(0o600)
 
-    outcome = supervise_qualification_runtime(
+    outcome = _supervise(
         manifest=manifest,
         stage="score-direct",
         private_run_dir=private_run_dir,
@@ -1128,7 +1373,7 @@ def test_scoring_gate_rejects_failed_incomplete_or_hash_drifted_preflight_eviden
 
     else:
         action = _write_complete_ledger
-    preflight = supervise_qualification_runtime(
+    preflight = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=private_run_dir,
@@ -1144,7 +1389,7 @@ def test_scoring_gate_rejects_failed_incomplete_or_hash_drifted_preflight_eviden
         ledger.write_bytes(ledger.read_bytes() + b'{"record":99}\n')
         ledger.chmod(0o600)
 
-    direct = supervise_qualification_runtime(
+    direct = _supervise(
         manifest=manifest,
         stage="score-direct",
         private_run_dir=private_run_dir,
@@ -1158,7 +1403,7 @@ def test_scoring_gate_rejects_failed_incomplete_or_hash_drifted_preflight_eviden
 def test_scored_treatment_needs_every_manifest_scenario_before_its_outcome_can_pass(tmp_path) -> None:
     manifest = _manifest(tmp_path)
     private_run_dir = _private_run(tmp_path)
-    preflight = supervise_qualification_runtime(
+    preflight = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=private_run_dir,
@@ -1175,7 +1420,7 @@ def test_scored_treatment_needs_every_manifest_scenario_before_its_outcome_can_p
         lease.direct_model_attempt_ledger.chmod(0o600)
         return 0
 
-    direct = supervise_qualification_runtime(
+    direct = _supervise(
         manifest=manifest,
         stage="score-direct",
         private_run_dir=private_run_dir,
@@ -1203,7 +1448,7 @@ def test_model_evidence_begin_failure_blocks_action_before_proxy_setup(tmp_path)
     private_run_dir = _private_run(tmp_path)
     runner = _FakeRuntimeRunner()
 
-    outcome = supervise_qualification_runtime(
+    outcome = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=private_run_dir,
@@ -1223,7 +1468,7 @@ def test_model_evidence_begin_failure_blocks_action_before_proxy_setup(tmp_path)
 def test_cold_direct_stage_adapts_actual_attempt_ledger_into_passed_model_evidence(tmp_path) -> None:
     manifest = _manifest(tmp_path)
     private_run_dir = _private_run(tmp_path)
-    preflight = supervise_qualification_runtime(
+    preflight = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=private_run_dir,
@@ -1240,7 +1485,7 @@ def test_cold_direct_stage_adapts_actual_attempt_ledger_into_passed_model_eviden
         runner.model_requests_completed += 1
         return 0
 
-    direct = supervise_qualification_runtime(
+    direct = _supervise(
         manifest=manifest,
         stage="score-direct",
         private_run_dir=private_run_dir,
@@ -1257,15 +1502,8 @@ def test_cold_direct_stage_adapts_actual_attempt_ledger_into_passed_model_eviden
 
 def test_warm_direct_stage_requires_and_binds_one_prime_before_its_first_hit(tmp_path) -> None:
     manifest = _manifest(tmp_path)
-    document = _manifest_document(manifest)
-    runtime = document["qualification_runtime"]
-    assert isinstance(runtime, dict)
-    trial = runtime["trial"]
-    assert isinstance(trial, dict)
-    trial["cache_lane"] = "warm-prefix"
-    _store_manifest(manifest, document)
     private_run_dir = _private_run(tmp_path)
-    preflight = supervise_qualification_runtime(
+    preflight = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=private_run_dir,
@@ -1284,12 +1522,13 @@ def test_warm_direct_stage_requires_and_binds_one_prime_before_its_first_hit(tmp
         runner.model_requests_completed += 2
         return 0
 
-    direct = supervise_qualification_runtime(
+    direct = _supervise(
         manifest=manifest,
         stage="score-direct",
         private_run_dir=private_run_dir,
         action=action,
         command_runner=runner,
+        cache_lane="warm-prefix",
     )
 
     assert direct.status == "passed"
@@ -1301,7 +1540,7 @@ def test_warm_direct_stage_requires_and_binds_one_prime_before_its_first_hit(tmp
 def test_successful_model_attempt_without_cache_evidence_blocks_outcome(tmp_path) -> None:
     manifest = _manifest(tmp_path)
     private_run_dir = _private_run(tmp_path)
-    preflight = supervise_qualification_runtime(
+    preflight = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=private_run_dir,
@@ -1317,7 +1556,7 @@ def test_successful_model_attempt_without_cache_evidence_blocks_outcome(tmp_path
         write_model_boundary_attempt_ledger(lease.direct_model_attempt_ledger, [_model_attempt(1, None)])
         return 0
 
-    direct = supervise_qualification_runtime(
+    direct = _supervise(
         manifest=manifest,
         stage="score-direct",
         private_run_dir=private_run_dir,
@@ -1334,7 +1573,7 @@ def test_successful_model_attempt_without_cache_evidence_blocks_outcome(tmp_path
 def test_proxy_stage_adapts_only_its_fresh_observer_attempts(tmp_path) -> None:
     manifest = _manifest(tmp_path)
     private_run_dir = _private_run(tmp_path)
-    preflight = supervise_qualification_runtime(
+    preflight = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=private_run_dir,
@@ -1342,7 +1581,7 @@ def test_proxy_stage_adapts_only_its_fresh_observer_attempts(tmp_path) -> None:
         command_runner=_FakeRuntimeRunner(),
     )
     assert preflight.status == "passed"
-    direct = supervise_qualification_runtime(
+    direct = _supervise(
         manifest=manifest,
         stage="score-direct",
         private_run_dir=private_run_dir,
@@ -1353,15 +1592,45 @@ def test_proxy_stage_adapts_only_its_fresh_observer_attempts(tmp_path) -> None:
     runner = _FakeRuntimeRunner()
 
     def action(lease: RuntimeLease) -> int:
+        assert lease.attestation_path is not None and lease.attestation_path.exists()
+        runner.calls.append(("action", (), None))
         _write_scored_output(lease)
         assert lease.observer_ledger is not None
+        assert lease.proxy_request_ledger is not None
         record = _model_attempt(1, _cold_cache()).to_dict()
         lease.observer_ledger.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
         lease.observer_ledger.chmod(0o600)
+        write_request_accounting_ledger(
+            lease.proxy_request_ledger,
+            (
+                RequestAccountingRecord(
+                    sequence=1,
+                    outcome="succeeded",
+                    local_projection=False,
+                    attempt_sequence_start=1,
+                    attempt_sequence_end=1,
+                    attempt_count=1,
+                    successful_attempt_count=1,
+                    phase_counts={"acquisition": 1, "finalization": 0},
+                    retry_attempt_count=0,
+                    blocked_duplicate_count=0,
+                    blocked_stall_count=0,
+                ),
+            ),
+        )
+        after = _zero_proxy_metrics()
+        after.update(
+            {
+                "downstream_requests": 1,
+                "upstream_calls": 1,
+                "phase_acquisition": 1,
+            }
+        )
+        runner.metrics_snapshots[1] = after
         runner.model_requests_completed += 1
         return 0
 
-    proxy = supervise_qualification_runtime(
+    proxy = _supervise(
         manifest=manifest,
         stage="score-proxy",
         private_run_dir=private_run_dir,
@@ -1373,12 +1642,230 @@ def test_proxy_stage_adapts_only_its_fresh_observer_attempts(tmp_path) -> None:
     evidence = json.loads((private_run_dir / "scored-proxy-model-cache-evidence.json").read_text())
     assert evidence["status"] == "passed"
     assert evidence["request_window"]["successful_measured"] == 1
+    reconciliation = private_run_dir / "scored-proxy-reconciliation.json"
+    assert stat.S_IMODE(reconciliation.stat().st_mode) == 0o600
+    reconciliation_record = json.loads(reconciliation.read_text(encoding="utf-8"))
+    assert reconciliation_record["status"] == "passed"
+    assert proxy.outcome_path is not None
+    runtime_outcome = json.loads(proxy.outcome_path.read_text(encoding="utf-8"))
+    assert runtime_outcome["proxy_reconciliation_sha256"] == hashlib.sha256(
+        reconciliation.read_bytes()
+    ).hexdigest()
+    scored_attestation = json.loads(
+        (private_run_dir / "scored-proxy-runtime-attestation.json").read_text()
+    )
+    preflight_attestation = json.loads(
+        (private_run_dir / "preflight-runtime-attestation.json").read_text()
+    )
+    assert scored_attestation["runtime_contract_sha256"] == preflight_attestation["runtime_contract_sha256"]
+    metric_indices = [
+        index
+        for index, call in enumerate(runner.calls)
+        if call[0] == "run"
+        and call[1][:3] == ("docker", "exec", "--user")
+        and "qualification-reconciliation-metrics" in call[1][-1]
+    ]
+    action_index = next(index for index, call in enumerate(runner.calls) if call[0] == "action")
+    cleanup_index = next(
+        index
+        for index, call in enumerate(runner.calls)
+        if call[0] == "run" and call[1][:3] == ("docker", "rm", "--force")
+    )
+    assert len(metric_indices) == 2
+    assert metric_indices[0] < action_index < metric_indices[1] < cleanup_index
+
+
+def test_warm_proxy_attestation_keeps_the_single_preflight_runtime_contract(tmp_path) -> None:
+    """Lane-specific C1 proof must not drift the cross-stage runtime gate."""
+
+    manifest = _manifest(tmp_path)
+    private_run_dir = _private_run(tmp_path)
+    assert (
+        _supervise(
+            manifest=manifest,
+            stage="preflight",
+            private_run_dir=private_run_dir,
+            action=_write_complete_ledger,
+            command_runner=_FakeRuntimeRunner(),
+        ).status
+        == "passed"
+    )
+    direct_runner = _FakeRuntimeRunner()
+
+    def direct_action(lease: RuntimeLease) -> int:
+        _write_scored_output(lease)
+        assert lease.direct_model_attempt_ledger is not None
+        assert lease.prime_model_attempt_ledger is not None
+        write_model_boundary_attempt_ledger(
+            lease.prime_model_attempt_ledger, [_model_attempt(1, _warm_prime_cache())]
+        )
+        write_model_boundary_attempt_ledger(
+            lease.direct_model_attempt_ledger, [_model_attempt(1, _warm_hit_cache())]
+        )
+        direct_runner.model_requests_completed += 2
+        return 0
+
+    assert (
+        _supervise(
+            manifest=manifest,
+            stage="score-direct",
+            private_run_dir=private_run_dir,
+            action=direct_action,
+            command_runner=direct_runner,
+            cache_lane="warm-prefix",
+        ).status
+        == "passed"
+    )
+    proxy_runner = _FakeRuntimeRunner()
+
+    def proxy_action(lease: RuntimeLease) -> int:
+        _write_scored_output(lease)
+        assert lease.observer_ledger is not None
+        assert lease.proxy_request_ledger is not None
+        assert lease.prime_model_attempt_ledger is not None
+        write_model_boundary_attempt_ledger(
+            lease.prime_model_attempt_ledger, [_model_attempt(1, _warm_prime_cache())]
+        )
+        observed = _model_attempt(1, _warm_hit_cache()).to_dict()
+        lease.observer_ledger.write_text(
+            json.dumps(observed, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"
+        )
+        lease.observer_ledger.chmod(0o600)
+        write_request_accounting_ledger(
+            lease.proxy_request_ledger,
+            (
+                RequestAccountingRecord(
+                    sequence=1,
+                    outcome="succeeded",
+                    local_projection=False,
+                    attempt_sequence_start=1,
+                    attempt_sequence_end=1,
+                    attempt_count=1,
+                    successful_attempt_count=1,
+                    phase_counts={"acquisition": 1, "finalization": 0},
+                    retry_attempt_count=0,
+                    blocked_duplicate_count=0,
+                    blocked_stall_count=0,
+                ),
+            ),
+        )
+        after = _zero_proxy_metrics()
+        after.update({"downstream_requests": 1, "upstream_calls": 1, "phase_acquisition": 1})
+        proxy_runner.metrics_snapshots[1] = after
+        proxy_runner.model_requests_completed += 2
+        return 0
+
+    proxy = _supervise(
+        manifest=manifest,
+        stage="score-proxy",
+        private_run_dir=private_run_dir,
+        action=proxy_action,
+        command_runner=proxy_runner,
+        cache_lane="warm-prefix",
+    )
+
+    assert proxy.status == "passed"
+    preflight = json.loads((private_run_dir / "preflight-runtime-attestation.json").read_text())
+    scored = json.loads((private_run_dir / "scored-proxy-runtime-attestation.json").read_text())
+    assert scored["runtime_contract_sha256"] == preflight["runtime_contract_sha256"]
+    assert scored["model_identity_sha256"] == preflight["model_identity_sha256"]
+
+
+def test_proxy_reconciliation_failure_retains_failed_artifact_and_blocks_passed_outcome(tmp_path) -> None:
+    manifest = _manifest(tmp_path)
+    private_run_dir = _private_run(tmp_path)
+    assert (
+        _supervise(
+            manifest=manifest,
+            stage="preflight",
+            private_run_dir=private_run_dir,
+            action=_write_complete_ledger,
+            command_runner=_FakeRuntimeRunner(),
+        ).status
+        == "passed"
+    )
+    assert (
+        _supervise(
+            manifest=manifest,
+            stage="score-direct",
+            private_run_dir=private_run_dir,
+            action=_write_complete_ledger,
+            command_runner=_FakeRuntimeRunner(),
+        ).status
+        == "passed"
+    )
+    runner = _FakeRuntimeRunner()
+    after = _zero_proxy_metrics()
+    after["downstream_requests"] = 1
+    runner.metrics_snapshots[1] = after
+
+    outcome = _supervise(
+        manifest=manifest,
+        stage="score-proxy",
+        private_run_dir=private_run_dir,
+        action=_write_complete_ledger,
+        command_runner=runner,
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.failure_category == "reconciliation_downstream_mismatch"
+    reconciliation = private_run_dir / "scored-proxy-reconciliation.json"
+    record = json.loads(reconciliation.read_text(encoding="utf-8"))
+    assert record["status"] == "failed"
+    assert outcome.outcome_path is not None
+    runtime_outcome = json.loads(outcome.outcome_path.read_text(encoding="utf-8"))
+    assert runtime_outcome["status"] == "failed"
+    assert runtime_outcome["proxy_reconciliation_sha256"] == hashlib.sha256(
+        reconciliation.read_bytes()
+    ).hexdigest()
+
+
+def test_proxy_nonzero_child_still_finalizes_its_safe_reconciliation_window(tmp_path) -> None:
+    manifest = _manifest(tmp_path)
+    private_run_dir = _private_run(tmp_path)
+    assert (
+        _supervise(
+            manifest=manifest,
+            stage="preflight",
+            private_run_dir=private_run_dir,
+            action=_write_complete_ledger,
+            command_runner=_FakeRuntimeRunner(),
+        ).status
+        == "passed"
+    )
+    assert (
+        _supervise(
+            manifest=manifest,
+            stage="score-direct",
+            private_run_dir=private_run_dir,
+            action=_write_complete_ledger,
+            command_runner=_FakeRuntimeRunner(),
+        ).status
+        == "passed"
+    )
+
+    def failed_child(lease: RuntimeLease) -> int:
+        _write_complete_ledger(lease)
+        return 7
+
+    outcome = _supervise(
+        manifest=manifest,
+        stage="score-proxy",
+        private_run_dir=private_run_dir,
+        action=failed_child,
+        command_runner=_FakeRuntimeRunner(),
+    )
+
+    assert (outcome.status, outcome.failure_category) == ("failed", "action_failed")
+    reconciliation = private_run_dir / "scored-proxy-reconciliation.json"
+    assert json.loads(reconciliation.read_text(encoding="utf-8"))["status"] == "passed"
+    assert outcome.proxy_reconciliation_sha256 == hashlib.sha256(reconciliation.read_bytes()).hexdigest()
 
 
 def test_score_proxy_requires_a_completed_direct_treatment_before_resources(tmp_path) -> None:
     manifest = _manifest(tmp_path)
     private_run_dir = _private_run(tmp_path)
-    preflight = supervise_qualification_runtime(
+    preflight = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=private_run_dir,
@@ -1388,7 +1875,7 @@ def test_score_proxy_requires_a_completed_direct_treatment_before_resources(tmp_
     assert preflight.status == "passed"
     runner = _FakeRuntimeRunner()
 
-    proxy = supervise_qualification_runtime(
+    proxy = _supervise(
         manifest=manifest,
         stage="score-proxy",
         private_run_dir=private_run_dir,
@@ -1405,7 +1892,7 @@ def test_scored_treatment_rejects_a_nonfresh_model_before_action_or_proxy_resour
 
     manifest = _manifest(tmp_path)
     private_run_dir = _private_run(tmp_path)
-    preflight = supervise_qualification_runtime(
+    preflight = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=private_run_dir,
@@ -1416,7 +1903,7 @@ def test_scored_treatment_rejects_a_nonfresh_model_before_action_or_proxy_resour
     runner = _FakeRuntimeRunner()
     runner.model_requests_completed = 1
 
-    direct = supervise_qualification_runtime(
+    direct = _supervise(
         manifest=manifest,
         stage="score-direct",
         private_run_dir=private_run_dir,
@@ -1434,7 +1921,7 @@ def test_scored_treatment_requires_a_dedicated_model_restart_even_with_zero_requ
     manifest = _manifest(tmp_path)
     private_run_dir = _private_run(tmp_path)
     runner = _FakeRuntimeRunner()
-    preflight = supervise_qualification_runtime(
+    preflight = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=private_run_dir,
@@ -1444,7 +1931,7 @@ def test_scored_treatment_requires_a_dedicated_model_restart_even_with_zero_requ
     assert preflight.status == "passed"
     preflight_commands = list(_docker_commands(runner))
 
-    direct = supervise_qualification_runtime(
+    direct = _supervise(
         manifest=manifest,
         stage="score-direct",
         private_run_dir=private_run_dir,
@@ -1494,7 +1981,7 @@ def test_setup_failures_never_invoke_action_and_clean_only_created_resources(
     runner = _FakeRuntimeRunner(failure=failure)
     action_calls: list[object] = []
 
-    outcome = supervise_qualification_runtime(
+    outcome = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=private_run_dir,
@@ -1528,7 +2015,7 @@ def test_inspect_drift_fails_closed_before_action_and_cleans(drift, tmp_path) ->
     private_run_dir = _private_run(tmp_path)
     runner = _FakeRuntimeRunner(drift=drift)
 
-    outcome = supervise_qualification_runtime(
+    outcome = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=private_run_dir,
@@ -1566,7 +2053,7 @@ def test_manifest_unknown_missing_or_runtime_drift_is_rejected_before_docker(mut
     _store_manifest(manifest, document)
     runner = _FakeRuntimeRunner()
 
-    outcome = supervise_qualification_runtime(
+    outcome = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=_private_run(tmp_path),
@@ -1596,7 +2083,7 @@ def test_duplicate_json_manifest_keys_are_rejected_before_runtime_side_effects(l
         manifest.write_text(serialized.replace(needle, needle + needle, 1), encoding="utf-8")
     runner = _FakeRuntimeRunner()
 
-    outcome = supervise_qualification_runtime(
+    outcome = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=_private_run(tmp_path),
@@ -1614,7 +2101,7 @@ def test_duplicate_json_manifest_keys_are_rejected_before_runtime_side_effects(l
 def test_benchmark_identity_drift_is_rejected_before_runtime_resources(failure, tmp_path) -> None:
     runner = _FakeRuntimeRunner(failure=failure)
 
-    outcome = supervise_qualification_runtime(
+    outcome = _supervise(
         manifest=_manifest(tmp_path),
         stage="preflight",
         private_run_dir=_private_run(tmp_path),
@@ -1631,7 +2118,7 @@ def test_tracked_source_checkout_without_installed_metadata_passes_in_isolation(
     assert not list((checkout / "src").glob("*.dist-info"))
     runner = _SourceCheckoutRunner()
 
-    outcome = supervise_qualification_runtime(
+    outcome = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=_private_run(tmp_path),
@@ -1655,7 +2142,7 @@ def test_untracked_sitecustomize_is_rejected_before_isolated_source_probe_can_ex
     )
     runner = _SourceCheckoutRunner()
 
-    outcome = supervise_qualification_runtime(
+    outcome = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=_private_run(tmp_path),
@@ -1695,7 +2182,7 @@ def test_missing_or_unpinned_benchmark_identity_is_rejected_before_runtime_resou
     _store_manifest(manifest, document)
     runner = _FakeRuntimeRunner()
 
-    outcome = supervise_qualification_runtime(
+    outcome = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=_private_run(tmp_path),
@@ -1718,16 +2205,21 @@ def test_missing_or_unpinned_benchmark_identity_is_rejected_before_runtime_resou
         ("unexpected", True),
     ],
 )
-def test_trial_identity_is_strict_and_blocks_runtime_resources(field, value, tmp_path) -> None:
+def test_campaign_identity_is_strict_and_blocks_runtime_resources(field, value, tmp_path) -> None:
     manifest = _manifest(tmp_path)
     document = _manifest_document(manifest)
-    trial = document["qualification_runtime"]["trial"]
-    assert isinstance(trial, dict)
-    trial[field] = value
+    campaign = document["qualification_runtime"]["campaign"]
+    assert isinstance(campaign, dict)
+    if field in {"run_id", "cache_lane", "pair_index"}:
+        slots = campaign["slots"]
+        assert isinstance(slots, list) and isinstance(slots[0], dict)
+        slots[0][field] = value
+    else:
+        campaign[field] = value
     _store_manifest(manifest, document)
     runner = _FakeRuntimeRunner()
 
-    outcome = supervise_qualification_runtime(
+    outcome = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=_private_run(tmp_path),
@@ -1736,6 +2228,185 @@ def test_trial_identity_is_strict_and_blocks_runtime_resources(field, value, tmp
     )
 
     assert outcome.failure_category == "runtime_manifest_invalid"
+    assert _docker_commands(runner) == []
+
+
+def test_campaign_stage_runner_inspects_absent_partial_failed_and_passed_outcomes(tmp_path) -> None:
+    """Campaign recovery uses durable outcome validation, never filename inference."""
+
+    manifest = _manifest(tmp_path)
+    private_campaign_dir = _private_run(tmp_path, "private-campaign")
+    stage_runner = runtime_module.QualificationCampaignStageRunner(
+        action=_write_complete_ledger,
+        command_runner=_FakeRuntimeRunner(),
+    )
+    preflight = _campaign_stage_request(manifest, private_campaign_dir, stage="preflight")
+
+    assert stage_runner.inspect(preflight).state == "absent"
+    preflight.private_run_dir.mkdir(mode=0o700)
+    preflight.private_run_dir.chmod(0o700)
+    completed = stage_runner.run(preflight)
+
+    assert completed.status == "passed"
+    inspected = stage_runner.inspect(preflight)
+    assert inspected.state == "complete"
+    assert inspected.result == completed
+
+    partial = _campaign_stage_request(
+        manifest, private_campaign_dir, stage="score-direct", cache_lane="cold", pair_index=1
+    )
+    partial.private_run_dir.mkdir(mode=0o700)
+    partial.private_run_dir.chmod(0o700)
+    (partial.private_run_dir / "scored-direct.jsonl").write_text("{}\n", encoding="utf-8")
+    (partial.private_run_dir / "scored-direct.jsonl").chmod(0o600)
+    assert stage_runner.inspect(partial).state == "partial"
+
+    failed_campaign_dir = _private_run(tmp_path, "failed-private-campaign")
+    failed_request = _campaign_stage_request(manifest, failed_campaign_dir, stage="preflight")
+    failed_request.private_run_dir.mkdir(mode=0o700)
+    failed_request.private_run_dir.chmod(0o700)
+
+    def failing_action(lease: RuntimeLease) -> int:
+        _write_complete_ledger(lease)
+        return 9
+
+    failed_runner = runtime_module.QualificationCampaignStageRunner(
+        action=failing_action,
+        command_runner=_FakeRuntimeRunner(),
+    )
+    failed = failed_runner.run(failed_request)
+    assert failed.status == "failed"
+    assert failed.failure_category == "action_failed"
+    assert failed_runner.inspect(failed_request) == runtime_module.StageInspection("complete", failed)
+
+
+def test_campaign_advance_uses_runtime_adapter_and_binds_the_first_event(tmp_path) -> None:
+    manifest = _manifest(tmp_path)
+    private_campaign_dir = _private_run(tmp_path, "advance-private-campaign")
+
+    class Readiness:
+        def probe(self, _request: StageRequest) -> ReadinessResult:
+            # The sole preflight never calls readiness; retain a typed safe
+            # fallback so this test proves the real campaign adapter surface.
+            return ReadinessResult("ready", "a" * 64)
+
+    advance = advance_qualification_campaign(
+        manifest,
+        private_campaign_dir,
+        stage_runner=runtime_module.QualificationCampaignStageRunner(
+            action=_write_complete_ledger,
+            command_runner=_FakeRuntimeRunner(),
+        ),
+        readiness_probe=Readiness(),
+    )
+
+    assert advance.kind == "stage_completed"
+    assert (advance.sequence, advance.stage, advance.status) == (1, "preflight", "passed")
+    event = next((private_campaign_dir / "campaign-events").glob("*.json"))
+    record = json.loads(event.read_text(encoding="utf-8"))
+    assert record["slot_ordinal"] == 0
+    assert record["cache_lane"] == "preflight"
+    outcome_path = private_campaign_dir / "slots" / "00-preflight-pair0" / "preflight-runtime-outcome.json"
+    assert record["runtime_outcome_sha256"] == hashlib.sha256(outcome_path.read_bytes()).hexdigest()
+    assert record["campaign_id_sha256"] == hashlib.sha256(b"qualification-campaign-1").hexdigest()
+    assert record["model_runtime_instance_sha256"] is not None
+
+
+def test_campaign_advances_a_full_first_pair_through_proxy_reconciliation(tmp_path) -> None:
+    """The real adapter binds the pair-local direct result and proxy reconciliation."""
+
+    manifest = _manifest(tmp_path)
+    private_campaign_dir = _private_run(tmp_path, "first-pair-private-campaign")
+
+    class PreflightReadiness:
+        def probe(self, _request: StageRequest) -> ReadinessResult:
+            return ReadinessResult("ready", "a" * 64)
+
+    preflight_runner = _FakeRuntimeRunner()
+    first = advance_qualification_campaign(
+        manifest,
+        private_campaign_dir,
+        stage_runner=runtime_module.QualificationCampaignStageRunner(
+            action=_write_complete_ledger,
+            command_runner=preflight_runner,
+        ),
+        readiness_probe=PreflightReadiness(),
+    )
+    assert first.kind == "stage_completed"
+
+    direct_runner = _FakeRuntimeRunner()
+    second = advance_qualification_campaign(
+        manifest,
+        private_campaign_dir,
+        stage_runner=runtime_module.QualificationCampaignStageRunner(
+            action=_write_complete_ledger,
+            command_runner=direct_runner,
+        ),
+        readiness_probe=runtime_module.QualificationCampaignReadinessProbe(
+            command_runner=direct_runner
+        ),
+    )
+    assert (second.kind, second.stage, second.status) == ("stage_completed", "score-direct", "passed")
+    assert not list((private_campaign_dir / "slots").glob(".readiness-*-model-cache-evidence.json"))
+
+    proxy_runner = _FakeRuntimeRunner()
+    third = advance_qualification_campaign(
+        manifest,
+        private_campaign_dir,
+        stage_runner=runtime_module.QualificationCampaignStageRunner(
+            action=_write_complete_ledger,
+            command_runner=proxy_runner,
+        ),
+        readiness_probe=runtime_module.QualificationCampaignReadinessProbe(
+            command_runner=proxy_runner
+        ),
+    )
+
+    assert (third.kind, third.sequence, third.stage, third.status) == (
+        "stage_completed",
+        3,
+        "score-proxy",
+        "passed",
+    )
+    slot = private_campaign_dir / "slots" / "01-cold-pair1"
+    reconciliation = slot / "scored-proxy-reconciliation.json"
+    proxy_outcome = slot / "scored-proxy-runtime-outcome.json"
+    event = json.loads((private_campaign_dir / "campaign-events" / "0003.json").read_text(encoding="utf-8"))
+    assert event["proxy_reconciliation_sha256"] == hashlib.sha256(reconciliation.read_bytes()).hexdigest()
+    assert event["runtime_outcome_sha256"] == hashlib.sha256(proxy_outcome.read_bytes()).hexdigest()
+    assert event["slot_ordinal"] == 1
+    assert event["cache_lane"] == "cold"
+    assert event["pair_index"] == 1
+
+
+def test_supervisor_rejects_a_stage_request_outside_exact_campaign_topology(tmp_path) -> None:
+    manifest = _manifest(tmp_path)
+    private_run_dir = _private_run(tmp_path)
+    request = _campaign_stage_request(manifest, private_run_dir, stage="preflight")
+    # The manifest-derived request remains valid, but the supervisor must not
+    # accept a caller-substituted private directory outside ``slots``.
+    invalid = StageRequest(
+        request.manifest,
+        request.manifest_sha256,
+        request.sequence,
+        request.slot,
+        request.stage,
+        private_run_dir,
+        private_run_dir / "preflight-runtime-outcome.json",
+    )
+    runner = _FakeRuntimeRunner()
+
+    outcome = runtime_module.supervise_qualification_runtime(
+        manifest=manifest,
+        stage="preflight",
+        private_run_dir=private_run_dir,
+        action=lambda _lease: pytest.fail("invalid topology must block the child"),
+        command_runner=runner,
+        stage_request=invalid,
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.failure_category == "runtime_campaign_request_invalid"
     assert _docker_commands(runner) == []
 
 
@@ -1759,7 +2430,7 @@ def test_insecure_equal_or_symlinked_credentials_are_rejected_before_docker(kind
         ordinary_path.symlink_to(replacement)
     runner = _FakeRuntimeRunner()
 
-    outcome = supervise_qualification_runtime(
+    outcome = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=_private_run(tmp_path),
@@ -1775,7 +2446,7 @@ def test_insecure_equal_or_symlinked_credentials_are_rejected_before_docker(kind
 def test_direct_stage_revalidates_credential_files_after_preflight(drift, tmp_path) -> None:
     manifest = _manifest(tmp_path)
     private_run_dir = _private_run(tmp_path)
-    preflight = supervise_qualification_runtime(
+    preflight = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=private_run_dir,
@@ -1799,7 +2470,7 @@ def test_direct_stage_revalidates_credential_files_after_preflight(drift, tmp_pa
         policy.write_text(ordinary.read_text(encoding="utf-8"), encoding="utf-8")
         policy.chmod(0o600)
 
-    outcome = supervise_qualification_runtime(
+    outcome = _supervise(
         manifest=manifest,
         stage="score-direct",
         private_run_dir=private_run_dir,
@@ -1815,7 +2486,7 @@ def test_proxy_stage_revalidates_host_credentials_immediately_before_action(monk
     manifest = _manifest(tmp_path)
     private_run_dir = _private_run(tmp_path)
     assert (
-        supervise_qualification_runtime(
+        _supervise(
             manifest=manifest,
             stage="preflight",
             private_run_dir=private_run_dir,
@@ -1825,7 +2496,7 @@ def test_proxy_stage_revalidates_host_credentials_immediately_before_action(monk
         == "passed"
     )
     assert (
-        supervise_qualification_runtime(
+        _supervise(
             manifest=manifest,
             stage="score-direct",
             private_run_dir=private_run_dir,
@@ -1849,7 +2520,7 @@ def test_proxy_stage_revalidates_host_credentials_immediately_before_action(monk
 
     monkeypatch.setattr(runtime, "_verify_proxy_auth_and_metrics", drift_after_setup)
 
-    outcome = supervise_qualification_runtime(
+    outcome = _supervise(
         manifest=manifest,
         stage="score-proxy",
         private_run_dir=private_run_dir,
@@ -1879,7 +2550,7 @@ def test_occupied_ports_reject_unrelated_ready_processes_before_docker(tmp_path,
             )
         _store_manifest(manifest, document)
         runner = _FakeRuntimeRunner()
-        outcome = supervise_qualification_runtime(
+        outcome = _supervise(
             manifest=manifest,
             stage="preflight",
             private_run_dir=_private_run(tmp_path),
@@ -1896,7 +2567,7 @@ def test_occupied_ports_reject_unrelated_ready_processes_before_docker(tmp_path,
 def test_unrelated_observer_ready_response_is_rejected(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("shiftedx_harness_proxy.qualification_runtime.time.sleep", lambda _seconds: None)
     runner = _FakeRuntimeRunner(failure="observer_ready")
-    outcome = supervise_qualification_runtime(
+    outcome = _supervise(
         manifest=_manifest(tmp_path),
         stage="preflight",
         private_run_dir=_private_run(tmp_path),
@@ -1919,7 +2590,7 @@ def test_action_nonzero_and_runtime_death_preserve_attestation_then_fail(tmp_pat
         action_attestations.append(lease.attestation_path)
         return 23
 
-    outcome = supervise_qualification_runtime(
+    outcome = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=private_run_dir,
@@ -1941,7 +2612,7 @@ def test_action_nonzero_and_runtime_death_preserve_attestation_then_fail(tmp_pat
         death_runner.observer.exit_code = 1
         return 0
 
-    died = supervise_qualification_runtime(
+    died = _supervise(
         manifest=second_manifest,
         stage="preflight",
         private_run_dir=second_private_run,
@@ -1958,7 +2629,7 @@ def test_action_nonzero_and_runtime_death_preserve_attestation_then_fail(tmp_pat
         container_runner.container_running = False
         return 0
 
-    container_died = supervise_qualification_runtime(
+    container_died = _supervise(
         manifest=container_manifest,
         stage="preflight",
         private_run_dir=container_private_run,
@@ -1977,7 +2648,7 @@ def test_signal_and_cleanup_failure_are_categorical_and_cleanup_is_scoped(tmp_pa
         os.kill(os.getpid(), signal.SIGTERM)
         return 0
 
-    interrupted = supervise_qualification_runtime(
+    interrupted = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=private_run_dir,
@@ -1991,7 +2662,7 @@ def test_signal_and_cleanup_failure_are_categorical_and_cleanup_is_scoped(tmp_pa
     setup_manifest = _manifest(tmp_path / "setup-signal")
     setup_private_run = _private_run(tmp_path / "setup-signal")
     setup_runner = _FakeRuntimeRunner(failure="signal_initializer")
-    setup_interrupted = supervise_qualification_runtime(
+    setup_interrupted = _supervise(
         manifest=setup_manifest,
         stage="preflight",
         private_run_dir=setup_private_run,
@@ -2005,7 +2676,7 @@ def test_signal_and_cleanup_failure_are_categorical_and_cleanup_is_scoped(tmp_pa
     cleanup_manifest = _manifest(tmp_path / "cleanup")
     cleanup_private_run = _private_run(tmp_path / "cleanup")
     cleanup_runner = _FakeRuntimeRunner(failure="cleanup_volume")
-    cleanup = supervise_qualification_runtime(
+    cleanup = _supervise(
         manifest=cleanup_manifest,
         stage="preflight",
         private_run_dir=cleanup_private_run,
@@ -2028,7 +2699,7 @@ def test_interruption_keeps_handlers_through_every_cleanup_boundary_and_ignores_
         os.kill(os.getpid(), signal.SIGTERM)
         return 0
 
-    outcome = supervise_qualification_runtime(
+    outcome = _supervise(
         manifest=_manifest(tmp_path),
         stage="preflight",
         private_run_dir=_private_run(tmp_path),
@@ -2061,7 +2732,7 @@ def test_interrupted_detached_resources_are_removed_by_predeclared_owned_names(
     manifest = _manifest(tmp_path)
     manifest_sha256 = _sha256_file(manifest)
 
-    outcome = supervise_qualification_runtime(
+    outcome = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=_private_run(tmp_path),
@@ -2088,7 +2759,7 @@ def test_interrupted_detached_resources_are_removed_by_predeclared_owned_names(
 def test_interrupted_volume_create_is_resolved_by_its_predeclared_owned_name(tmp_path) -> None:
     runner = _FakeRuntimeRunner(failure="signal_volume_create")
 
-    outcome = supervise_qualification_runtime(
+    outcome = _supervise(
         manifest=_manifest(tmp_path),
         stage="preflight",
         private_run_dir=_private_run(tmp_path),
@@ -2111,7 +2782,7 @@ def test_unresolved_owned_resource_during_cleanup_fails_the_stage(tmp_path) -> N
         runner.failure = "cleanup_inspect"
         return _write_complete_ledger(lease)
 
-    outcome = supervise_qualification_runtime(
+    outcome = _supervise(
         manifest=_manifest(tmp_path),
         stage="preflight",
         private_run_dir=_private_run(tmp_path),
@@ -2131,7 +2802,7 @@ def test_existing_evidence_is_never_clobbered_and_direct_stage_uses_preflight_at
     preexisting.chmod(0o600)
     blocked_runner = _FakeRuntimeRunner()
 
-    blocked = supervise_qualification_runtime(
+    blocked = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=private_run_dir,
@@ -2149,7 +2820,7 @@ def test_existing_evidence_is_never_clobbered_and_direct_stage_uses_preflight_at
     existing_outcome.write_text("prior-outcome\n", encoding="utf-8")
     existing_outcome.chmod(0o600)
     outcome_runner = _FakeRuntimeRunner()
-    outcome_blocked = supervise_qualification_runtime(
+    outcome_blocked = _supervise(
         manifest=outcome_manifest,
         stage="preflight",
         private_run_dir=outcome_private_run,
@@ -2164,7 +2835,7 @@ def test_existing_evidence_is_never_clobbered_and_direct_stage_uses_preflight_at
     proxy_manifest = _manifest(proxy_root)
     proxy_private_run = _private_run(proxy_root)
     proxy_runner = _FakeRuntimeRunner()
-    proxy_blocked = supervise_qualification_runtime(
+    proxy_blocked = _supervise(
         manifest=proxy_manifest,
         stage="score-proxy",
         private_run_dir=proxy_private_run,
@@ -2177,7 +2848,7 @@ def test_existing_evidence_is_never_clobbered_and_direct_stage_uses_preflight_at
     clean_manifest = _manifest(tmp_path / "clean")
     clean_private_run = _private_run(tmp_path / "clean")
     preflight_runner = _FakeRuntimeRunner()
-    passed = supervise_qualification_runtime(
+    passed = _supervise(
         manifest=clean_manifest,
         stage="preflight",
         private_run_dir=clean_private_run,
@@ -2186,7 +2857,7 @@ def test_existing_evidence_is_never_clobbered_and_direct_stage_uses_preflight_at
     )
     assert passed.status == "passed"
     direct_runner = _FakeRuntimeRunner()
-    direct = supervise_qualification_runtime(
+    direct = _supervise(
         manifest=clean_manifest,
         stage="score-direct",
         private_run_dir=clean_private_run,
@@ -2211,7 +2882,7 @@ def test_outcomes_and_attestations_are_private_mode_600_and_fresh_instances(tmp_
     first_root = tmp_path / "first"
     first_manifest = _manifest(first_root)
     first_private = _private_run(first_root)
-    first = supervise_qualification_runtime(
+    first = _supervise(
         manifest=first_manifest,
         stage="preflight",
         private_run_dir=first_private,
@@ -2221,7 +2892,7 @@ def test_outcomes_and_attestations_are_private_mode_600_and_fresh_instances(tmp_
     second_root = tmp_path / "second"
     second_manifest = _manifest(second_root)
     second_private = _private_run(second_root)
-    second = supervise_qualification_runtime(
+    second = _supervise(
         manifest=second_manifest,
         stage="preflight",
         private_run_dir=second_private,
@@ -2243,7 +2914,7 @@ def test_outcomes_and_attestations_are_private_mode_600_and_fresh_instances(tmp_
 def test_scored_proxy_requires_preflight_then_uses_a_fresh_scored_attestation(tmp_path) -> None:
     manifest = _manifest(tmp_path)
     private_run_dir = _private_run(tmp_path)
-    preflight = supervise_qualification_runtime(
+    preflight = _supervise(
         manifest=manifest,
         stage="preflight",
         private_run_dir=private_run_dir,
@@ -2251,7 +2922,7 @@ def test_scored_proxy_requires_preflight_then_uses_a_fresh_scored_attestation(tm
         command_runner=_FakeRuntimeRunner(),
     )
     assert preflight.status == "passed"
-    direct = supervise_qualification_runtime(
+    direct = _supervise(
         manifest=manifest,
         stage="score-direct",
         private_run_dir=private_run_dir,
@@ -2260,7 +2931,7 @@ def test_scored_proxy_requires_preflight_then_uses_a_fresh_scored_attestation(tm
     )
     assert direct.status == "passed"
     lease_seen: list[RuntimeLease] = []
-    scored = supervise_qualification_runtime(
+    scored = _supervise(
         manifest=manifest,
         stage="score-proxy",
         private_run_dir=private_run_dir,
@@ -2301,12 +2972,21 @@ def _lease(stage: str) -> RuntimeLease:
         trial_run_id="qualified-run",
         cache_lane="warm-prefix",
         pair_index=2,
+        campaign_id_sha256="9" * 64,
+        slot_ordinal=5,
         direct_base_url="https://private-model.invalid/v1",
         direct_api_key_file=Path("/private/direct-api-key"),
         proxy_base_url="http://127.0.0.1:19090/v1" if stage != "score-direct" else None,
         proxy_metrics_url="http://127.0.0.1:19090/metrics" if stage != "score-direct" else None,
         proxy_api_key_file=Path("/private/qualification-policy-key") if stage != "score-direct" else None,
         observer_ledger=Path("/private/observer.jsonl") if stage != "score-direct" else None,
+        proxy_request_ledger=(
+            Path("/private/preflight-proxy-requests.jsonl")
+            if stage == "preflight"
+            else Path("/private/scored-proxy-requests.jsonl")
+            if stage == "score-proxy"
+            else None
+        ),
         direct_model_attempt_ledger=(
             Path("/private/preflight-direct-model-boundary.jsonl")
             if stage == "preflight"
@@ -2420,29 +3100,43 @@ def test_thin_cli_cold_lane_uses_bypass_and_never_primes(monkeypatch) -> None:
     assert "--cache-prime-only" not in captured[0]
 
 
-def test_thin_cli_only_passes_manifest_stage_and_private_directory_to_supervisor(tmp_path) -> None:
+def test_campaign_cli_advances_only_the_manifest_derived_next_stage(tmp_path) -> None:
     cli = _load_runtime_cli()
     calls: dict[str, object] = {}
 
-    def supervisor(**kwargs) -> Outcome:
-        calls.update(kwargs)
-        return Outcome(
-            stage="preflight",
-            status="passed",
-            action_exit_code=0,
-            failure_category=None,
-            attestation_path=None,
-            outcome_path=None,
+    def campaign_advancer(manifest, private_campaign_dir, *, stage_runner, readiness_probe):
+        calls.update(
+            {
+                "manifest": manifest,
+                "private_campaign_dir": private_campaign_dir,
+                "stage_runner": stage_runner,
+                "readiness_probe": readiness_probe,
+            }
         )
+        return SimpleNamespace(kind="stage_completed")
 
     result = cli.main(
-        ["--manifest", str(tmp_path / "manifest.json"), "--stage", "preflight", "--private-run-dir", str(tmp_path)],
-        supervisor=supervisor,
+        ["--manifest", str(tmp_path / "manifest.json"), "--private-campaign-dir", str(tmp_path)],
+        campaign_advancer=campaign_advancer,
     )
 
     assert result == 0
-    assert set(calls) == {"manifest", "stage", "private_run_dir", "action"}
-    assert calls["action"] is cli.invoke_paired_runner
+    assert set(calls) == {"manifest", "private_campaign_dir", "stage_runner", "readiness_probe"}
+    assert calls["manifest"] == tmp_path / "manifest.json"
+    assert calls["private_campaign_dir"] == tmp_path
+
+    with pytest.raises(SystemExit, match="2"):
+        cli.main(
+            [
+                "--manifest",
+                str(tmp_path / "manifest.json"),
+                "--private-campaign-dir",
+                str(tmp_path),
+                "--stage",
+                "preflight",
+            ],
+            campaign_advancer=campaign_advancer,
+        )
 
 
 def test_benchmarking_manifest_example_is_duplicate_rejecting_json_with_c1_model_contract() -> None:
@@ -2462,9 +3156,9 @@ def test_benchmarking_manifest_example_is_duplicate_rejecting_json_with_c1_model
     runtime = parsed["qualification_runtime"]
     assert isinstance(runtime, dict)
     model = runtime["model"]
-    trial = runtime["trial"]
+    campaign = runtime["campaign"]
     assert isinstance(model, dict)
-    assert isinstance(trial, dict)
+    assert isinstance(campaign, dict)
     assert set(model) == {
         "public_id",
         "upstream_url",
@@ -2485,7 +3179,15 @@ def test_benchmarking_manifest_example_is_duplicate_rejecting_json_with_c1_model
         "health_contract_sha256",
         "settings_contract_sha256",
     }
-    assert set(trial) == {"run_id", "cache_lane", "pair_index", "treatment_order"}
+    assert set(campaign) == {
+        "campaign_id",
+        "slots",
+        "stage_order",
+        "treatment_order",
+        "model_instance_policy",
+        "failure_policy",
+    }
+    assert len(campaign["slots"]) == 6
     assert "--ssd-session-cache=off" in model["required_launch_flags"]
     assert runtime["benchmark"]["scenario_count"] > 0
     assert "restart it from the exact frozen model" in document
@@ -2506,10 +3208,10 @@ def test_private_manifest_documentation_is_valid_json_with_positive_scenario_cou
         "image",
         "model",
         "benchmark",
-        "trial",
+        "campaign",
         "observer",
         "proxy",
         "credentials",
     }
     assert runtime["benchmark"]["scenario_count"] > 0
-    assert runtime["trial"]["treatment_order"] == ["direct", "proxy"]
+    assert runtime["campaign"]["treatment_order"] == ["direct", "proxy"]

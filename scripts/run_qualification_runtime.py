@@ -9,10 +9,11 @@ import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+from shiftedx_harness_proxy.qualification_campaign import CampaignAdvance, advance_qualification_campaign
 from shiftedx_harness_proxy.qualification_runtime import (
-    Outcome,
+    QualificationCampaignReadinessProbe,
+    QualificationCampaignStageRunner,
     RuntimeLease,
-    supervise_qualification_runtime,
 )
 
 
@@ -44,6 +45,7 @@ def paired_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
         proxy_base_url, proxy_metrics_url, proxy_api_key_file, observer_ledger, attestation_path = _require_proxy_lease(
             lease
         )
+        proxy_request_ledger = _require_proxy_request_ledger(lease)
         direct_attempt_ledger = _require_direct_attempt_ledger(lease)
         argv = [
             *common,
@@ -58,6 +60,8 @@ def paired_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
             proxy_metrics_url,
             "--proxy-observer-ledger",
             str(observer_ledger),
+            "--proxy-request-ledger",
+            str(proxy_request_ledger),
             "--direct-model-attempt-ledger",
             str(direct_attempt_ledger),
             "--proxy-api-key-file",
@@ -97,6 +101,7 @@ def paired_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
             observer_ledger,
             attestation_path,
         ) = _require_proxy_lease(lease)
+        proxy_request_ledger = _require_proxy_request_ledger(lease)
         argv = [
             *common,
             "--base-url",
@@ -108,6 +113,8 @@ def paired_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
             str(proxy_api_key_file),
             "--proxy-observer-ledger",
             str(observer_ledger),
+            "--proxy-request-ledger",
+            str(proxy_request_ledger),
             "--preflight-ledger",
             str(lease.preflight_ledger),
             "--runtime-attestation",
@@ -115,7 +122,7 @@ def paired_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
             "--preflight-runtime-outcome",
             str(lease.preflight_ledger.with_name("preflight-runtime-outcome.json")),
             "--direct-runtime-outcome",
-            str(lease.preflight_ledger.with_name("scored-direct-runtime-outcome.json")),
+            str(lease.output_ledger.with_name("scored-direct-runtime-outcome.json")),
         ]
         return tuple(argv)
     raise ValueError("unsupported qualification runtime stage")
@@ -200,22 +207,23 @@ def _cache_mode(lease: RuntimeLease) -> str:
 def main(
     argv: Sequence[str] | None = None,
     *,
-    supervisor: Callable[..., Outcome] = supervise_qualification_runtime,
+    campaign_advancer: Callable[..., CampaignAdvance] = advance_qualification_campaign,
 ) -> int:
-    """Accept only manifest/stage/private-directory inputs; runtime behavior has no overrides."""
+    """Advance exactly one manifest-derived campaign stage without operator overrides."""
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--stage", choices=("preflight", "score-direct", "score-proxy"), required=True)
-    parser.add_argument("--private-run-dir", type=Path, required=True)
+    parser.add_argument("--private-campaign-dir", type=Path, required=True)
     args = parser.parse_args(argv)
-    outcome = supervisor(
-        manifest=args.manifest,
-        stage=args.stage,
-        private_run_dir=args.private_run_dir,
-        action=invoke_paired_runner,
+    advance = campaign_advancer(
+        args.manifest,
+        args.private_campaign_dir,
+        stage_runner=QualificationCampaignStageRunner(action=invoke_paired_runner),
+        readiness_probe=QualificationCampaignReadinessProbe(),
     )
-    return 0 if outcome.status == "passed" else 1
+    if advance.kind in {"stage_completed", "campaign_passed"}:
+        return 0
+    return 2 if advance.kind == "restart_required" else 1
 
 
 def _require_proxy_lease(lease: RuntimeLease) -> tuple[str, str, Path, Path, Path]:
@@ -245,6 +253,12 @@ def _require_direct_attempt_ledger(lease: RuntimeLease) -> Path:
     if lease.direct_model_attempt_ledger is None:
         raise ValueError("lease is missing its direct model-attempt ledger")
     return lease.direct_model_attempt_ledger
+
+
+def _require_proxy_request_ledger(lease: RuntimeLease) -> Path:
+    if lease.proxy_request_ledger is None:
+        raise ValueError("proxy lease is missing its request-accounting ledger")
+    return lease.proxy_request_ledger
 
 
 if __name__ == "__main__":

@@ -54,46 +54,43 @@ therefore consumes zero observer records.
 
 Do not paste Docker, observer, secret-copy, readiness, or cleanup commands into a qualification
 run. `scripts/run_qualification_runtime.py` owns that private mechanics and accepts only an
-immutable manifest, stage, and new private run directory. It derives every other runner input from
-the manifest; there are intentionally no behavior overrides.
+immutable master manifest and private campaign directory. It advances exactly the sole next
+manifest-derived stage; there is intentionally no stage, slot, run-ID, or behavior override.
 
-`benchmark-reports/private/` is ignored by Git. Create it and a unique mode-`700` run directory
+`benchmark-reports/private/` is ignored by Git. Create it and a unique mode-`700` campaign directory
 before any request. Do not pre-create, truncate, or reuse a ledger, attestation, or outcome path.
 Every evidence writer is no-clobber and atomic.
 
 ```bash
 umask 077
 install -d -m 700 benchmark-reports/private
-RUN_DIR="$(mktemp -d benchmark-reports/private/qualification.XXXXXX)"
+CAMPAIGN_DIR="$(mktemp -d benchmark-reports/private/qualification.XXXXXX)"
 RUN_MANIFEST="/absolute/private/path/approved-qualification-manifest.json"
 
 uv run python scripts/run_qualification_runtime.py \
-  --manifest "$RUN_MANIFEST" --private-run-dir "$RUN_DIR" --stage preflight
-
-uv run python scripts/run_qualification_runtime.py \
-  --manifest "$RUN_MANIFEST" --private-run-dir "$RUN_DIR" --stage score-direct
-
-uv run python scripts/run_qualification_runtime.py \
-  --manifest "$RUN_MANIFEST" --private-run-dir "$RUN_DIR" --stage score-proxy
+  --manifest "$RUN_MANIFEST" --private-campaign-dir "$CAMPAIGN_DIR"
 ```
 
-The commands are sequential. `preflight` creates the passed paired ledger and its immutable
-runtime attestation; `score-direct` validates that exact preflight attestation and starts no
-container; `score-proxy` creates a fresh observer, volume, proxy instance, and scored-proxy
-attestation. A failure retains its safe outcome after scoped cleanup and never authorizes a later
-stage. A stale labelled container or volume is a failure, never an automatic deletion target.
+Run that same command again only after it reports the prior stage complete. It advances one event
+at a time in this fixed order: the sole preflight, then direct/proxy for cold pairs 1–3, then
+direct/proxy for warm-prefix pairs 1–3. An exit status of `2` means the next scored stage requires
+the independently operated MTPLX restart; restart the exact frozen model process, then repeat the
+same command. A failure retains its safe outcome after scoped cleanup, appends a terminal campaign
+event, and never authorizes a rerun. A stale labelled container or volume is a failure, never an
+automatic deletion target.
 The local MTPLX server is outside the supervisor lifecycle: restart it from the exact frozen model
 launch contract before `score-direct`, then restart it again before `score-proxy`. Each measured
 treatment needs its own dedicated process with `requests_completed == 0`; the supervisor rejects
 a nonzero counter or a runtime instance reused from its preceding stage.
 
-The supervisor reserves these private evidence names:
+The sole preflight is always in `slots/00-preflight-pair0`. Each direct/proxy pair shares exactly
+one `slots/0N-<cache_lane>-pairN` directory. The supervisor reserves these private evidence names:
 
 | Stage | New evidence |
 | --- | --- |
-| `preflight` | `preflight.jsonl`, `preflight-direct-model-boundary.jsonl`, `preflight-proxy-model-boundary.jsonl`, `preflight-model-cache-evidence.json`, `preflight-runtime-attestation.json`, `preflight-runtime-outcome.json` |
+| `preflight` | `preflight.jsonl`, `preflight-direct-model-boundary.jsonl`, `preflight-proxy-model-boundary.jsonl`, `preflight-proxy-requests.jsonl`, `preflight-model-cache-evidence.json`, `preflight-runtime-attestation.json`, `preflight-runtime-outcome.json` |
 | `score-direct` | `scored-direct.jsonl`, `scored-direct-model-boundary.jsonl`, `scored-direct-prime-model-boundary.jsonl` (warm lane only), `scored-direct-model-cache-evidence.json`, `scored-direct-runtime-outcome.json` |
-| `score-proxy` | `scored-proxy.jsonl`, `scored-proxy-model-boundary.jsonl`, `scored-proxy-prime-model-boundary.jsonl` (warm lane only), `scored-proxy-model-cache-evidence.json`, `scored-proxy-runtime-attestation.json`, `scored-proxy-runtime-outcome.json` |
+| `score-proxy` | `scored-proxy.jsonl`, `scored-proxy-model-boundary.jsonl`, `scored-proxy-requests.jsonl`, `scored-proxy-prime-model-boundary.jsonl` (warm lane only), `scored-proxy-model-cache-evidence.json`, `scored-proxy-runtime-attestation.json`, `scored-proxy-reconciliation.json`, `scored-proxy-runtime-outcome.json` |
 
 The attestation is allowlist-only: candidate source commit, image digest, manifest SHA-256,
 canonical model/order hashes, benchmark revision, runtime-contract/instance hashes, and the fixed
@@ -156,11 +153,20 @@ uses `"schema_version": "1.0"` and exactly these keys:
       "scenario_order_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
       "scenario_count": 12
     },
-    "trial": {
-      "run_id": "qualification-2026-08-20-a",
-      "cache_lane": "cold",
-      "pair_index": 1,
-      "treatment_order": ["direct", "proxy"]
+    "campaign": {
+      "campaign_id": "qualification-2026-08-20",
+      "slots": [
+        {"cache_lane": "cold", "pair_index": 1, "run_id": "qualification-cold-pair-1"},
+        {"cache_lane": "cold", "pair_index": 2, "run_id": "qualification-cold-pair-2"},
+        {"cache_lane": "cold", "pair_index": 3, "run_id": "qualification-cold-pair-3"},
+        {"cache_lane": "warm-prefix", "pair_index": 1, "run_id": "qualification-warm-pair-1"},
+        {"cache_lane": "warm-prefix", "pair_index": 2, "run_id": "qualification-warm-pair-2"},
+        {"cache_lane": "warm-prefix", "pair_index": 3, "run_id": "qualification-warm-pair-3"}
+      ],
+      "stage_order": ["preflight", "score-direct", "score-proxy"],
+      "treatment_order": ["direct", "proxy"],
+      "model_instance_policy": "fresh-per-scored-treatment",
+      "failure_policy": "terminal-no-rerun"
     },
     "observer": {
       "host": "127.0.0.1",
@@ -263,14 +269,18 @@ that cleanup and the atomic outcome write finish.
 
 The outcome is a mode-`600`, no-clobber JSON record written only after cleanup. Its exact fields
 are `schema_version`, `record_type`, `stage`, `status`, `action_exit_code`, `failure_category`,
-`run_manifest_sha256`, `attestation_sha256`, `model_evidence_sha256`, `output_ledger_sha256`, and
-`output_record_count`. A passed outcome requires a passed exact model-cache-evidence artifact. A
-passed preflight requires five complete ledger rows; a passed scored treatment requires exactly the
-manifest's positive `scenario_count`. `score-direct` requires a passed preflight outcome,
+`run_manifest_sha256`, `attestation_sha256`, `model_evidence_sha256`, `output_ledger_sha256`,
+`output_record_count`, `proxy_reconciliation_sha256`, `campaign_id_sha256`, `slot_ordinal`,
+`cache_lane`, and `pair_index`. Every outcome is slot-bound; a copied result cannot authorize a
+different pair. A passed outcome requires a passed exact model-cache-evidence artifact. A passed
+preflight requires five complete ledger rows; a passed scored treatment requires exactly the
+manifest's positive `scenario_count`. `score-direct` requires the sole passed preflight outcome,
 attestation, and model evidence, while `score-proxy` additionally requires the passed direct
-outcome, ledger, and model evidence. The supervisor supplies the same manifest `trial.run_id` to
-both treatments and derives their child variants as
-`<cache_lane>-pair<pair_index>-direct|proxy-<agentic_set>`.
+outcome from its own pair directory, ledger, and model evidence. A passed proxy outcome also binds
+the passed authenticated `scored-proxy-reconciliation.json`; it snapshots zero proxy metrics before
+the child, validates its request/observer/model evidence after the child, and fails closed on a
+counter or partition mismatch. The supervisor supplies each slot's frozen run ID to both
+treatments and derives variants as `<cache_lane>-pair<pair_index>-direct|proxy-<agentic_set>`.
 
 `cache_lane` is measured proof, not a `cache_proof_sha256` self-assertion. Preflight always sends
 `--cache-mode bypass`, including a later `warm-prefix` campaign: every successful preflight attempt
