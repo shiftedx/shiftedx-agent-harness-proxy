@@ -454,7 +454,14 @@ def cache_observation_from_response(response: Any) -> CacheObservation | None:
     if not isinstance(stats, dict):
         return None
     postcommit = stats.get("session_postcommit_snapshot")
-    if not isinstance(postcommit, dict):
+    if isinstance(postcommit, dict):
+        postcommit_stored = postcommit.get("stored")
+    elif (
+        "session_postcommit_snapshot" not in stats
+        and stats.get("request_session_bank_bypass") is True
+    ):
+        postcommit_stored = False
+    else:
         return None
     return _cache_observation(
         {
@@ -466,7 +473,7 @@ def cache_observation_from_response(response: Any) -> CacheObservation | None:
             "ssd_cached_tokens": stats.get("ssd_cached_tokens"),
             "session_cache_hit": stats.get("session_cache_hit"),
             "request_session_bank_bypass": stats.get("request_session_bank_bypass"),
-            "postcommit_stored": postcommit.get("stored"),
+            "postcommit_stored": postcommit_stored,
         }
     )
 

@@ -14,12 +14,70 @@ from shiftedx_harness_proxy.qualification_contract import (
     RuntimeAttestationFailure,
     RuntimeOutcome,
     RuntimeOutcomeFailure,
+    cache_observation_from_response,
     load_runtime_attestation,
     load_runtime_outcome,
     model_boundary_fingerprint,
     read_model_boundary_observer_records,
     write_model_boundary_attempt_ledger,
 )
+
+
+def test_bypass_cache_observation_accepts_exact_mtplx_shape_without_postcommit_snapshot() -> None:
+    observation = cache_observation_from_response(
+        {
+            "mtplx_stats": {
+                "prompt_tokens": 31,
+                "cached_tokens": 0,
+                "new_prefill_tokens": 31,
+                "cache_source": "none",
+                "ssd_cache_hit": False,
+                "ssd_cached_tokens": 0,
+                "session_cache_hit": False,
+                "request_session_bank_bypass": True,
+            }
+        }
+    )
+
+    assert observation == CacheObservation(
+        prompt_tokens=31,
+        cached_tokens=0,
+        new_prefill_tokens=31,
+        cache_source="none",
+        ssd_cache_hit=False,
+        ssd_cached_tokens=0,
+        session_cache_hit=False,
+        request_session_bank_bypass=True,
+        postcommit_stored=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "stats_override",
+    [
+        {"request_session_bank_bypass": False},
+        {
+            "request_session_bank_bypass": True,
+            "session_postcommit_snapshot": None,
+        },
+        {"request_session_bank_bypass": True, "prompt_tokens": "31"},
+    ],
+)
+def test_missing_postcommit_snapshot_does_not_relax_warm_or_malformed_cache_evidence(
+    stats_override,
+) -> None:
+    stats = {
+        "prompt_tokens": 31,
+        "cached_tokens": 0,
+        "new_prefill_tokens": 31,
+        "cache_source": "none",
+        "ssd_cache_hit": False,
+        "ssd_cached_tokens": 0,
+        "session_cache_hit": False,
+        **stats_override,
+    }
+
+    assert cache_observation_from_response({"mtplx_stats": stats}) is None
 
 
 def test_model_boundary_records_load_exact_safe_response_cache_projection(tmp_path) -> None:
