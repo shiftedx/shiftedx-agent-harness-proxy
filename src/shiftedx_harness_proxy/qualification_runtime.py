@@ -2082,7 +2082,7 @@ def _verify_proxy(
     }
     if not isinstance(labels, dict) or any(labels.get(key) != value for key, value in expected_labels.items()):
         raise QualificationRuntimeFailure("runtime_inspect_drift")
-    _verify_resources(host_config, spec.proxy)
+    _verify_resources(config, host_config, spec.proxy)
     expected_mount = next(
         (
             mount
@@ -2113,9 +2113,10 @@ def _verify_proxy(
         raise QualificationRuntimeFailure("runtime_inspect_drift")
 
 
-def _verify_resources(host_config: dict[str, Any], proxy: _ProxySpec) -> None:
+def _verify_resources(config: dict[str, Any], host_config: dict[str, Any], proxy: _ProxySpec) -> None:
     security_options = host_config.get("SecurityOpt")
     cap_drop = host_config.get("CapDrop")
+    stop_timeout = config.get("StopTimeout")
     if (
         host_config.get("ReadonlyRootfs") is not True
         or not isinstance(cap_drop, list)
@@ -2123,7 +2124,10 @@ def _verify_resources(host_config: dict[str, Any], proxy: _ProxySpec) -> None:
         or not isinstance(security_options, list)
         or "no-new-privileges:true" not in security_options
         or host_config.get("PidsLimit") != proxy.pids_limit
-        or host_config.get("StopTimeout") != proxy.stop_timeout_seconds
+        # Docker 29 persists --stop-timeout in the container Config section.
+        # Require a real integer rather than accepting coercible JSON values.
+        or type(stop_timeout) is not int
+        or stop_timeout != proxy.stop_timeout_seconds
         or host_config.get("Memory") != proxy.memory_bytes
         or host_config.get("NanoCpus") != int(proxy.cpus * Decimal("1000000000"))
         or host_config.get("Init") is not True
