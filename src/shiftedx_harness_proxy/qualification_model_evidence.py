@@ -171,6 +171,15 @@ _SENSITIVE_SETTING_KEY = re.compile(r"(?:^model$|path|directory|(?:^|_)dir$|erro
 _SENSITIVE_LAUNCH_MATERIAL = re.compile(
     r"(?:api[_-]?key|token|password|secret|credential|authorization|bearer)", re.IGNORECASE
 )
+_NUMERIC_TOKEN_LAUNCH_KEYS = frozenset(
+    {
+        "--max-response-tokens",
+        "--max-tokens",
+        "--prefill-chunk-tokens",
+        "--ssd-session-cache-min-prefix-tokens",
+        "--warmup-tokens",
+    }
+)
 _READ_ONLY_COMMAND_ENV = {
     "PATH": "/usr/bin:/bin:/usr/sbin",
     "LANG": "C",
@@ -847,7 +856,11 @@ def _validate_launch_semantics(contract: ModelEvidenceContract) -> None:
 
 def _unsafe_launch_flag(value: str) -> bool:
     key, separator, flag_value = value.partition("=")
-    if key == "--no-auth" and not separator:
+    if key == "--no-auth":
+        return bool(separator)
+    if key in _NUMERIC_TOKEN_LAUNCH_KEYS and separator and flag_value.isdigit():
+        return False
+    if key == "--chat-template-profile" and separator and flag_value == "tokenizer":
         return False
     return (
         key.startswith("--auth")
@@ -1017,16 +1030,26 @@ def _urlsafe_digest(value: str) -> bytes:
 
 
 def _metadata_fields(value: str) -> dict[str, str]:
+    identity_headers = {"name": "Name", "version": "Version"}
     result: dict[str, str] = {}
     for line in value.splitlines():
         if not line:
             break
-        if ":" not in line:
+        if line[0].isspace() or ":" not in line:
             raise ModelEvidenceFailure("model_package_invalid")
         key, item = line.split(":", 1)
-        if key in result or not item.startswith(" "):
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", key) is None or not item.startswith(" "):
             raise ModelEvidenceFailure("model_package_invalid")
-        result[key] = item.strip()
+        field_value = item[1:]
+        if not field_value or field_value != field_value.strip() or not field_value.isprintable():
+            raise ModelEvidenceFailure("model_package_invalid")
+        normalized = key.casefold()
+        canonical = identity_headers.get(normalized)
+        if canonical is None:
+            continue
+        if key != canonical or canonical in result:
+            raise ModelEvidenceFailure("model_package_invalid")
+        result[canonical] = field_value
     return result
 
 
