@@ -171,6 +171,15 @@ _SENSITIVE_SETTING_KEY = re.compile(r"(?:^model$|path|directory|(?:^|_)dir$|erro
 _SENSITIVE_LAUNCH_MATERIAL = re.compile(
     r"(?:api[_-]?key|token|password|secret|credential|authorization|bearer)", re.IGNORECASE
 )
+_NUMERIC_TOKEN_LAUNCH_KEYS = frozenset(
+    {
+        "--max-response-tokens",
+        "--max-tokens",
+        "--prefill-chunk-tokens",
+        "--ssd-session-cache-min-prefix-tokens",
+        "--warmup-tokens",
+    }
+)
 _READ_ONLY_COMMAND_ENV = {
     "PATH": "/usr/bin:/bin:/usr/sbin",
     "LANG": "C",
@@ -847,7 +856,11 @@ def _validate_launch_semantics(contract: ModelEvidenceContract) -> None:
 
 def _unsafe_launch_flag(value: str) -> bool:
     key, separator, flag_value = value.partition("=")
-    if key == "--no-auth" and not separator:
+    if key == "--no-auth":
+        return bool(separator)
+    if key in _NUMERIC_TOKEN_LAUNCH_KEYS and separator and flag_value.isdigit():
+        return False
+    if key == "--chat-template-profile" and separator and flag_value == "tokenizer":
         return False
     return (
         key.startswith("--auth")

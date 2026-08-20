@@ -1348,6 +1348,37 @@ def test_launch_semantics_accept_real_space_separated_vector_without_foreground(
     assert session.complete([_attempt()]).status == "passed"
 
 
+def test_launch_semantics_accepts_harmless_mtplx_token_count_and_tokenizer_flags(tmp_path: Path) -> None:
+    contract = _contract(tmp_path)
+    flags = (
+        *contract.required_launch_flags,
+        "--warmup-tokens=0",
+        "--ssd-session-cache-min-prefix-tokens=512",
+        "--chat-template-profile=tokenizer",
+        "--max-response-tokens=1024",
+        "--max-tokens=1024",
+        "--prefill-chunk-tokens=2048",
+    )
+    contract = replace(contract, required_launch_flags=flags)
+    probe = _probe_for(contract)
+    for name in ("before", "after"):
+        snapshot = getattr(probe, name)
+        owner = dict(snapshot.listener_owners[0])
+        owner["command_flags"] = flags
+        setattr(probe, name, replace(snapshot, listener_owners=(owner,)))
+
+    session = ModelEvidenceSession.begin(
+        contract,
+        stage="score-direct",
+        run_manifest_sha256="f" * 64,
+        evidence_path=tmp_path / "harmless-token-flags.json",
+        credential_file=_private(tmp_path / "credential", b"model-api-token"),
+        probe=probe,
+    )
+
+    assert session.complete([_attempt()]).status == "passed"
+
+
 def test_launch_semantics_reject_sensitive_flag_value(tmp_path: Path) -> None:
     contract = replace(
         _contract(tmp_path),
@@ -1370,14 +1401,29 @@ def test_launch_semantics_reject_sensitive_flag_value(tmp_path: Path) -> None:
         )
 
 
-@pytest.mark.parametrize("flag", ["--auth-file=/private/keymaterial", "--model-id=sk-private-token"])
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--auth-file=/private/keymaterial",
+        "--auth-token=private-value",
+        "--api-key=private-value",
+        "--password=private-value",
+        "--secret=private-value",
+        "--credential=private-value",
+        "--authorization=private-value",
+        "--bearer=private-value",
+        "--model-id=sk-private-token",
+        "--warmup-tokens=secret",
+        "--chat-template-profile=bearer",
+        "--no-auth=private-value",
+    ],
+)
 def test_launch_semantics_rejects_other_sensitive_flag_names_and_values(tmp_path: Path, flag: str) -> None:
-    contract = replace(
-        _contract(tmp_path),
-        required_launch_flags=("--host=127.0.0.1", "--port=8999", flag),
-    )
+    base = _contract(tmp_path)
+    contract = replace(base, required_launch_flags=(*base.required_launch_flags, flag))
 
     credential = _private(tmp_path / "credential", b"model-api-token")
+    probe = _probe_for(contract)
     with pytest.raises(ModelEvidenceFailure, match="model_contract_invalid"):
         ModelEvidenceSession.begin(
             contract,
@@ -1385,8 +1431,9 @@ def test_launch_semantics_rejects_other_sensitive_flag_names_and_values(tmp_path
             run_manifest_sha256="f" * 64,
             evidence_path=tmp_path / "sensitive-other.json",
             credential_file=credential,
-            probe=_probe_for(contract),
+            probe=probe,
         )
+    assert probe.calls == []
 
 
 def test_warm_prefix_allows_a_pending_nonbypass_prime_when_the_next_request_hits(tmp_path: Path) -> None:
