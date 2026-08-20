@@ -72,6 +72,13 @@ class OptOutPhaseSplitUpstream(EchoUpstream):
         return {"id": "chatcmpl", "choices": [{"message": {"role": "assistant", "content": content}}]}
 
 
+class ObjectFinalizationUpstream(EchoUpstream):
+    async def chat(self, payload: dict[str, Any], request_headers: dict[str, str]) -> dict[str, Any]:
+        self.requests.append(payload)
+        content: Any = "acquisition terminal" if "tools" in payload else {"status": "done"}
+        return {"id": "chatcmpl", "choices": [{"message": {"role": "assistant", "content": content}}]}
+
+
 @pytest.mark.asyncio
 async def test_http_surface_auth_health_streaming_and_unknown_request_passthrough() -> None:
     upstream = EchoUpstream()
@@ -312,6 +319,45 @@ async def test_http_phase_split_harness_opt_out_still_uses_safe_two_phase_transl
     assert "shiftedx_proxy_phase_acquisition_total 1" in metrics.text
     assert "shiftedx_proxy_phase_finalization_total 1" in metrics.text
     assert "shiftedx_proxy_phase_schema_rejections_total 1" in metrics.text
+
+
+@pytest.mark.asyncio
+async def test_http_phase_split_harness_opt_out_releases_canonical_object_finalization_content() -> None:
+    upstream = ObjectFinalizationUpstream()
+    settings = Settings(
+        upstream_base_url="http://upstream/v1",
+        allow_harness_opt_out=True,
+        trusted_policy_extension_api_keys=SecretStr("trusted-extension"),
+        upstream_tool_response_capability_mode="phase_split",
+    )
+    app = create_app(settings, upstream)
+    payload = {
+        "model": "model",
+        "messages": [{"role": "user", "content": "answer"}],
+        "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "result",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {"status": {"type": "string"}},
+                    "required": ["status"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    }
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer trusted-extension", "X-Shiftedx-Harness": "off"},
+                json=payload,
+            )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == '{"status":"done"}'
 
 
 @pytest.mark.asyncio

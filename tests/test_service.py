@@ -413,6 +413,22 @@ async def test_phase_split_harness_opt_out_rejects_unsupported_combined_schema_b
 
 
 @pytest.mark.asyncio
+async def test_phase_split_harness_opt_out_normalizes_object_finalization_content_before_release() -> None:
+    final = completion()
+    final["choices"][0]["message"]["content"] = {"status": "done"}
+    upstream = ScriptedUpstream([completion(content="acquisition terminal"), final])
+    payload = request([{"role": "user", "content": "answer"}])
+    payload["response_format"] = strict_schema()
+
+    result = await ChatService(
+        Settings(upstream_base_url="http://upstream/v1", upstream_tool_response_capability_mode="phase_split"),
+        upstream,
+    ).complete(payload, {}, harness_enabled=False)
+
+    assert result.body["choices"][0]["message"]["content"] == '{"status":"done"}'
+
+
+@pytest.mark.asyncio
 async def test_phase_split_rejects_complex_combined_schema_without_an_upstream_call() -> None:
     upstream = ScriptedUpstream([])
     payload = request([{"role": "user", "content": "answer"}])

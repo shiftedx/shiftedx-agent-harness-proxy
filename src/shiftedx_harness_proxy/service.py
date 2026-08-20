@@ -154,18 +154,11 @@ class ChatService:
                     contract=contract,
                     policy_extension_used=policy_extension_used,
                 )
-            body = _without_reserved_projection_marker(await self.upstream.chat(forwarded, request_headers))
-            return ChatResult(
-                body,
-                PolicyTelemetry(
-                    "off",
-                    0,
-                    0,
-                    0,
-                    1,
-                    (time.perf_counter() - started) * 1000,
-                    policy_extensions_used=int(policy_extension_used),
-                ),
+            return _off_result(
+                await self.upstream.chat(forwarded, request_headers),
+                started,
+                1,
+                policy_extension_used,
             )
         available = {_tool_name(tool) for tool in tools}
         require_receipt = (
@@ -377,6 +370,7 @@ def _terminal_schema_issue(message: JsonObject, contract: SchemaContract) -> str
     content = message.get("content")
     if not isinstance(content, str):
         content = "" if content is None else json.dumps(content, separators=(",", ":"))
+        message["content"] = content
     normalized, changed = normalize_bare_json(content)
     if changed:
         message["content"] = normalized
