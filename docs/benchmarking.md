@@ -82,6 +82,10 @@ runtime attestation; `score-direct` validates that exact preflight attestation a
 container; `score-proxy` creates a fresh observer, volume, proxy instance, and scored-proxy
 attestation. A failure retains its safe outcome after scoped cleanup and never authorizes a later
 stage. A stale labelled container or volume is a failure, never an automatic deletion target.
+The local MTPLX server is outside the supervisor lifecycle: restart it from the exact frozen model
+launch contract before `score-direct`, then restart it again before `score-proxy`. Each measured
+treatment needs its own dedicated process with `requests_completed == 0`; the supervisor rejects
+a nonzero counter or a runtime instance reused from its preceding stage.
 
 The supervisor reserves these private evidence names:
 
@@ -136,7 +140,8 @@ uses `"schema_version": "1.0"` and exactly these keys:
         "--no-auth",
         "--generation-mode=mtp",
         "--depth=3",
-        "--temperature=0"
+        "--temperature=0",
+        "--ssd-session-cache=off"
       ],
       "health_contract_sha256": "0303030303030303030303030303030303030303030303030303030303030303",
       "settings_contract_sha256": "0404040404040404040404040404040404040404040404040404040404040404"
@@ -217,11 +222,12 @@ put endpoint bodies in the manifest. The placeholder flag list above is illustra
 manifest carries the complete frozen semantic vector for that model process.
 
 The supervisor probes only `/health`, `/v1/models`, and `/v1/mtplx/settings`, joins the health
-startup PID to the sole loopback listener, and verifies the executable, launch vector, package,
-model identity, and quiescent request count before and after each stage. An already-ready unrelated
-service, a replacement PID, or intervening model traffic fails the exclusive qualification window.
-No model endpoint, path, PID, launch argv, or server response is emitted into an attestation,
-outcome, or cache-evidence artifact.
+startup PID to the sole loopback listener, and verifies the executable, launch vector (including
+`--ssd-session-cache=off`), package, model identity, and quiescent request count before and after
+each stage. A scored lane requires a newly restarted instance with `requests_completed == 0`; an
+already-ready unrelated service, a replacement PID, a reused preceding-stage instance, or
+intervening model traffic fails the exclusive qualification window. No model endpoint, path, PID,
+launch argv, or server response is emitted into an attestation, outcome, or cache-evidence artifact.
 
 `credentials` names three distinct, regular, non-symlink, mode-`600`, nonempty host files. The
 first is the ordinary production `PROXY_API_KEY`; the second is the distinct trusted
@@ -266,14 +272,16 @@ outcome, ledger, and model evidence. The supervisor supplies the same manifest `
 both treatments and derives their child variants as
 `<cache_lane>-pair<pair_index>-direct|proxy-<agentic_set>`.
 
-`cache_lane` is measured proof, not a `cache_proof_sha256` self-assertion. In the `cold` lane the
-child receives `--cache-mode bypass`; every successful actual attempt must report bypass, no RAM or
-SSD hit, zero cached tokens, a full new prefill, and no postcommit store. In the `warm-prefix` lane
-the supervisor first runs one direct-to-model prime child with the same frozen run ID, scenario
-order, variant, and a `direct` or `proxy` prime arm. It records exactly one safe prime attempt,
-then runs the scored child. The prime request digest must equal the first measured request digest;
-that first measured attempt must be a non-bypass RAM or SSD hit with positive cached tokens, and
-the server request-count delta must leave no room for intervening traffic. A pending postcommit
+`cache_lane` is measured proof, not a `cache_proof_sha256` self-assertion. Preflight always sends
+`--cache-mode bypass`, including a later `warm-prefix` campaign: every successful preflight attempt
+must report bypass, no RAM or SSD hit, zero cached tokens, a full new prefill, and no postcommit
+store. The `cold` scored lane enforces the same evidence on its dedicated zero-counter process. In
+the `warm-prefix` scored lane, that separate process has persistent SSD cache disabled and the
+supervisor first runs one direct-to-model prime child with the same frozen run ID, scenario order,
+variant, and a `direct` or `proxy` prime arm. It records exactly one safe prime attempt, then runs
+the scored child. The prime request digest must equal the first measured request digest; that first
+measured attempt must be a non-bypass **RAM** hit with positive cached tokens and no SSD-hit fields,
+and the server request-count delta must leave no room for intervening traffic. A pending postcommit
 flag is corroborating information only, because a tool-required MTPLX prime can commit after the
 first matching request.
 

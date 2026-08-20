@@ -235,6 +235,7 @@ def test_runtime_attestation_loads_exact_verified_identity(tmp_path) -> None:
     }
     serialized = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
     path.write_bytes(serialized)
+    path.chmod(0o600)
 
     attestation = load_runtime_attestation(
         path,

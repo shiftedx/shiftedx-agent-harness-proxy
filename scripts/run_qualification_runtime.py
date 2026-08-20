@@ -192,6 +192,8 @@ def _variant(lease: RuntimeLease, treatment: str) -> str:
 
 
 def _cache_mode(lease: RuntimeLease) -> str:
+    if lease.stage == "preflight":
+        return "bypass"
     return "bypass" if lease.cache_lane == "cold" else "warm-prefix"
 
 

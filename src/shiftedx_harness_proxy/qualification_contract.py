@@ -12,7 +12,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import stat
 import subprocess
 import tempfile
@@ -33,6 +32,7 @@ _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 _SOURCE_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _FAILURE_CATEGORY = re.compile(r"^[a-z0-9_]+$")
 _SAFE_POLICY_LITERALS = frozenset({"auto", "none", "required", "low", "medium", "high"})
+_FROZEN_GIT_EXECUTABLE = Path("/usr/bin/git")
 
 
 class PreflightFailure(RuntimeError):
@@ -473,17 +473,7 @@ def load_runtime_attestation(
 ) -> RuntimeAttestation:
     """Load runtime evidence and bind it to the exact qualification invocation."""
     try:
-        file_status = path.lstat()
-        if not stat.S_ISREG(file_status.st_mode) or path.is_symlink():
-            raise RuntimeAttestationFailure("runtime_attestation_invalid")
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        try:
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                raise RuntimeAttestationFailure("runtime_attestation_invalid")
-            with os.fdopen(descriptor, "rb", closefd=False) as handle:
-                serialized = handle.read()
-        finally:
-            os.close(descriptor)
+        serialized = _read_private_regular_file(path)
         document = json.loads(serialized, object_pairs_hook=_unique_json_object)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise RuntimeAttestationFailure("runtime_attestation_invalid") from error
@@ -1257,6 +1247,8 @@ def require_scoring_gate(
     if arm == "proxy":
         if summary.get("model_identity_sha256") != attestation.model_identity_sha256:
             raise SystemExit("scored proxy runtime contract does not match the paired preflight")
+        if summary.get("runtime_contract_sha256") != attestation.runtime_contract_sha256:
+            raise SystemExit("scored proxy runtime contract does not match the paired preflight")
         if summary.get("runtime_instance_sha256") == attestation.runtime_instance_sha256:
             raise SystemExit("scored proxy requires a fresh runtime instance")
     try:
@@ -1362,11 +1354,20 @@ def require_candidate_provenance(candidate_source_commit: str, candidate_image_d
     """Require the local merged source and immutable image declared for the window."""
     if not _IMAGE_DIGEST.fullmatch(candidate_image_digest):
         raise SystemExit("--candidate-image-digest must be an immutable sha256 digest")
-    git = shutil.which("git")
-    if git is None:
+    try:
+        executable_status = _FROZEN_GIT_EXECUTABLE.stat()
+    except OSError as error:
+        raise SystemExit(
+            "the frozen /usr/bin/git executable is required to verify --candidate-source-commit"
+        ) from error
+    if not stat.S_ISREG(executable_status.st_mode) or not os.access(_FROZEN_GIT_EXECUTABLE, os.X_OK):
         raise SystemExit("git is required to verify --candidate-source-commit")
-    current_commit = subprocess.run(  # noqa: S603 - resolved executable and fixed Git arguments
-        [git, "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    current_commit = subprocess.run(  # noqa: S603 - fixed, validated host executable and Git arguments
+        [str(_FROZEN_GIT_EXECUTABLE), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={},
     ).stdout.strip()
     if candidate_source_commit != current_commit:
         raise SystemExit("--candidate-source-commit must exactly match the checked-out merged source")

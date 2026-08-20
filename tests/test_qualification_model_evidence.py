@@ -73,7 +73,7 @@ def _snapshot(
         "executable_sha256": executable_sha256,
         "command_sha256": "b" * 64,
         "mtplx_distribution_sha256": distribution_sha256,
-        "command_flags": ("--host=127.0.0.1", "--port=8999", "--foreground"),
+        "command_flags": ("--host=127.0.0.1", "--port=8999", "--ssd-session-cache=off"),
     }
     return ProbeSnapshot(
         health=health,
@@ -210,6 +210,8 @@ def _real_command(contract: ModelEvidenceContract) -> tuple[str, ...]:
         "3",
         "--temperature",
         "0",
+        "--ssd-session-cache",
+        "off",
     )
 
 
@@ -221,6 +223,7 @@ def _real_semantic_flags() -> tuple[str, ...]:
         "--generation-mode=mtp",
         "--depth=3",
         "--temperature=0",
+        "--ssd-session-cache=off",
     )
 
 
@@ -274,7 +277,7 @@ def _contract(tmp_path: Path, *, lane: str = "cold") -> ModelEvidenceContract:
         mtplx_record=record,
         mtplx_version="2.7.1",
         launch_command_sha256="b" * 64,
-        required_launch_flags=("--host=127.0.0.1", "--port=8999", "--foreground"),
+        required_launch_flags=("--host=127.0.0.1", "--port=8999", "--ssd-session-cache=off"),
         host="127.0.0.1",
         port=8999,
         health_contract_sha256=_sha256({"status": "ok"}),
@@ -313,7 +316,7 @@ def _distribution_digest(contract: ModelEvidenceContract) -> str:
     )
 
 
-def _probe_for(contract: ModelEvidenceContract, *, before_requests: int = 7, after_requests: int = 8) -> _Probe:
+def _probe_for(contract: ModelEvidenceContract, *, before_requests: int = 0, after_requests: int = 1) -> _Probe:
     probe = _Probe()
     probe.before = _snapshot(
         requests_completed=before_requests,
@@ -427,6 +430,68 @@ def test_cold_session_writes_only_safe_hash_evidence(tmp_path: Path) -> None:
     assert "model-api-token" not in output.read_text(encoding="utf-8")
     assert str(contract.stage_path) not in output.read_text(encoding="utf-8")
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
+
+
+def test_preflight_successful_attempts_are_bypass_only_and_cannot_seed_a_warm_lane(tmp_path: Path) -> None:
+    """A warm campaign's preflight is still an isolated, non-storing cache bypass."""
+
+    contract = _contract(tmp_path, lane="preflight")
+    probe = _probe_for(contract, before_requests=0, after_requests=1)
+    session, _contract_value, _probe_value, output, _credential = _begin(
+        tmp_path, contract=contract, probe=probe
+    )
+
+    with pytest.raises(ModelEvidenceFailure, match="model_cache_preflight_invalid"):
+        session.complete([_attempt(request_session_bank_bypass=False)])
+
+    assert _failed_record(output)["failure_category"] == "model_cache_preflight_invalid"
+
+
+@pytest.mark.parametrize("lane", ["cold", "warm-prefix"])
+def test_scored_cache_evidence_requires_a_fresh_model_request_window_before_action(
+    tmp_path: Path, lane: str
+) -> None:
+    """Cold and warm scored treatments cannot inherit an already-used MTPLX process."""
+
+    contract = _contract(tmp_path, lane=lane)
+    probe = _probe_for(contract, before_requests=1, after_requests=2)
+    credential = _private(tmp_path / "credential", b"model-api-token")
+
+    with pytest.raises(ModelEvidenceFailure, match="model_cache_instance_not_fresh"):
+        ModelEvidenceSession.begin(
+            contract,
+            stage="score-direct",
+            run_manifest_sha256="f" * 64,
+            evidence_path=tmp_path / "freshness.json",
+            credential_file=credential,
+            probe=probe,
+        )
+
+    assert probe.calls == ["snapshot"]
+
+
+def test_launch_semantics_requires_ssd_cache_to_be_disabled(tmp_path: Path) -> None:
+    """A warm RAM proof is invalid when persistent SSD cache can satisfy the hit."""
+
+    contract = replace(
+        _contract(tmp_path),
+        required_launch_flags=(
+            "--host=127.0.0.1",
+            "--port=8999",
+            "--ssd-session-cache=on",
+        ),
+    )
+    credential = _private(tmp_path / "credential", b"model-api-token")
+
+    with pytest.raises(ModelEvidenceFailure, match="model_contract_invalid"):
+        ModelEvidenceSession.begin(
+            contract,
+            stage="score-direct",
+            run_manifest_sha256="f" * 64,
+            evidence_path=tmp_path / "ssd-cache.json",
+            credential_file=credential,
+            probe=_probe_for(contract),
+        )
 
 
 def test_model_identity_excludes_only_cache_lane(tmp_path: Path) -> None:
@@ -589,7 +654,7 @@ def test_record_aggregate_ignores_pycache_but_rejects_metadata_version_drift(tmp
         run_manifest_sha256="f" * 64,
         evidence_path=tmp_path / "pass.json",
         credential_file=credential,
-        probe=_probe_for(contract, after_requests=7),
+        probe=_probe_for(contract, before_requests=0, after_requests=0),
     )
     session.complete([])
 
@@ -623,7 +688,7 @@ def test_record_aggregate_binds_but_does_not_read_standard_console_script_rows(t
         encoding="utf-8",
     )
     credential = _private(tmp_path / "credential", b"model-api-token")
-    probe = _probe_for(contract, after_requests=7)
+    probe = _probe_for(contract, before_requests=0, after_requests=0)
 
     session = ModelEvidenceSession.begin(
         contract,
@@ -705,7 +770,7 @@ def test_complete_fails_closed_for_nonquiescent_after_probe(tmp_path: Path) -> N
 
 def test_complete_detects_intervening_request_count(tmp_path: Path) -> None:
     contract = _contract(tmp_path)
-    probe = _probe_for(contract, after_requests=9)
+    probe = _probe_for(contract, before_requests=0, after_requests=2)
     session, _contract_value, _probe_value, output, _credential = _begin(tmp_path, contract=contract, probe=probe)
 
     with pytest.raises(ModelEvidenceFailure, match="model_request_window_invalid"):
@@ -714,8 +779,8 @@ def test_complete_detects_intervening_request_count(tmp_path: Path) -> None:
     record = _failed_record(output)
     assert record["failure_category"] == "model_request_window_invalid"
     assert record["request_window"] == {
-        "before": 7,
-        "after": 9,
+        "before": 0,
+        "after": 2,
         "delta": 2,
         "expected": 1,
         "successful_measured": 1,
@@ -759,7 +824,7 @@ def test_untyped_attempt_mapping_fails_categorically_without_retaining_raw_value
 
 def test_warm_prefix_requires_matching_prime_and_first_cache_hit(tmp_path: Path) -> None:
     contract = _contract(tmp_path, lane="warm-prefix")
-    probe = _probe_for(contract, after_requests=9)
+    probe = _probe_for(contract, before_requests=0, after_requests=2)
     session, _contract_value, _probe_value, output, _credential = _begin(tmp_path, contract=contract, probe=probe)
     prime = _attempt(
         digest="a" * 64,
@@ -804,9 +869,37 @@ def test_warm_prefix_rejects_mismatched_prime_without_serializing_it(tmp_path: P
     assert _failed_record(output)["failure_category"] == "model_cache_warm_invalid"
 
 
+def test_warm_prefix_rejects_an_ssd_hit_even_when_the_prime_digest_matches(tmp_path: Path) -> None:
+    """Persistent SSD cache cannot satisfy the measured warm-prefix hit."""
+
+    contract = _contract(tmp_path, lane="warm-prefix")
+    probe = _probe_for(contract, before_requests=0, after_requests=2)
+    session, _contract_value, _probe_value, output, _credential = _begin(
+        tmp_path, contract=contract, probe=probe
+    )
+    digest = "a" * 64
+    ssd_hit = _attempt(
+        digest=digest,
+        cached_tokens=6,
+        new_prefill_tokens=4,
+        cache_source="ssd",
+        ssd_cache_hit=True,
+        ssd_cached_tokens=6,
+        request_session_bank_bypass=False,
+    )
+
+    with pytest.raises(ModelEvidenceFailure, match="model_cache_warm_invalid"):
+        session.complete(
+            [ssd_hit],
+            prime_record=_attempt(digest=digest, request_session_bank_bypass=False),
+        )
+
+    assert _failed_record(output)["failure_category"] == "model_cache_warm_invalid"
+
+
 def test_local_projection_is_zero_model_attempts_not_a_failure(tmp_path: Path) -> None:
     contract = _contract(tmp_path, lane="preflight")
-    probe = _probe_for(contract, after_requests=7)
+    probe = _probe_for(contract, before_requests=0, after_requests=0)
     session, _contract_value, _probe_value, output, _credential = _begin(tmp_path, contract=contract, probe=probe)
 
     result = session.complete([])
@@ -997,7 +1090,7 @@ def test_system_probe_hits_only_the_approved_read_paths(tmp_path: Path) -> None:
         str(contract.runtime_executable),
         "--host=127.0.0.1",
         "--port=8999",
-        "--foreground",
+        "--ssd-session-cache=off",
     )
     contract = replace(contract, launch_command_sha256=_sha256(list(command)))
     seen_urls: list[str] = []
@@ -1298,7 +1391,7 @@ def test_launch_semantics_rejects_other_sensitive_flag_names_and_values(tmp_path
 
 def test_warm_prefix_allows_a_pending_nonbypass_prime_when_the_next_request_hits(tmp_path: Path) -> None:
     contract = _contract(tmp_path, lane="warm-prefix")
-    probe = _probe_for(contract, after_requests=9)
+    probe = _probe_for(contract, before_requests=0, after_requests=2)
     session, _contract_value, _probe_value, output, _credential = _begin(tmp_path, contract=contract, probe=probe)
     warmed = _attempt(
         digest="a" * 64,

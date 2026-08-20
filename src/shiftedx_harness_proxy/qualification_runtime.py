@@ -28,8 +28,9 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import FrameType
 from typing import Any, Literal, Protocol, cast
+from urllib.error import HTTPError
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from pydantic import SecretStr
 
@@ -41,6 +42,9 @@ from .qualification_contract import (
     PreflightFailure,
     load_model_evidence,
     read_model_boundary_observer_records,
+)
+from .qualification_contract import (
+    ModelEvidenceFailure as ModelEvidenceArtifactFailure,
 )
 from .qualification_model_evidence import (
     ModelEvidenceContract,
@@ -108,6 +112,11 @@ _CHECK_KEYS = (
 )
 _LABEL_PREFIX = "io.shiftedx.qualification"
 _CONTAINER_LISTEN_HOST = "0.0.0.0"  # noqa: S104 - proxy is published only on a loopback host binding
+_MAX_HTTP_RESPONSE_BYTES = 1 << 20
+_FROZEN_HOST_TOOLS = {
+    "docker": Path("/usr/local/bin/docker"),
+    "git": Path("/usr/bin/git"),
+}
 
 
 class QualificationRuntimeFailure(RuntimeError):
@@ -139,6 +148,62 @@ class CommandResult:
     returncode: int
     stdout: str
     stderr: str
+
+
+class _RejectRedirect(HTTPRedirectHandler):
+    """Reject redirects before urllib can replay a bearer credential elsewhere."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        del msg, newurl
+        raise HTTPError(req.full_url, code, "redirect rejected", headers, fp)
+
+
+def _frozen_host_command(
+    argv: tuple[str, ...], *, env: dict[str, str] | None
+) -> tuple[tuple[str, ...], dict[str, str] | None] | None:
+    """Return a validated absolute Docker/Git vector with no inherited environment."""
+
+    if not argv:
+        return None
+    executable = next(
+        (path for name, path in _FROZEN_HOST_TOOLS.items() if argv[0] in {name, str(path)}),
+        None,
+    )
+    if executable is None:
+        return argv, env
+    try:
+        executable_status = executable.stat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(executable_status.st_mode) or not os.access(executable, os.X_OK):
+        return None
+    return (str(executable), *argv[1:]), {}
+
+
+def _safe_http_response(
+    url: str, *, headers: dict[str, str] | None, timeout: float
+) -> tuple[int, bytes | None]:
+    """Issue one bounded, exact-URL request without proxy or redirect credential replay."""
+
+    request = Request(url, headers=headers or {})  # noqa: S310 - callers validate private runtime URLs
+    opener = build_opener(ProxyHandler({}), _RejectRedirect())
+    try:
+        with opener.open(request, timeout=timeout) as response:  # noqa: S310 - exact URL is checked below
+            status = getattr(response, "status", None)
+            if not isinstance(status, int) or not 100 <= status <= 599 or response.geturl() != url:
+                return 0, None
+            if 300 <= status < 400:
+                return 0, None
+            payload = response.read(_MAX_HTTP_RESPONSE_BYTES + 1)
+            if len(payload) > _MAX_HTTP_RESPONSE_BYTES:
+                return 0, None
+            return status, payload
+    except HTTPError as error:
+        if 300 <= error.code < 400:
+            return 0, None
+        return error.code, None
+    except (OSError, UnicodeError, ValueError):
+        return 0, None
 
 
 class ManagedProcess(Protocol):
@@ -175,13 +240,17 @@ class SubprocessRuntimeCommandRunner:
     def run(
         self, argv: tuple[str, ...], *, env: dict[str, str] | None = None, timeout: float | None = None
     ) -> CommandResult:
+        frozen = _frozen_host_command(argv, env=env)
+        if frozen is None:
+            return CommandResult(125, "", "")
+        command, command_env = frozen
         try:
             completed = subprocess.run(  # noqa: S603 - fixed executable vectors are assembled internally
-                list(argv),
+                list(command),
                 capture_output=True,
                 text=True,
                 check=False,
-                env=env,
+                env=command_env,
                 timeout=timeout,
             )
         except (OSError, subprocess.TimeoutExpired):
@@ -197,25 +266,20 @@ class SubprocessRuntimeCommandRunner:
         )
 
     def http_status(self, url: str, *, headers: dict[str, str] | None = None, timeout: float = 5.0) -> int:
-        request = Request(url, headers=headers or {})  # noqa: S310 - manifest-validated private URL
-        try:
-            with urlopen(request, timeout=timeout) as response:  # noqa: S310 - manifest-validated private URL
-                return int(response.status)
-        except Exception as error:
-            status = getattr(error, "code", None)
-            return status if isinstance(status, int) else 0
+        status, _payload = _safe_http_response(url, headers=headers, timeout=timeout)
+        return status
 
     def http_json(
         self, url: str, *, headers: dict[str, str] | None = None, timeout: float = 5.0
     ) -> tuple[int, dict[str, Any] | None]:
-        request = Request(url, headers=headers or {})  # noqa: S310 - manifest-validated private URL
+        status, payload = _safe_http_response(url, headers=headers, timeout=timeout)
+        if payload is None:
+            return status, None
         try:
-            with urlopen(request, timeout=timeout) as response:  # noqa: S310 - manifest-validated private URL
-                document = json.loads(response.read().decode("utf-8"))
-                return response.status, document if isinstance(document, dict) else None
-        except Exception as error:
-            status = getattr(error, "code", None)
-            return (status if isinstance(status, int) else 0), None
+            document = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return status, None
+        return status, document if isinstance(document, dict) else None
 
 
 class _RuntimeModelEvidenceProbe:
@@ -446,6 +510,7 @@ def supervise_qualification_runtime(
             _validate_prior_outcome(private_run_dir, "preflight", spec, attestation_path)
             _validate_credentials(spec.credentials, upstream_authenticated=spec.model.upstream_authenticated)
             model_session = _begin_model_evidence(runner, spec, stage, private_run_dir)
+            _require_distinct_scored_model_instance(private_run_dir, spec, stage, model_session)
             if _attestation_model_identity(attestation_path) != model_session.model_identity_sha256:
                 raise QualificationRuntimeFailure("runtime_model_identity_mismatch")
             lease = _direct_lease(spec, stage, private_run_dir, attestation_path, model_session)
@@ -475,6 +540,8 @@ def supervise_qualification_runtime(
                 and _attestation_model_identity(preflight_attestation) != model_session.model_identity_sha256
             ):
                 raise QualificationRuntimeFailure("runtime_model_identity_mismatch")
+            if stage == "score-proxy":
+                _require_distinct_scored_model_instance(private_run_dir, spec, stage, model_session)
             _assert_port_available(spec.proxy.host, spec.proxy.port, "proxy_port_unavailable")
             _assert_port_available(spec.observer.host, spec.observer.port, "observer_port_unavailable")
             instance = _instance_token(spec.manifest_sha256, stage)
@@ -1440,6 +1507,7 @@ def _verify_proxy_auth_and_metrics(runner: RuntimeCommandRunner, container_id: s
     code = "\n".join(
         (
             "import json",
+            "import urllib.error",
             "import urllib.request",
             "from shiftedx_harness_proxy.config import Settings",
             "settings = Settings()",
@@ -1448,14 +1516,20 @@ def _verify_proxy_auth_and_metrics(runner: RuntimeCommandRunner, container_id: s
             "trusted = next(iter(trusted_values)) if len(trusted_values) == 1 else None",
             "upstream = settings.upstream_api_key.get_secret_value() if settings.upstream_api_key else None",
             f"metrics_url = 'http://127.0.0.1:{spec.proxy.container_port}/metrics'",
+            "class _RejectRedirect(urllib.request.HTTPRedirectHandler):",
+            "    def redirect_request(self, request, fp, code, msg, headers, newurl):",
+            "        raise urllib.error.HTTPError(request.full_url, code, 'redirect rejected', headers, fp)",
+            "opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _RejectRedirect())",
             "def metric_status(token):",
             "    if token is None:",
             "        return 0",
             "    try:",
             "        request = urllib.request.Request(metrics_url, headers={'Authorization': 'Bearer ' + token})",
-            "        with urllib.request.urlopen(request, timeout=5) as response:",
-            "            return response.status",
-            "    except Exception:",
+            "        with opener.open(request, timeout=5) as response:",
+            "            if response.geturl() != metrics_url or 300 <= response.status < 400:",
+            "                return 0",
+            "            return 200 if response.status == 200 and len(response.read(1048577)) <= 1048576 else 0",
+            "    except (urllib.error.HTTPError, OSError, ValueError):",
             "        return 0",
             "result = {",
             f"    'settings': {{name: getattr(settings, name) for name in {setting_names!r}}},",
@@ -1680,6 +1754,31 @@ def _begin_model_evidence(
         raise QualificationRuntimeFailure(error.category) from None
 
 
+def _require_distinct_scored_model_instance(
+    private_run_dir: Path,
+    spec: _RuntimeSpec,
+    stage: Literal["score-direct", "score-proxy"],
+    model_session: ModelEvidenceSession,
+) -> None:
+    """Require a restarted MTPLX instance for each measured scored treatment."""
+
+    prior_stage: Literal["preflight", "score-direct"] = "preflight" if stage == "score-direct" else "score-direct"
+    evidence_stage: Literal["preflight", "score-direct", "score-proxy"] = (
+        "preflight" if prior_stage == "preflight" else "score-direct"
+    )
+    try:
+        prior = load_model_evidence(
+            _model_evidence_path(private_run_dir, prior_stage),
+            expected_stage=evidence_stage,
+            run_manifest_sha256=spec.manifest_sha256,
+            model_identity_sha256=model_session.model_identity_sha256,
+        )
+    except ModelEvidenceArtifactFailure as error:
+        raise QualificationRuntimeFailure("runtime_prior_model_evidence_invalid") from error
+    if prior.runtime_instance_sha256 == model_session.runtime_instance_sha256:
+        raise QualificationRuntimeFailure("runtime_model_instance_not_fresh")
+
+
 def _adapt_model_attempt(record: ModelBoundaryRecord) -> SafeAttemptRecord:
     if 200 <= (record.status_code or 0) <= 299:
         if record.cache is None:
@@ -1884,7 +1983,11 @@ def _read_private_file(path: Path, category: str) -> bytes:
             raise QualificationRuntimeFailure(category)
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         opened_status = os.fstat(descriptor)
-        if not stat.S_ISREG(opened_status.st_mode) or stat.S_IMODE(opened_status.st_mode) != 0o600:
+        if (
+            not stat.S_ISREG(opened_status.st_mode)
+            or stat.S_IMODE(opened_status.st_mode) != 0o600
+            or (opened_status.st_dev, opened_status.st_ino) != (file_status.st_dev, file_status.st_ino)
+        ):
             raise QualificationRuntimeFailure(category)
         chunks: list[bytes] = []
         while True:
@@ -1958,17 +2061,7 @@ def _validate_stage_evidence_absent(private_run_dir: Path, stage: RuntimeStage, 
 def _validate_existing_preflight_attestation(private_run_dir: Path, spec: _RuntimeSpec) -> Path:
     path = _attestation_path(private_run_dir, "preflight")
     try:
-        file_status = path.lstat()
-        if path.is_symlink() or not stat.S_ISREG(file_status.st_mode) or stat.S_IMODE(file_status.st_mode) != 0o600:
-            raise QualificationRuntimeFailure("runtime_preflight_attestation_invalid")
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        try:
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                raise QualificationRuntimeFailure("runtime_preflight_attestation_invalid")
-            with os.fdopen(descriptor, "rb", closefd=False) as handle:
-                serialized = handle.read()
-        finally:
-            os.close(descriptor)
+        serialized = _read_private_file(path, "runtime_preflight_attestation_invalid")
         value = json.loads(serialized, object_pairs_hook=_unique_json_object)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise QualificationRuntimeFailure("runtime_preflight_attestation_invalid") from error

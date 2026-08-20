@@ -9,6 +9,8 @@ import socket
 import stat
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from base64 import urlsafe_b64encode
 from dataclasses import replace
 from pathlib import Path
@@ -142,6 +144,8 @@ def _model_manifest_fields(tmp_path: Path) -> dict[str, object]:
         "3",
         "--temperature",
         "0",
+        "--ssd-session-cache",
+        "off",
     )
     health = {
         "ok": True,
@@ -174,6 +178,7 @@ def _model_manifest_fields(tmp_path: Path) -> dict[str, object]:
             "--generation-mode=mtp",
             "--depth=3",
             "--temperature=0",
+            "--ssd-session-cache=off",
         ],
         "health_contract_sha256": health_hash,
         "settings_contract_sha256": settings_hash,
@@ -381,6 +386,8 @@ class _FakeProcess:
 
 
 class _FakeRuntimeRunner:
+    _next_model_started_at = 1712345678
+
     def __init__(self, *, failure: str | None = None, drift: str | None = None) -> None:
         self.calls: list[tuple[str, tuple[str, ...], dict[str, str] | None]] = []
         self.observer = _FakeProcess(signal_on_terminate=failure == "signal_cleanup_observer")
@@ -392,6 +399,8 @@ class _FakeRuntimeRunner:
         self.container_running = True
         self.model_contract = None
         self.model_requests_completed = 0
+        type(self)._next_model_started_at += 1
+        self.model_started_at = float(type(self)._next_model_started_at)
 
     def prepare_model_evidence_contract(self, contract) -> None:
         self.model_contract = contract
@@ -433,6 +442,8 @@ class _FakeRuntimeRunner:
                         "3",
                         "--temperature",
                         "0",
+                        "--ssd-session-cache",
+                        "off",
                     )
                 )
                 return SimpleNamespace(returncode=0, stdout=command + "\n", stderr="")
@@ -623,7 +634,7 @@ class _FakeRuntimeRunner:
                     "active_requests": 0,
                     "foreground_active": 0,
                     "requests_completed": self.model_requests_completed,
-                    "startup": {"pid": 444, "started_at": 1712345678.25, "launch_id": None},
+                    "startup": {"pid": 444, "started_at": self.model_started_at, "launch_id": None},
                 }
             if url.endswith("/v1/models"):
                 return 200, {
@@ -790,6 +801,139 @@ def test_preflight_supervisor_writes_safe_attestation_before_action_and_cleans(m
     compile(effective_settings_check, "qualification-effective-settings-check", "exec")
     assert any(call[1][:3] == ("docker", "rm", "--force") for call in runner.calls if call[0] == "run")
     assert any(call[1][:3] == ("docker", "volume", "rm") for call in runner.calls if call[0] == "run")
+
+
+def test_in_container_metrics_probe_rejects_redirects_before_replaying_trusted_or_ordinary_key(
+    monkeypatch, tmp_path
+) -> None:
+    """The emitted container probe must not follow a redirect with either credential role."""
+
+    runner = _FakeRuntimeRunner()
+    outcome = supervise_qualification_runtime(
+        manifest=_manifest(tmp_path),
+        stage="preflight",
+        private_run_dir=_private_run(tmp_path),
+        action=_write_complete_ledger,
+        command_runner=runner,
+    )
+    assert outcome.status == "passed"
+    source = next(
+        call[1][-1]
+        for call in runner.calls
+        if call[0] == "run" and call[1][:3] == ("docker", "exec", "--user")
+    )
+
+    class Secret:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def get_secret_value(self) -> str:
+            return self.value
+
+    class Settings:
+        proxy_api_key = Secret("ordinary-test-token")
+        upstream_api_key = Secret("upstream-test-token")
+
+        def trusted_policy_extension_keys(self) -> frozenset[str]:
+            return frozenset({"trusted-test-token"})
+
+        def __getattr__(self, _name: str) -> None:
+            return None
+
+    requests: list[urllib.request.Request] = []
+
+    class RedirectingOpener:
+        def __init__(self, handlers) -> None:
+            self.redirect_handler = next(
+                handler
+                for handler in handlers
+                if isinstance(handler, urllib.request.HTTPRedirectHandler)
+            )
+
+        def open(self, request, *, timeout: float):
+            del timeout
+            requests.append(request)
+            return self.redirect_handler.redirect_request(
+                request,
+                None,
+                302,
+                "found",
+                {},
+                "http://redirect.invalid/metrics",
+            )
+
+    def fake_build_opener(*handlers):
+        proxy_handler = next(handler for handler in handlers if isinstance(handler, urllib.request.ProxyHandler))
+        assert proxy_handler.proxies == {}
+        return RedirectingOpener(handlers)
+
+    def unexpected_urlopen(*_args, **_kwargs):
+        raise AssertionError("the metrics probe must use its no-proxy, no-redirect opener")
+
+    monkeypatch.setattr("shiftedx_harness_proxy.config.Settings", Settings)
+    monkeypatch.setattr(urllib.request, "build_opener", fake_build_opener)
+    monkeypatch.setattr(urllib.request, "urlopen", unexpected_urlopen)
+    exec(  # noqa: S102 - executes the fixed generated probe with a redirect-only fake opener
+        compile(source, "qualification-in-container-metrics-probe", "exec"),
+        {"__name__": "__main__"},
+    )
+
+    assert len(requests) == 2
+    assert {request.get_header("Authorization") for request in requests} == {
+        "Bearer ordinary-test-token",
+        "Bearer trusted-test-token",
+    }
+    assert {request.full_url for request in requests} == {"http://127.0.0.1:8090/metrics"}
+
+
+def test_subprocess_runtime_command_runner_freezes_host_tools_and_scrubs_ambient_environment(monkeypatch) -> None:
+    """Docker/Git commands cannot inherit proxy, credential, or context configuration."""
+
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((list(argv), kwargs))
+        return SimpleNamespace(returncode=0, stdout="safe", stderr="")
+
+    monkeypatch.setenv("DOCKER_HOST", "private-daemon-marker")
+    monkeypatch.setenv("DOCKER_CONTEXT", "private-context-marker")
+    monkeypatch.setenv("HTTPS_PROXY", "http://private-proxy.invalid")
+    monkeypatch.setenv("UPSTREAM_API_KEY", "private-upstream-token")
+    monkeypatch.setattr(runtime_module.subprocess, "run", fake_run)
+    command_runner = runtime_module.SubprocessRuntimeCommandRunner()
+
+    assert command_runner.run(("docker", "version")).returncode == 0
+    assert command_runner.run(("git", "rev-parse", "HEAD")).returncode == 0
+
+    assert [argv for argv, _kwargs in calls] == [
+        ["/usr/local/bin/docker", "version"],
+        ["/usr/bin/git", "rev-parse", "HEAD"],
+    ]
+    for _argv, kwargs in calls:
+        environment = kwargs["env"]
+        assert environment == {}
+        assert not {"DOCKER_HOST", "DOCKER_CONTEXT", "HTTPS_PROXY", "UPSTREAM_API_KEY"} & set(environment)
+
+
+def test_runtime_private_evidence_reader_rejects_a_rename_swap(monkeypatch, tmp_path) -> None:
+    """A lstat/open race cannot replace immutable evidence with another regular file."""
+
+    evidence = _private_file(tmp_path / "preflight-runtime-attestation.json", b"first\n")
+    replacement = _private_file(tmp_path / "replacement-runtime-attestation.json", b"second\n")
+    original_open = runtime_module.os.open
+    replaced = False
+
+    def replace_before_open(path, *args, **kwargs):
+        nonlocal replaced
+        if not replaced and os.fspath(path) == os.fspath(evidence):
+            replaced = True
+            os.replace(replacement, evidence)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(runtime_module.os, "open", replace_before_open)
+    with pytest.raises(runtime_module.QualificationRuntimeFailure, match="runtime_evidence_invalid"):
+        runtime_module._read_private_file(evidence, "runtime_evidence_invalid")
+    assert replaced is True
 
 
 def _private_run(tmp_path: Path, name: str = "private-run") -> Path:
@@ -1254,6 +1398,62 @@ def test_score_proxy_requires_a_completed_direct_treatment_before_resources(tmp_
 
     assert proxy.failure_category == "runtime_prior_outcome_invalid"
     assert _docker_commands(runner) == []
+
+
+def test_scored_treatment_rejects_a_nonfresh_model_before_action_or_proxy_resources(tmp_path) -> None:
+    """The supervisor requires an owned restart, not just a cache-mode assertion."""
+
+    manifest = _manifest(tmp_path)
+    private_run_dir = _private_run(tmp_path)
+    preflight = supervise_qualification_runtime(
+        manifest=manifest,
+        stage="preflight",
+        private_run_dir=private_run_dir,
+        action=_write_complete_ledger,
+        command_runner=_FakeRuntimeRunner(),
+    )
+    assert preflight.status == "passed"
+    runner = _FakeRuntimeRunner()
+    runner.model_requests_completed = 1
+
+    direct = supervise_qualification_runtime(
+        manifest=manifest,
+        stage="score-direct",
+        private_run_dir=private_run_dir,
+        action=lambda _lease: pytest.fail("a nonfresh model must block the scored action"),
+        command_runner=runner,
+    )
+
+    assert direct.failure_category == "model_cache_instance_not_fresh"
+    assert _docker_commands(runner) == []
+
+
+def test_scored_treatment_requires_a_dedicated_model_restart_even_with_zero_requests(tmp_path) -> None:
+    """A zero counter alone cannot reuse the preflight process as a scored treatment."""
+
+    manifest = _manifest(tmp_path)
+    private_run_dir = _private_run(tmp_path)
+    runner = _FakeRuntimeRunner()
+    preflight = supervise_qualification_runtime(
+        manifest=manifest,
+        stage="preflight",
+        private_run_dir=private_run_dir,
+        action=_write_complete_ledger,
+        command_runner=runner,
+    )
+    assert preflight.status == "passed"
+    preflight_commands = list(_docker_commands(runner))
+
+    direct = supervise_qualification_runtime(
+        manifest=manifest,
+        stage="score-direct",
+        private_run_dir=private_run_dir,
+        action=lambda _lease: pytest.fail("a reused model must block the scored action"),
+        command_runner=runner,
+    )
+
+    assert direct.failure_category == "runtime_model_instance_not_fresh"
+    assert _docker_commands(runner) == preflight_commands
 
 
 def _manifest_document(path: Path) -> dict[str, object]:
@@ -2142,7 +2342,7 @@ def test_thin_cli_derives_fixed_child_argv_without_secret_values(stage) -> None:
     assert "--candidate-image-digest" in argv
     assert "--run-manifest-sha256" in argv
     assert argv[argv.index("--run-id") + 1] == "qualified-run"
-    assert argv[argv.index("--cache-mode") + 1] == "warm-prefix"
+    assert argv[argv.index("--cache-mode") + 1] == ("bypass" if stage == "preflight" else "warm-prefix")
     assert "private-secret-value" not in serialized
     assert "--model" in argv
     if stage == "preflight":
@@ -2165,6 +2365,15 @@ def test_thin_cli_derives_fixed_child_argv_without_secret_values(stage) -> None:
         assert argv[argv.index("--variant") + 1] == "warm-prefix-pair2-proxy-expanded"
         assert argv[argv.index("--preflight-runtime-outcome") + 1] == "/private/preflight-runtime-outcome.json"
         assert argv[argv.index("--direct-runtime-outcome") + 1] == "/private/scored-direct-runtime-outcome.json"
+
+
+def test_thin_cli_forces_preflight_bypass_even_for_a_warm_campaign() -> None:
+    """Preflight must never seed the RAM prefix used by a later warm treatment."""
+
+    cli = _load_runtime_cli()
+    argv = cli.paired_runner_argv(_lease("preflight"))
+
+    assert argv[argv.index("--cache-mode") + 1] == "bypass"
 
 
 def test_thin_cli_runs_child_with_only_pinned_benchmark_source_environment(monkeypatch) -> None:
@@ -2277,7 +2486,10 @@ def test_benchmarking_manifest_example_is_duplicate_rejecting_json_with_c1_model
         "settings_contract_sha256",
     }
     assert set(trial) == {"run_id", "cache_lane", "pair_index", "treatment_order"}
+    assert "--ssd-session-cache=off" in model["required_launch_flags"]
     assert runtime["benchmark"]["scenario_count"] > 0
+    assert "restart it from the exact frozen model" in document
+    assert "Preflight always sends" in document
 
 
 def test_private_manifest_documentation_is_valid_json_with_positive_scenario_count() -> None:

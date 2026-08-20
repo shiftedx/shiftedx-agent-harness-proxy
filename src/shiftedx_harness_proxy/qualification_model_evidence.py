@@ -422,6 +422,8 @@ class ModelEvidenceSession:
         api_key = _read_credential(credential_file) if credential_file is not None else None
         active_probe = probe or SystemModelEvidenceProbe()
         before = _probe_live(active_probe, contract, api_key, validated)
+        if contract.cache_lane in {"cold", "warm-prefix"} and before.requests_completed != 0:
+            raise ModelEvidenceFailure("model_cache_instance_not_fresh")
         return cls(
             contract=contract,
             stage=stage,
@@ -834,7 +836,11 @@ def _validate_launch_semantics(contract: ModelEvidenceContract) -> None:
         )
     ):
         raise ModelEvidenceFailure("model_contract_invalid")
-    expected = {f"--host={contract.host}", f"--port={contract.port}"}
+    expected = {
+        f"--host={contract.host}",
+        f"--port={contract.port}",
+        "--ssd-session-cache=off",
+    }
     if not expected.issubset(set(flags)):
         raise ModelEvidenceFailure("model_contract_invalid")
 
@@ -1205,6 +1211,18 @@ def _validate_cache_invariants(
     if lane == "preflight":
         if prime is not None:
             raise ModelEvidenceFailure("model_cache_preflight_invalid")
+        for item in successful:
+            if (
+                item.request_session_bank_bypass is not True
+                or item.session_cache_hit is not False
+                or item.ssd_cache_hit is not False
+                or item.cached_tokens != 0
+                or item.new_prefill_tokens != item.prompt_tokens
+                or item.cache_source != "none"
+                or item.ssd_cached_tokens != 0
+                or item.postcommit_stored is True
+            ):
+                raise ModelEvidenceFailure("model_cache_preflight_invalid")
         return len(successful)
     if lane == "cold":
         if prime is not None:
@@ -1236,9 +1254,11 @@ def _validate_cache_invariants(
             or prime.session_cache_hit is not False
             or prime.request_digest != first.request_digest
             or first.cached_tokens <= 0
-            or first.cache_source not in {"ram", "ssd"}
+            or first.cache_source != "ram"
             or first.request_session_bank_bypass is not False
-            or not (first.session_cache_hit or first.ssd_cache_hit)
+            or first.session_cache_hit is not True
+            or first.ssd_cache_hit is not False
+            or first.ssd_cached_tokens != 0
         ):
             raise ModelEvidenceFailure("model_cache_warm_invalid")
         return 1 + len(successful)

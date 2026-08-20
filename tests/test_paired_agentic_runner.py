@@ -4,6 +4,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -13,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import shiftedx_harness_proxy.qualification_contract as contract_module
 from shiftedx_harness_proxy.core import HARNESS_SYSTEM_SUFFIX
 from shiftedx_harness_proxy.projection_accounting import (
     LOCAL_PROJECTION_EXTENSION,
@@ -21,6 +23,7 @@ from shiftedx_harness_proxy.projection_accounting import (
 from shiftedx_harness_proxy.qualification_contract import (
     BENCHMARK_REVISION,
     load_model_evidence,
+    load_runtime_attestation,
     load_runtime_outcome,
     read_model_boundary_observer_records,
 )
@@ -224,6 +227,35 @@ def load_runner(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_candidate_provenance_uses_frozen_git_with_a_scrubbed_environment(monkeypatch) -> None:
+    """Qualification provenance must not inherit Git or proxy configuration from the shell."""
+
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((list(argv), kwargs))
+        return SimpleNamespace(stdout="a" * 40 + "\n")
+
+    monkeypatch.setenv("DOCKER_HOST", "private-daemon-marker")
+    monkeypatch.setenv("HTTPS_PROXY", "http://private-proxy.invalid")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setattr(contract_module.subprocess, "run", fake_run)
+
+    contract_module.require_candidate_provenance("a" * 40, "sha256:" + "b" * 64)
+
+    assert calls == [
+        (
+            ["/usr/bin/git", "rev-parse", "HEAD"],
+            {
+                "capture_output": True,
+                "text": True,
+                "check": True,
+                "env": {},
+            },
+        )
+    ]
 
 
 def test_client_failure_is_recorded_without_response_body_and_run_continues(monkeypatch, tmp_path):
@@ -1514,6 +1546,53 @@ def test_proxy_scoring_rejects_coordinated_preflight_attestation_and_outcome_rep
     assert not (tmp_path / "proxy.jsonl").exists()
 
 
+def test_proxy_scoring_rejects_runtime_contract_drift_before_provenance_or_output(monkeypatch, tmp_path):
+    """A fresh proxy instance still has to implement the preflight runtime contract."""
+
+    runner = load_runner(monkeypatch)
+    source_commit = _source_commit()
+    image_digest = "sha256:" + "0" * 64
+    ledger = tmp_path / "preflight.jsonl"
+    preflight_attestation = _write_passing_preflight(runner, ledger, source_commit, image_digest)
+    preflight_outcome, direct_outcome = _write_passing_scored_prerequisites(
+        tmp_path, ledger, preflight_attestation
+    )
+    scored_attestation = _write_runtime_attestation(
+        tmp_path / "scored-proxy-runtime-attestation.json",
+        stage="scored_proxy",
+        source_commit=source_commit,
+        image_digest=image_digest,
+        runtime_contract_sha256="f" * 64,
+        runtime_instance_sha256="5" * 64,
+    )
+    summary = json.loads(ledger.read_text(encoding="utf-8").splitlines()[-1])
+    provenance_calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        runner,
+        "require_candidate_provenance",
+        lambda *args: provenance_calls.append(args),
+    )
+
+    with pytest.raises(SystemExit, match="runtime contract does not match"):
+        runner.require_scoring_gate(
+            output=tmp_path / "proxy.jsonl",
+            preflight_ledger=ledger,
+            candidate_source_commit=source_commit,
+            candidate_image_digest=image_digest,
+            contract_digest=summary["qualification_contract_digests"]["proxy"],
+            arm="proxy",
+            model="model",
+            run_manifest_sha256=_RUN_MANIFEST_SHA256,
+            scenario_order=["case-1", "case-2"],
+            runtime_attestation=scored_attestation,
+            preflight_runtime_outcome=preflight_outcome,
+            direct_runtime_outcome=direct_outcome,
+        )
+
+    assert provenance_calls == []
+    assert not (tmp_path / "proxy.jsonl").exists()
+
+
 def test_proxy_scoring_requires_a_fresh_runtime_instance(monkeypatch, tmp_path):
     runner = load_runner(monkeypatch)
     source_commit = _source_commit()
@@ -2225,6 +2304,62 @@ def _write_runtime_attestation(
     path.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")), encoding="utf-8")
     path.chmod(0o600)
     return path
+
+
+def test_runtime_attestation_reader_requires_private_mode_and_stable_inode(monkeypatch, tmp_path):
+    """The scored gate must not parse an attestation replaced after its first stat."""
+
+    source_commit = _source_commit()
+    image_digest = "sha256:" + "0" * 64
+    attestation = _write_runtime_attestation(
+        tmp_path / "preflight-runtime-attestation.json",
+        stage="preflight",
+        source_commit=source_commit,
+        image_digest=image_digest,
+    )
+    attestation.chmod(0o644)
+
+    with pytest.raises(contract_module.RuntimeAttestationFailure, match="runtime_attestation_invalid"):
+        load_runtime_attestation(
+            attestation,
+            expected_stage="preflight",
+            source_commit=source_commit,
+            image_digest=image_digest,
+            run_manifest_sha256=_RUN_MANIFEST_SHA256,
+            model="model",
+            scenario_order=["case-1", "case-2"],
+        )
+
+    attestation.chmod(0o600)
+    replacement = _write_runtime_attestation(
+        tmp_path / "replacement-runtime-attestation.json",
+        stage="preflight",
+        source_commit=source_commit,
+        image_digest=image_digest,
+        runtime_instance_sha256="f" * 64,
+    )
+    original_open = contract_module.os.open
+    replaced = False
+
+    def replace_before_open(path, *args, **kwargs):
+        nonlocal replaced
+        if not replaced and os.fspath(path) == os.fspath(attestation):
+            replaced = True
+            os.replace(replacement, attestation)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(contract_module.os, "open", replace_before_open)
+    with pytest.raises(contract_module.RuntimeAttestationFailure, match="runtime_attestation_invalid"):
+        load_runtime_attestation(
+            attestation,
+            expected_stage="preflight",
+            source_commit=source_commit,
+            image_digest=image_digest,
+            run_manifest_sha256=_RUN_MANIFEST_SHA256,
+            model="model",
+            scenario_order=["case-1", "case-2"],
+        )
+    assert replaced is True
 
 
 def _write_model_evidence(
