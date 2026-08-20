@@ -83,8 +83,26 @@ class ReconciliationFailure(RuntimeError):
 
 
 @dataclass(frozen=True)
+class ReconciliationIdentity:
+    """Identity available before the proxy treatment starts.
+
+    The three evidence-ledger hashes deliberately do not belong here: they
+    cannot exist until the child has run.  ``ProxyReconciliationSession``
+    snapshots zero metrics against this immutable identity, then requires the
+    matching complete context before it observes post-action metrics.
+    """
+
+    run_manifest_sha256: str
+    campaign_id_sha256: str
+    slot_ordinal: int
+    cache_lane: CacheLane
+    pair_index: int
+    attestation_sha256: str
+
+
+@dataclass(frozen=True)
 class ReconciliationContext:
-    """Immutable hash-only identity of one campaign slot."""
+    """Immutable complete hash-only identity of one campaign slot."""
 
     run_manifest_sha256: str
     campaign_id_sha256: str
@@ -165,27 +183,28 @@ class ProxyReconciliationSession:
     """One begin/complete reconciliation transaction for a dedicated proxy."""
 
     def __init__(
-        self, context: ReconciliationContext, metrics_reader: MetricsReader, before: MetricsSnapshot
+        self, identity: ReconciliationIdentity, metrics_reader: MetricsReader, before: MetricsSnapshot
     ) -> None:
-        self._context = context
+        self._identity = identity
         self._metrics_reader = metrics_reader
         self._before = before
         self._completed = False
 
     @classmethod
     def begin(
-        cls, context: ReconciliationContext, metrics_reader: MetricsReader
+        cls, identity: ReconciliationIdentity, metrics_reader: MetricsReader
     ) -> ProxyReconciliationSession:
         """Validate immutable identity and require a fresh zero-counter proxy."""
 
-        _validate_context(context)
+        _validate_identity(identity)
         before = _snapshot(metrics_reader)
         if any(before.to_dict().values()):
             raise ReconciliationFailure("reconciliation_metrics_not_zero")
-        return cls(context, metrics_reader, before)
+        return cls(identity, metrics_reader, before)
 
     def complete(
         self,
+        context: ReconciliationContext,
         observer_records: Sequence[ModelBoundaryRecord],
         request_records: Sequence[RequestAccountingRecord],
         model_summary: ModelOperationSummary,
@@ -196,13 +215,16 @@ class ProxyReconciliationSession:
         if self._completed:
             raise ReconciliationFailure("reconciliation_complete_once")
         self._completed = True
+        _validate_context(context)
+        if not _context_matches_identity(context, self._identity):
+            raise ReconciliationFailure("reconciliation_context_invalid")
         before_values = self._before.to_dict()
         try:
             after = _snapshot(self._metrics_reader)
         except ReconciliationFailure as error:
             derived = _derive_or_empty(observer_records, request_records, model_summary)
             record = _artifact_record(
-                self._context,
+                context,
                 status="failed",
                 failure_category=error.category,
                 before=self._before,
@@ -220,7 +242,7 @@ class ProxyReconciliationSession:
         input_failure = _input_failure_category(observer_records, request_records, model_summary)
         if input_failure is not None:
             record = _artifact_record(
-                self._context,
+                context,
                 status="failed",
                 failure_category=input_failure,
                 before=self._before,
@@ -232,7 +254,7 @@ class ProxyReconciliationSession:
             _write_artifact(artifact_path, record)
             raise ReconciliationFailure(input_failure)
         derived = _derive(observer_records, request_records, model_summary)
-        checks = _checks(self._context, deltas, derived, observer_records, request_records)
+        checks = _checks(context, deltas, derived, observer_records, request_records)
         failure_category: str | None
         if not _model_operation_total_available(observer_records):
             checks["model_operations"] = False
@@ -240,7 +262,7 @@ class ProxyReconciliationSession:
         else:
             failure_category = _failed_check_category(checks)
         record = _artifact_record(
-            self._context,
+            context,
             status="passed" if failure_category is None else "failed",
             failure_category=failure_category,
             before=self._before,
@@ -255,27 +277,59 @@ class ProxyReconciliationSession:
         return ReconciliationResult(artifact_path, hashlib.sha256(serialized).hexdigest(), "passed")
 
 
-def _validate_context(context: ReconciliationContext) -> None:
+def _validate_identity(identity: ReconciliationIdentity) -> None:
     if (
-        type(context) is not ReconciliationContext
+        type(identity) is not ReconciliationIdentity
         or any(
             not isinstance(value, str) or _SHA256.fullmatch(value) is None
             for value in (
-                context.run_manifest_sha256,
-                context.campaign_id_sha256,
-                context.attestation_sha256,
-                context.model_evidence_sha256,
-                context.observer_ledger_sha256,
-                context.request_ledger_sha256,
+                identity.run_manifest_sha256,
+                identity.campaign_id_sha256,
+                identity.attestation_sha256,
             )
         )
-        or not _positive_int(context.slot_ordinal)
-        or context.slot_ordinal > 6
-        or context.cache_lane not in {"cold", "warm-prefix"}
-        or not _positive_int(context.pair_index)
-        or context.pair_index > 3
+        or not _positive_int(identity.slot_ordinal)
+        or identity.slot_ordinal > 6
+        or identity.cache_lane not in {"cold", "warm-prefix"}
+        or not _positive_int(identity.pair_index)
+        or identity.pair_index > 3
     ):
         raise ReconciliationFailure("reconciliation_context_invalid")
+
+
+def _validate_context(context: ReconciliationContext) -> None:
+    if type(context) is not ReconciliationContext:
+        raise ReconciliationFailure("reconciliation_context_invalid")
+    _validate_identity(
+        ReconciliationIdentity(
+            run_manifest_sha256=context.run_manifest_sha256,
+            campaign_id_sha256=context.campaign_id_sha256,
+            slot_ordinal=context.slot_ordinal,
+            cache_lane=context.cache_lane,
+            pair_index=context.pair_index,
+            attestation_sha256=context.attestation_sha256,
+        )
+    )
+    if any(
+        not isinstance(value, str) or _SHA256.fullmatch(value) is None
+        for value in (
+            context.model_evidence_sha256,
+            context.observer_ledger_sha256,
+            context.request_ledger_sha256,
+        )
+    ):
+        raise ReconciliationFailure("reconciliation_context_invalid")
+
+
+def _context_matches_identity(context: ReconciliationContext, identity: ReconciliationIdentity) -> bool:
+    return (
+        context.run_manifest_sha256 == identity.run_manifest_sha256
+        and context.campaign_id_sha256 == identity.campaign_id_sha256
+        and context.slot_ordinal == identity.slot_ordinal
+        and context.cache_lane == identity.cache_lane
+        and context.pair_index == identity.pair_index
+        and context.attestation_sha256 == identity.attestation_sha256
+    )
 
 
 def _snapshot(reader: MetricsReader) -> MetricsSnapshot:

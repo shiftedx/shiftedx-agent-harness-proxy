@@ -17,6 +17,7 @@ from shiftedx_harness_proxy.qualification_reconciliation import (
     ProxyReconciliationSession,
     ReconciliationContext,
     ReconciliationFailure,
+    ReconciliationIdentity,
     RequestAccountingRecord,
 )
 
@@ -70,6 +71,18 @@ def _context(**changes: object) -> ReconciliationContext:
     return replace(value, **changes)
 
 
+def _identity(**changes: object) -> ReconciliationIdentity:
+    value = ReconciliationIdentity(
+        run_manifest_sha256="1" * 64,
+        campaign_id_sha256="2" * 64,
+        slot_ordinal=1,
+        cache_lane="cold",
+        pair_index=1,
+        attestation_sha256="3" * 64,
+    )
+    return replace(value, **changes)
+
+
 def _observer(sequence: int, phase: str = "acquisition", status_code: int | None = 200) -> ModelBoundaryRecord:
     return ModelBoundaryRecord(
         sequence=sequence,
@@ -110,12 +123,51 @@ def _request(
     )
 
 
-def test_cold_success_reconciles_one_request_operation_phase_and_model_completion(tmp_path: Path) -> None:
+def test_begin_snapshots_zero_metrics_before_action_and_complete_binds_post_action_evidence(
+    tmp_path: Path,
+) -> None:
     after = replace(_ZERO_METRICS, downstream_requests=1, upstream_calls=1, phase_acquisition=1)
-    session = ProxyReconciliationSession.begin(_context(), FakeMetricsReader(_ZERO_METRICS, after))
+    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, after))
     artifact = tmp_path / "reconciliation.json"
 
     result = session.complete(
+        _context(),
+        [_observer(1)],
+        [_request(1, start=1, end=1, attempts=1, successful=1, acquisition=1)],
+        ModelOperationSummary(requests_completed_delta=1, prime_count=0),
+        artifact,
+    )
+
+    assert result.status == "passed"
+    document = json.loads(artifact.read_text(encoding="utf-8"))
+    assert document["observer_ledger_sha256"] == "5" * 64
+    assert document["request_ledger_sha256"] == "6" * 64
+
+
+def test_complete_rejects_post_action_evidence_context_that_drifts_from_pre_action_identity(
+    tmp_path: Path,
+) -> None:
+    session = ProxyReconciliationSession.begin(
+        _identity(), FakeMetricsReader(_ZERO_METRICS, _ZERO_METRICS)
+    )
+
+    with pytest.raises(ReconciliationFailure, match="^reconciliation_context_invalid$"):
+        session.complete(
+            _context(attestation_sha256="9" * 64),
+            [],
+            [],
+            ModelOperationSummary(requests_completed_delta=0, prime_count=0),
+            tmp_path / "reconciliation.json",
+        )
+
+
+def test_cold_success_reconciles_one_request_operation_phase_and_model_completion(tmp_path: Path) -> None:
+    after = replace(_ZERO_METRICS, downstream_requests=1, upstream_calls=1, phase_acquisition=1)
+    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, after))
+    artifact = tmp_path / "reconciliation.json"
+
+    result = session.complete(
+        _context(),
         [_observer(1)],
         [_request(1, start=1, end=1, attempts=1, successful=1, acquisition=1)],
         ModelOperationSummary(requests_completed_delta=1, prime_count=0),
@@ -193,11 +245,12 @@ def test_cold_success_reconciles_one_request_operation_phase_and_model_completio
 
 def test_request_phase_mismatch_retains_only_categorical_failed_artifact(tmp_path: Path) -> None:
     after = replace(_ZERO_METRICS, downstream_requests=1, upstream_calls=1, phase_acquisition=1)
-    session = ProxyReconciliationSession.begin(_context(), FakeMetricsReader(_ZERO_METRICS, after))
+    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, after))
     artifact = tmp_path / "reconciliation.json"
 
     with pytest.raises(ReconciliationFailure, match="^reconciliation_phase_counts_mismatch$"):
         session.complete(
+            _context(),
             [_observer(1)],
             [_request(1, start=1, end=1, attempts=1, successful=1, acquisition=0)],
             ModelOperationSummary(requests_completed_delta=1, prime_count=0),
@@ -240,11 +293,12 @@ def test_request_sequences_must_be_contiguous_from_one(tmp_path: Path) -> None:
         receipt_projections=1,
         local_projection_upstream_calls_avoided=1,
     )
-    session = ProxyReconciliationSession.begin(_context(), FakeMetricsReader(_ZERO_METRICS, after))
+    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, after))
     artifact = tmp_path / "reconciliation.json"
 
     with pytest.raises(ReconciliationFailure, match="^reconciliation_request_sequences_mismatch$"):
         session.complete(
+            _context(),
             [_observer(1)],
             [
                 _request(
@@ -267,11 +321,12 @@ def test_request_sequences_must_be_contiguous_from_one(tmp_path: Path) -> None:
 
 def test_attempt_ranges_must_partition_every_observer_once_and_match_row_counts(tmp_path: Path) -> None:
     after = replace(_ZERO_METRICS, downstream_requests=2, upstream_calls=2, phase_acquisition=2)
-    session = ProxyReconciliationSession.begin(_context(), FakeMetricsReader(_ZERO_METRICS, after))
+    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, after))
     artifact = tmp_path / "reconciliation.json"
 
     with pytest.raises(ReconciliationFailure, match="^reconciliation_attempt_partition_mismatch$"):
         session.complete(
+            _context(),
             [_observer(1), _observer(2)],
             [
                 _request(1, start=1, end=1, attempts=1, successful=1, acquisition=1),
@@ -293,12 +348,13 @@ def test_model_prime_count_must_match_the_frozen_cache_lane(
 ) -> None:
     after = replace(_ZERO_METRICS, downstream_requests=1, upstream_calls=1, phase_acquisition=1)
     session = ProxyReconciliationSession.begin(
-        _context(cache_lane=cache_lane), FakeMetricsReader(_ZERO_METRICS, after)
+        _identity(cache_lane=cache_lane), FakeMetricsReader(_ZERO_METRICS, after)
     )
     artifact = tmp_path / "reconciliation.json"
 
     with pytest.raises(ReconciliationFailure, match="^reconciliation_model_operations_mismatch$"):
         session.complete(
+            _context(cache_lane=cache_lane),
             [_observer(1)],
             [_request(1, start=1, end=1, attempts=1, successful=1, acquisition=1)],
             ModelOperationSummary(requests_completed_delta=completed_delta, prime_count=prime_count),
@@ -324,11 +380,12 @@ def test_warm_prime_retry_and_local_projection_reconcile_without_counting_prime_
         phase_finalization=1,
     )
     session = ProxyReconciliationSession.begin(
-        _context(slot_ordinal=4, cache_lane="warm-prefix"), FakeMetricsReader(_ZERO_METRICS, after)
+        _identity(slot_ordinal=4, cache_lane="warm-prefix"), FakeMetricsReader(_ZERO_METRICS, after)
     )
     artifact = tmp_path / "reconciliation.json"
 
     session.complete(
+        _context(slot_ordinal=4, cache_lane="warm-prefix"),
         [_observer(1), _observer(2), _observer(3, "finalization")],
         [
             _request(
@@ -408,11 +465,12 @@ def test_each_proxy_metric_delta_is_reconciled_to_safe_request_and_observer_evid
 ) -> None:
     valid_after = replace(_ZERO_METRICS, downstream_requests=1, upstream_calls=1, phase_acquisition=1)
     after = replace(valid_after, **{metric: value})
-    session = ProxyReconciliationSession.begin(_context(), FakeMetricsReader(_ZERO_METRICS, after))
+    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, after))
     artifact = tmp_path / "reconciliation.json"
 
     with pytest.raises(ReconciliationFailure, match=f"^{category}$"):
         session.complete(
+            _context(),
             [_observer(1)],
             [_request(1, start=1, end=1, attempts=1, successful=1, acquisition=1)],
             ModelOperationSummary(requests_completed_delta=1, prime_count=0),
@@ -433,11 +491,12 @@ def test_failed_or_unobserved_model_operation_retains_unavailable_total_category
         errors=1,
         phase_acquisition=1,
     )
-    session = ProxyReconciliationSession.begin(_context(), FakeMetricsReader(_ZERO_METRICS, after))
+    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, after))
     artifact = tmp_path / "reconciliation.json"
 
     with pytest.raises(ReconciliationFailure, match="^model_operation_total_unavailable$"):
         session.complete(
+            _context(),
             [_observer(1, status_code=status_code)],
             [
                 _request(
@@ -461,11 +520,12 @@ def test_failed_or_unobserved_model_operation_retains_unavailable_total_category
 
 
 def test_after_metrics_exception_retains_categorical_artifact_without_exception_text(tmp_path: Path) -> None:
-    session = ProxyReconciliationSession.begin(_context(), FailingAfterMetricsReader())
+    session = ProxyReconciliationSession.begin(_identity(), FailingAfterMetricsReader())
     artifact = tmp_path / "reconciliation.json"
 
     with pytest.raises(ReconciliationFailure, match="^reconciliation_metrics_unavailable$") as raised:
         session.complete(
+            _context(),
             [_observer(1)],
             [_request(1, start=1, end=1, attempts=1, successful=1, acquisition=1)],
             ModelOperationSummary(requests_completed_delta=1, prime_count=0),
@@ -498,7 +558,7 @@ def test_begin_rejects_invalid_identity_categorically_without_reading_metrics(ch
     reader = FakeMetricsReader(_ZERO_METRICS)
 
     with pytest.raises(ReconciliationFailure, match="^reconciliation_context_invalid$") as raised:
-        ProxyReconciliationSession.begin(_context(**changes), reader)
+        ProxyReconciliationSession.begin(_identity(**changes), reader)
 
     assert str(raised.value) == "reconciliation_context_invalid"
     assert len(reader._snapshots) == 1
@@ -508,7 +568,7 @@ def test_begin_requires_every_allowlisted_proxy_counter_to_be_zero() -> None:
     before = replace(_ZERO_METRICS, phase_schema_rejections=1)
 
     with pytest.raises(ReconciliationFailure, match="^reconciliation_metrics_not_zero$"):
-        ProxyReconciliationSession.begin(_context(), FakeMetricsReader(before))
+        ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(before))
 
 
 @pytest.mark.parametrize("value", [-1, True])
@@ -516,7 +576,7 @@ def test_metrics_snapshot_rejects_negative_and_boolean_counter_values(value: int
     before = replace(_ZERO_METRICS, upstream_calls=value)
 
     with pytest.raises(ReconciliationFailure, match="^reconciliation_metrics_invalid$"):
-        ProxyReconciliationSession.begin(_context(), FakeMetricsReader(before))
+        ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(before))
 
 
 def test_retry_exhaustion_counts_attempts_but_not_success_only_correction_or_block_metrics(tmp_path: Path) -> None:
@@ -527,10 +587,11 @@ def test_retry_exhaustion_counts_attempts_but_not_success_only_correction_or_blo
         errors=1,
         phase_acquisition=3,
     )
-    session = ProxyReconciliationSession.begin(_context(), FakeMetricsReader(_ZERO_METRICS, after))
+    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, after))
     artifact = tmp_path / "reconciliation.json"
 
     session.complete(
+        _context(),
         [_observer(1), _observer(2), _observer(3)],
         [
             _request(
@@ -567,10 +628,11 @@ def test_cancelled_and_deadline_requests_reconcile_exact_error_subcounters(tmp_p
         cancellations=1,
         phase_acquisition=2,
     )
-    session = ProxyReconciliationSession.begin(_context(), FakeMetricsReader(_ZERO_METRICS, after))
+    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, after))
     artifact = tmp_path / "reconciliation.json"
 
     session.complete(
+        _context(),
         [_observer(1), _observer(2)],
         [
             _request(
@@ -603,12 +665,13 @@ def test_cancelled_and_deadline_requests_reconcile_exact_error_subcounters(tmp_p
 
 
 def test_untyped_request_record_is_rejected_without_retaining_raw_fields(tmp_path: Path) -> None:
-    session = ProxyReconciliationSession.begin(_context(), FakeMetricsReader(_ZERO_METRICS, _ZERO_METRICS))
+    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, _ZERO_METRICS))
     artifact = tmp_path / "reconciliation.json"
     raw_record = {"private_prompt": "must-never-survive"}
 
     with pytest.raises(ReconciliationFailure, match="^reconciliation_request_record_invalid$"):
         session.complete(
+            _context(),
             [],
             cast(Any, [raw_record]),
             ModelOperationSummary(requests_completed_delta=0, prime_count=0),
@@ -633,23 +696,31 @@ def test_artifact_is_no_clobber_and_never_follows_an_existing_symlink(tmp_path: 
         artifact.write_text('{"private":"prior-evidence"}\n', encoding="utf-8")
         artifact.chmod(0o600)
         target = artifact
-    session = ProxyReconciliationSession.begin(_context(), FakeMetricsReader(_ZERO_METRICS, _ZERO_METRICS))
+    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, _ZERO_METRICS))
 
     with pytest.raises(ReconciliationFailure, match="^reconciliation_artifact_exists$"):
-        session.complete([], [], ModelOperationSummary(requests_completed_delta=0, prime_count=0), artifact)
+        session.complete(_context(), [], [], ModelOperationSummary(requests_completed_delta=0, prime_count=0), artifact)
 
     assert target.read_text(encoding="utf-8") == '{"private":"prior-evidence"}\n'
 
 
 def test_success_result_hashes_exact_immutable_artifact_bytes_and_session_completes_once(tmp_path: Path) -> None:
-    session = ProxyReconciliationSession.begin(_context(), FakeMetricsReader(_ZERO_METRICS, _ZERO_METRICS))
+    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, _ZERO_METRICS))
     artifact = tmp_path / "reconciliation.json"
 
-    result = session.complete([], [], ModelOperationSummary(requests_completed_delta=0, prime_count=0), artifact)
+    result = session.complete(
+        _context(), [], [], ModelOperationSummary(requests_completed_delta=0, prime_count=0), artifact
+    )
 
     assert result.file_sha256 == hashlib.sha256(artifact.read_bytes()).hexdigest()
     with pytest.raises(ReconciliationFailure, match="^reconciliation_complete_once$"):
-        session.complete([], [], ModelOperationSummary(requests_completed_delta=0, prime_count=0), tmp_path / "second")
+        session.complete(
+            _context(),
+            [],
+            [],
+            ModelOperationSummary(requests_completed_delta=0, prime_count=0),
+            tmp_path / "second",
+        )
     assert not (tmp_path / "second").exists()
 
 
@@ -657,10 +728,11 @@ def test_artifact_requires_an_existing_private_mode_0700_parent(tmp_path: Path) 
     public_parent = tmp_path / "public"
     public_parent.mkdir(mode=0o755)
     public_parent.chmod(0o755)
-    session = ProxyReconciliationSession.begin(_context(), FakeMetricsReader(_ZERO_METRICS, _ZERO_METRICS))
+    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, _ZERO_METRICS))
 
     with pytest.raises(ReconciliationFailure, match="^reconciliation_artifact_parent_invalid$"):
         session.complete(
+            _context(),
             [],
             [],
             ModelOperationSummary(requests_completed_delta=0, prime_count=0),
@@ -681,21 +753,22 @@ def test_artifact_requires_an_existing_private_mode_0700_parent(tmp_path: Path) 
 def test_model_operation_summary_is_strict_nonnegative_and_prime_is_zero_or_one(
     tmp_path: Path, summary: ModelOperationSummary
 ) -> None:
-    session = ProxyReconciliationSession.begin(_context(), FakeMetricsReader(_ZERO_METRICS, _ZERO_METRICS))
+    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, _ZERO_METRICS))
     artifact = tmp_path / "reconciliation.json"
 
     with pytest.raises(ReconciliationFailure, match="^reconciliation_model_summary_invalid$"):
-        session.complete([], [], summary, artifact)
+        session.complete(_context(), [], [], summary, artifact)
 
     assert json.loads(artifact.read_text())["failure_category"] == "reconciliation_model_summary_invalid"
 
 
 def test_untyped_observer_is_rejected_without_retaining_raw_fields(tmp_path: Path) -> None:
-    session = ProxyReconciliationSession.begin(_context(), FakeMetricsReader(_ZERO_METRICS, _ZERO_METRICS))
+    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, _ZERO_METRICS))
     artifact = tmp_path / "reconciliation.json"
 
     with pytest.raises(ReconciliationFailure, match="^reconciliation_observer_record_invalid$"):
         session.complete(
+            _context(),
             cast(Any, [{"response": "private-model-output"}]),
             [],
             ModelOperationSummary(requests_completed_delta=0, prime_count=0),
@@ -755,11 +828,12 @@ def test_request_record_invariants_fail_closed_with_stable_categories(
     tmp_path: Path, record: RequestAccountingRecord, category: str
 ) -> None:
     after = replace(_ZERO_METRICS, downstream_requests=1, upstream_calls=1, phase_acquisition=1)
-    session = ProxyReconciliationSession.begin(_context(), FakeMetricsReader(_ZERO_METRICS, after))
+    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, after))
     artifact = tmp_path / "reconciliation.json"
 
     with pytest.raises(ReconciliationFailure, match=f"^{category}$"):
         session.complete(
+            _context(),
             [_observer(1)],
             [record],
             ModelOperationSummary(requests_completed_delta=1, prime_count=0),
