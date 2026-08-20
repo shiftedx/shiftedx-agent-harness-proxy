@@ -12,6 +12,10 @@ from types import SimpleNamespace
 import pytest
 
 from shiftedx_harness_proxy.core import HARNESS_SYSTEM_SUFFIX
+from shiftedx_harness_proxy.projection_accounting import (
+    LOCAL_PROJECTION_EXTENSION,
+    local_projection_accounting,
+)
 
 _RUN_MANIFEST_SHA256 = "1" * 64
 
@@ -41,7 +45,23 @@ def load_runner(monkeypatch):
 
     agentic.run_agentic_cases = fail_case
     api = types.ModuleType("shiftedx_bench.api")
-    api.OpenAIClient = lambda *_args, **_kwargs: object()
+
+    class DroppingOpenAIClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def complete(self, _payload, *, stream=False):
+            raise AssertionError(f"unexpected benchmark client call (stream={stream})")
+
+        @staticmethod
+        def _normalize(value, *, wall_s, ttft_s):
+            del wall_s, ttft_s
+            return {
+                "content": value.get("content") or "",
+                "tool_calls": value.get("tool_calls") or [],
+            }
+
+    api.OpenAIClient = DroppingOpenAIClient
     package = types.ModuleType("shiftedx_bench")
     monkeypatch.setitem(sys.modules, "shiftedx_bench", package)
     monkeypatch.setitem(sys.modules, "shiftedx_bench.agentic", agentic)
@@ -391,7 +411,7 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
                 }
             return {"content": '{"status":"passed"}', "tool_calls": []}
 
-    runner.OpenAIClient = FakeClient
+    runner.ProjectionAwareOpenAIClient = FakeClient
     metric_values = iter(({"acquisition": 0, "finalization": 0}, {"acquisition": 2, "finalization": 1}))
     monkeypatch.setattr(runner, "_phase_metrics", lambda *_args: next(metric_values))
     args = SimpleNamespace(
@@ -842,7 +862,7 @@ def test_scored_proxy_rows_use_actual_observer_fingerprints_and_failures_keep_sa
             handle.write(json.dumps({"case_id": case_id, "passed": True}) + "\n")
         return [{"case_id": case_id}]
 
-    runner.OpenAIClient = ObservingProxy
+    runner.ProjectionAwareOpenAIClient = ObservingProxy
     runner.run_agentic_cases = run_cases
     monkeypatch.setattr(
         sys,
@@ -888,6 +908,144 @@ def test_scored_proxy_rows_use_actual_observer_fingerprints_and_failures_keep_sa
     assert "private prompt marker" not in serialized
 
 
+def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_records(
+    monkeypatch, tmp_path
+):
+    runner = load_runner(monkeypatch)
+    source_commit = _source_commit()
+    image_digest = "sha256:" + "0" * 64
+    preflight = tmp_path / "preflight.jsonl"
+    observer_path = tmp_path / "scored-observer.jsonl"
+    output = tmp_path / "scored.jsonl"
+    _write_passing_preflight(runner, preflight, source_commit, image_digest)
+
+    def complete(self, _payload, *, stream=False):
+        assert stream is False
+        return self._normalize(
+            {LOCAL_PROJECTION_EXTENSION: local_projection_accounting()}, wall_s=0.1, ttft_s=None
+        )
+
+    def run_cases(*, client, model, output_path, case_id, **_kwargs):
+        scenario = next(item for item in runner.scenario_set("expanded") if item.case_id == case_id)
+        response = client.complete(runner.request_payload(scenario, model=model, proxy_policy=True))
+        assert response[LOCAL_PROJECTION_EXTENSION]["origin"] == "local_projection"
+        with output_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"case_id": case_id, "passed": True}) + "\n")
+        return [{"case_id": case_id}]
+
+    monkeypatch.setattr(runner.ProjectionAwareOpenAIClient, "complete", complete)
+    runner.run_agentic_cases = run_cases
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_paired_agentic_trial.py",
+            "--base-url",
+            "http://proxy.invalid/v1",
+            "--model",
+            "model",
+            "--output",
+            str(output),
+            "--agentic-set",
+            "expanded",
+            "--variant",
+            "proxy",
+            "--proxy-policy",
+            "--preflight-ledger",
+            str(preflight),
+            "--candidate-source-commit",
+            source_commit,
+            "--candidate-image-digest",
+            image_digest,
+            "--run-manifest-sha256",
+            _RUN_MANIFEST_SHA256,
+            "--proxy-observer-ledger",
+            str(observer_path),
+        ],
+    )
+
+    runner.main()
+
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert [row["case_id"] for row in rows] == ["case-1", "case-2"]
+    assert all(row["passed"] is True and row["scored"] is True for row in rows)
+    for row in rows:
+        fingerprints = row["contract_fingerprints"]
+        assert fingerprints["downstream"]["boundary"] == "downstream"
+        assert fingerprints["model_facing"] == []
+        assert fingerprints["model_facing_turns"] == [{"turn_index": 0, "fingerprints": []}]
+        assert "error" not in row
+    assert not observer_path.exists()
+    assert "private prompt marker" not in output.read_text()
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {LOCAL_PROJECTION_EXTENSION: "local_projection"},
+        {LOCAL_PROJECTION_EXTENSION: {"origin": "upstream"}},
+        {"x-shiftedx-local-projection": {"origin": "local_projection"}},
+    ],
+)
+def test_local_projection_detection_rejects_malformed_or_spoofed_extensions(monkeypatch, response):
+    runner = load_runner(monkeypatch)
+
+    assert runner._is_local_projection(response) is False
+
+
+def test_projection_aware_client_preserves_only_the_canonical_projection_marker(monkeypatch):
+    runner = load_runner(monkeypatch)
+    canonical = local_projection_accounting()
+
+    normalized = runner.ProjectionAwareOpenAIClient._normalize(
+        {
+            LOCAL_PROJECTION_EXTENSION: canonical,
+            "untrusted_response_field": "private marker that must be stripped",
+        },
+        wall_s=0.1,
+        ttft_s=None,
+    )
+
+    assert normalized[LOCAL_PROJECTION_EXTENSION] == canonical
+    assert normalized[LOCAL_PROJECTION_EXTENSION] is not canonical
+    assert runner._is_local_projection(normalized) is True
+    assert "untrusted_response_field" not in normalized
+
+    malformed = runner.ProjectionAwareOpenAIClient._normalize(
+        {LOCAL_PROJECTION_EXTENSION: {"origin": "local_projection"}}, wall_s=0.1, ttft_s=None
+    )
+    assert LOCAL_PROJECTION_EXTENSION not in malformed
+    assert runner._is_local_projection(malformed) is False
+
+
+@pytest.mark.parametrize("operation", ("failure", "annotation"))
+def test_atomic_scored_rewrites_preserve_completed_rows_when_replace_fails(monkeypatch, tmp_path, operation):
+    runner = load_runner(monkeypatch)
+    output = tmp_path / "scored.jsonl"
+    original = '{"case_id":"complete","passed":true}\n'
+    output.write_text(original, encoding="utf-8")
+
+    def replace_failure(_source, _destination):
+        raise OSError("simulated atomic replace failure")
+
+    monkeypatch.setattr(runner.os, "replace", replace_failure)
+    with pytest.raises(OSError, match="simulated atomic replace failure"):
+        if operation == "failure":
+            runner.append_failure(output, {"case_id": "failed", "passed": False})
+        else:
+            client = SimpleNamespace(
+                actual_contract_fingerprints=lambda: {
+                    "downstream": None,
+                    "model_facing": [],
+                    "model_facing_turns": [],
+                }
+            )
+            runner.annotate_scored_rows(output, client, {"complete"})
+
+    assert output.read_text(encoding="utf-8") == original
+    assert [path.name for path in tmp_path.iterdir()] == ["scored.jsonl"]
+
+
 def test_metrics_preflight_failure_is_retained_as_categorical_unscored_evidence(monkeypatch, tmp_path):
     runner = load_runner(monkeypatch)
     args = _preflight_args(tmp_path)
@@ -920,7 +1078,7 @@ def test_network_preflight_failure_retains_partial_safe_observation_without_exce
             assert stream is False
             raise RuntimeError("HTTP 502 https://private.invalid body=private-marker")
 
-    runner.OpenAIClient = FailingClient
+    runner.ProjectionAwareOpenAIClient = FailingClient
     monkeypatch.setattr(runner, "_phase_metrics", lambda *_args: {"acquisition": 0, "finalization": 0})
 
     with pytest.raises(SystemExit, match="preflight_client_failure"):
@@ -945,7 +1103,7 @@ def test_preflight_existing_output_is_rejected_before_any_model_request(monkeypa
         def __init__(self, *_args, **_kwargs):
             raise AssertionError("must not make a preflight request")
 
-    runner.OpenAIClient = UnexpectedClient
+    runner.ProjectionAwareOpenAIClient = UnexpectedClient
 
     with pytest.raises(SystemExit, match="existing preflight ledger"):
         runner._run_paired_preflight(args, [runner.scenario_set("expanded")[0]])

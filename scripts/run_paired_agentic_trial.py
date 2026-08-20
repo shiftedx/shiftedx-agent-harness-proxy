@@ -7,7 +7,9 @@ import argparse
 import copy
 import hashlib
 import json
+import os
 import re
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -20,6 +22,10 @@ from typing import Any
 from shiftedx_bench.agentic import run_agentic_cases, scenario_set
 from shiftedx_bench.api import OpenAIClient
 
+from shiftedx_harness_proxy.projection_accounting import (
+    LOCAL_PROJECTION_EXTENSION,
+    public_projection_summary,
+)
 from shiftedx_harness_proxy.qualification_contract import (
     ModelBoundaryObserverCursor,
     PhasePlanner,
@@ -47,6 +53,18 @@ _SYSTEM_PROMPT = (
     "results, recover from failures, verify completion, and obey the requested final JSON format."
 )
 _HTTP_STATUS = re.compile(r"\bHTTP ([1-5][0-9]{2})\b")
+
+
+class ProjectionAwareOpenAIClient(OpenAIClient):
+    """Retain only the validated Local Projection marker dropped by the benchmark normalizer."""
+
+    @staticmethod
+    def _normalize(value: dict[str, Any], *, wall_s: float, ttft_s: float | None) -> dict[str, Any]:
+        marker = _canonical_local_projection_marker(value)
+        normalized = OpenAIClient._normalize(value, wall_s=wall_s, ttft_s=ttft_s)
+        if marker is not None:
+            normalized[LOCAL_PROJECTION_EXTENSION] = marker
+        return normalized
 
 
 def request_payload(scenario: Any, *, model: str, proxy_policy: bool) -> dict[str, Any]:
@@ -250,8 +268,22 @@ class CompatibilityClient:
         )
 
 
+def _canonical_local_projection_marker(value: object) -> dict[str, Any] | None:
+    """Return a copied marker only when it satisfies the shared exact accounting contract."""
+    if not isinstance(value, dict):
+        return None
+    marker = value.get(LOCAL_PROJECTION_EXTENSION)
+    if not isinstance(marker, dict) or marker.get("origin") != "local_projection":
+        return None
+    try:
+        public_projection_summary([{LOCAL_PROJECTION_EXTENSION: marker}])
+    except ValueError:
+        return None
+    return copy.deepcopy(marker)
+
+
 def _is_local_projection(response: dict[str, Any]) -> bool:
-    return isinstance(response.get("x-shiftedx-local-projection"), dict)
+    return _canonical_local_projection_marker(response) is not None
 
 
 def _preflight_payload(scenario: Any, *, model: str, proxy_policy: bool, no_tools: bool) -> dict[str, Any]:
@@ -386,10 +418,7 @@ def append_failure(output: Path, row: dict[str, Any]) -> None:
     # Replace it with the fail-closed evidence row rather than leaving an unverified scored row.
     rows = [item for item in rows if item.get("case_id") != row.get("case_id")]
     rows.append(row)
-    output.write_text(
-        "".join(json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n" for item in rows),
-        encoding="utf-8",
-    )
+    _atomic_replace_jsonl(output, rows)
 
 
 def annotate_scored_rows(
@@ -404,10 +433,28 @@ def annotate_scored_rows(
             continue
         row["scored"] = True
         row["contract_fingerprints"] = client.actual_contract_fingerprints()
-    output.write_text(
-        "".join(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n" for row in rows),
-        encoding="utf-8",
-    )
+    _atomic_replace_jsonl(output, rows)
+
+
+def _atomic_replace_jsonl(output: Path, rows: list[dict[str, Any]]) -> None:
+    """Atomically replace a live scored ledger without exposing a truncated prior file."""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=output.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(
+                "".join(
+                    json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                    for item in rows
+                )
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, output)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def response_format(case_id: str, keys: tuple[str, ...] | None, types: dict[str, str]) -> dict[str, Any]:
@@ -524,7 +571,7 @@ def main() -> None:
     api_key = args.api_key_file.read_text().strip() if args.api_key_file is not None else None
     if args.api_key_file is not None and not api_key:
         raise SystemExit("--api-key-file must contain a non-empty bearer credential")
-    client = OpenAIClient(args.base_url, api_key=api_key, timeout_s=600.0)
+    client = ProjectionAwareOpenAIClient(args.base_url, api_key=api_key, timeout_s=600.0)
     observer: ModelBoundaryObserverCursor | None = None
     if args.proxy_policy:
         if args.proxy_observer_ledger is None:
@@ -648,7 +695,7 @@ def _run_paired_preflight(args: argparse.Namespace, selected: list[Any]) -> None
             ("proxy", args.proxy_base_url, proxy_metrics_key, True),
         ):
             tool_client = CompatibilityClient(
-                OpenAIClient(base_url, api_key=api_key, timeout_s=600.0),
+                ProjectionAwareOpenAIClient(base_url, api_key=api_key, timeout_s=600.0),
                 arm=arm,
                 scenario_order=scenario_order,
                 proxy_policy=proxy_policy,
@@ -663,7 +710,7 @@ def _run_paired_preflight(args: argparse.Namespace, selected: list[Any]) -> None
                 observations.append(tool_client.observation(tool_required=True, original_payload=tool_payload))
 
             terminal_client = CompatibilityClient(
-                OpenAIClient(base_url, api_key=api_key, timeout_s=600.0),
+                ProjectionAwareOpenAIClient(base_url, api_key=api_key, timeout_s=600.0),
                 arm=arm,
                 scenario_order=scenario_order,
                 proxy_policy=False,

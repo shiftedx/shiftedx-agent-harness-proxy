@@ -47,7 +47,8 @@ between the proxy and model. It forwards requests and records only ordered hashe
 model-boundary fields. The runner consumes records immediately after each proxy turn and rejects
 missing, stale, malformed, out-of-order, raw-field-bearing, or field-drifting records. It records
 the full system hash, normalized base-system hash, and only the exact declared harness suffix
-delta; no other system-prompt mutation is accepted.
+delta; no other system-prompt mutation is accepted. A validated Local Projection has no model
+boundary attempt and therefore consumes zero observer records.
 
 Create a private, unique run directory before either arm starts. Do not pre-create or truncate a
 ledger: a preflight output path must be new, and its atomic writer will never overwrite existing
@@ -56,6 +57,7 @@ only its SHA-256 to the runner.
 
 ```bash
 umask 077
+install -d -m 700 benchmark-reports/private
 RUN_DIR="$(mktemp -d benchmark-reports/private/qualification.XXXXXX)"
 PREFLIGHT_OBSERVER_LEDGER="$RUN_DIR/preflight-proxy-model-boundary.jsonl"
 PREFLIGHT_LEDGER="$RUN_DIR/preflight.jsonl"
