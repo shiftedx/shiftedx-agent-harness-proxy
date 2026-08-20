@@ -28,6 +28,116 @@ an evaluation adapter, not benchmark or proxy policy derived from expected answe
 `--proxy-policy` only for the proxy endpoint. The benchmark runner's control profile remains
 `baseline` in both treatments so policy is not applied twice.
 
+## Parity preflight and score gate
+
+The replacement qualification uses the frozen sampler `temperature=0.0`, `top_p=0.95`,
+`top_k=20`, thinking enabled, reasoning effort `medium`, and `max_tokens=1024`. Temperature `1.0`
+is a distinct future experiment and must not share a ledger with this parity run.
+
+Before a scored command, run the paired preflight against the direct and proxy arms. It uses the
+same versioned phase planner on each arm while keeping the proxy's downstream request standard:
+tool acquisition has tools but no terminal grammar; forced finalization has terminal grammar but
+no tools. The proxy arm also compares its aggregate acquisition/finalization counter delta with
+the synthetic one-tool path. The preflight writes only `scored:false` hash-only rows; it never
+copies prompts, schemas, tool calls or arguments/results, model output, credentials, endpoints,
+or host paths.
+
+For the proxy arm, place `scripts/qualification_model_boundary_observer.py` on the private hop
+between the proxy and model. It forwards requests and records only ordered hashes of allowlisted
+model-boundary fields. The runner consumes records immediately after each proxy turn and rejects
+missing, stale, malformed, out-of-order, raw-field-bearing, or field-drifting records. It records
+the full system hash, normalized base-system hash, and only the exact declared harness suffix
+delta; no other system-prompt mutation is accepted. A validated Local Projection has no model
+boundary attempt and therefore consumes zero observer records.
+
+Create a private, unique run directory before either arm starts. Do not pre-create or truncate a
+ledger: a preflight output path must be new, and its atomic writer will never overwrite existing
+evidence. The frozen manifest itself carries the approved exact model revision and runtime; pass
+only its SHA-256 to the runner.
+
+```bash
+umask 077
+install -d -m 700 benchmark-reports/private
+RUN_DIR="$(mktemp -d benchmark-reports/private/qualification.XXXXXX)"
+PREFLIGHT_OBSERVER_LEDGER="$RUN_DIR/preflight-proxy-model-boundary.jsonl"
+PREFLIGHT_LEDGER="$RUN_DIR/preflight.jsonl"
+SCORED_PROXY_OBSERVER_LEDGER="$RUN_DIR/scored-proxy-model-boundary.jsonl"
+RUN_MANIFEST_SHA256="$(shasum -a 256 "$RUN_MANIFEST" | awk '{print $1}')"
+
+QUALIFICATION_OBSERVER_UPSTREAM="$MODEL_URL" \
+QUALIFICATION_OBSERVER_LEDGER="$PREFLIGHT_OBSERVER_LEDGER" \
+  uv run python scripts/qualification_model_boundary_observer.py &
+UPSTREAM_BASE_URL=http://127.0.0.1:18092/v1 \
+  uv run shiftedx-agent-harness-proxy
+```
+
+The preflight runner requires that observer ledger to be absent or empty before requests and will
+neither delete nor overwrite it. Use a newly launched observer and a distinct new ledger for every
+preflight and every scored proxy treatment. Restore the fixed approved model URL after each
+qualification-only observer exercise; do not use this observer as a production routing layer.
+
+```bash
+uv run scripts/run_paired_agentic_trial.py \
+  --paired-preflight --model "$PUBLIC_MODEL_ID" --agentic-set expanded \
+  --direct-base-url "$DIRECT_URL" --proxy-base-url "$PROXY_URL" \
+  --proxy-metrics-url "$PRIVATE_PROXY_METRICS_URL" \
+  --proxy-observer-ledger "$PREFLIGHT_OBSERVER_LEDGER" \
+  --direct-api-key-file secrets/direct_key --proxy-api-key-file secrets/proxy_key \
+  --output "$PREFLIGHT_LEDGER" \
+  --candidate-source-commit "$CANDIDATE_SOURCE_COMMIT" \
+  --candidate-image-digest "$CANDIDATE_IMAGE_DIGEST" \
+  --run-manifest-sha256 "$RUN_MANIFEST_SHA256"
+```
+
+The command fails before any scored row when either arm produces zero native acquisition calls,
+phase/field fingerprints differ outside the declared proxy receipt policy, proxy phase counters do
+not prove the equivalent split, or either terminal response fails strict-schema validation. A
+scored command requires that passed ledger and exactly matching checked-out source and immutable
+image digest. Failed preflights are atomically retained with `status:"failed"`, still contain only
+hashes/counts/allowlisted categories, and can never authorize scoring. The passed summary also
+binds each arm to its full selected scenario order and request-contract digest, so a `--case-id` or
+`--limit` preflight cannot authorize a differently selected scored run:
+
+```bash
+uv run scripts/run_paired_agentic_trial.py \
+  --base-url "$DIRECT_URL" --model "$PUBLIC_MODEL_ID" --variant direct \
+  --output "$RUN_DIR/direct.jsonl" --agentic-set expanded \
+  --preflight-ledger "$PREFLIGHT_LEDGER" \
+  --candidate-source-commit "$CANDIDATE_SOURCE_COMMIT" \
+  --candidate-image-digest "$CANDIDATE_IMAGE_DIGEST" \
+  --run-manifest-sha256 "$RUN_MANIFEST_SHA256"
+```
+
+Before the equivalent proxy command, stop the preflight-only observer/proxy, then launch a new
+observer wired to the distinct scored ledger and configure the dedicated qualification proxy to
+use its loopback listener:
+
+```bash
+QUALIFICATION_OBSERVER_UPSTREAM="$MODEL_URL" \
+QUALIFICATION_OBSERVER_LEDGER="$SCORED_PROXY_OBSERVER_LEDGER" \
+  uv run python scripts/qualification_model_boundary_observer.py &
+UPSTREAM_BASE_URL=http://127.0.0.1:18092/v1 \
+  uv run shiftedx-agent-harness-proxy
+```
+
+Pass that same new path to the runner:
+
+```bash
+uv run scripts/run_paired_agentic_trial.py \
+  --base-url "$PROXY_URL" --model "$PUBLIC_MODEL_ID" --variant proxy \
+  --output "$RUN_DIR/proxy.jsonl" --agentic-set expanded --proxy-policy \
+  --proxy-observer-ledger "$SCORED_PROXY_OBSERVER_LEDGER" \
+  --preflight-ledger "$PREFLIGHT_LEDGER" \
+  --candidate-source-commit "$CANDIDATE_SOURCE_COMMIT" \
+  --candidate-image-digest "$CANDIDATE_IMAGE_DIGEST" \
+  --run-manifest-sha256 "$RUN_MANIFEST_SHA256"
+```
+
+Never invoke either command without the same frozen candidate provenance, model ID, and manifest
+digest; the runner refuses to append to an existing scored output. Proxy scored rows carry only
+the newly consumed, ordered observer fingerprints for that case/turn; direct rows use their actual
+sent model-facing payload fingerprints.
+
 Pass authenticated proxy credentials with `--api-key-file`; never put a bearer value directly in
 the command line. If the benchmark client cannot obtain a response (for example, a bounded proxy
 `502`), the runner writes a failed row with only the exception type, HTTP status when available,

@@ -15,7 +15,7 @@ reviewers can verify that thresholds were not changed after results were known.
   `335e6694e4aec13e9370af8a993d8c8f14d7ffb5`
 - Candidate model revision:
   `b5a54ea5d7745b6ddada238f83b66d63c979b9a5`
-- Sampler: temperature `1.0`, top-p `0.95`, top-k `20`
+- Sampler: temperature `0.0`, top-p `0.95`, top-k `20`
 - Reasoning: thinking enabled, reasoning effort `medium`
 - Treatments: direct upstream baseline and proxy-assisted, both using the benchmark runner's
   `baseline` control profile
@@ -102,7 +102,10 @@ Cold and warm-prefix results are separate datasets.
 1. Approve the coordinated window and immutable run manifest.
 2. Verify the retained OCI checksum, provenance subject, SBOM, image digest, and source commit.
 3. Start the exact proxy image and approved model runtime without rebuilding or tuning either.
-4. Run preflight authentication, readiness, credential-isolation, and one non-scored smoke case.
+4. Run preflight authentication, readiness, credential-isolation, and the required hash-only paired
+   tool-acquisition/no-tool-terminal preflight. It must prove native tool calls, direct/proxy
+   phase/fingerprint parity, proxy phase-counter deltas, and terminal-schema validation before any
+   scored row is written.
 5. For each cold/warm lane, run three complete pairs in the fixed order: direct baseline, then
    proxy-assisted. Keep model/runtime/sampler/task contracts identical.
 6. Run steady load at declared capacity and overload above it while collecting client, proxy,
