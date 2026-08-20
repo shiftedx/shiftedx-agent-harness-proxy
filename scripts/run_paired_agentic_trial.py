@@ -71,6 +71,26 @@ _CANONICAL_COUNTER = re.compile(r"^(?:0|[1-9][0-9]{0,19})$")
 _MAX_PROXY_RESPONSE_BYTES = 16 * 1024 * 1024
 PROXY_RESPONSE_ACCOUNTING = "_shiftedx_qualification_proxy_accounting"
 ProxyRequestRecord: TypeAlias = RequestAccountingRecord
+SamplerProfile: TypeAlias = str
+
+_SAMPLER_PROFILES: dict[SamplerProfile, dict[str, Any]] = {
+    "corrected-parity-v1": {
+        "temperature": 0.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "thinking": {"enabled": True},
+        "reasoning_effort": "medium",
+        "max_tokens": 1024,
+    },
+    "historical-aeon-v1": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "thinking": {"enabled": True},
+        "reasoning_effort": "medium",
+        "max_tokens": 1024,
+    },
+}
 
 
 class _RejectAllRedirects(urllib.request.HTTPRedirectHandler):
@@ -188,8 +208,10 @@ def request_payload(
     model: str,
     proxy_policy: bool,
     cache_mode: str = "warm-prefix",
+    sampler_profile: SamplerProfile = "corrected-parity-v1",
 ) -> dict[str, Any]:
     """Build the unchanged standard downstream Chat Completions contract."""
+    sampler = _sampler_profile(sampler_profile)
     payload: dict[str, Any] = {
         "model": model,
         "messages": [
@@ -198,12 +220,7 @@ def request_payload(
         ],
         "tools": scenario.tools,
         "tool_choice": "auto",
-        "temperature": 0.0,
-        "top_p": 0.95,
-        "top_k": 20,
-        "thinking": {"enabled": True},
-        "reasoning_effort": "medium",
-        "max_tokens": 1024,
+        **sampler,
         "response_format": response_format(scenario.case_id, scenario.final_keys, scenario.final_types),
     }
     if proxy_policy:
@@ -213,9 +230,11 @@ def request_payload(
     return payload
 
 
-def cache_prime_payload(scenario: Any, *, model: str, arm: str) -> dict[str, Any]:
+def cache_prime_payload(
+    scenario: Any, *, model: str, arm: str, sampler_profile: SamplerProfile = "corrected-parity-v1"
+) -> dict[str, Any]:
     """Build the exact first scored model-facing payload for warm-cache priming."""
-    payload = request_payload(scenario, model=model, proxy_policy=False)
+    payload = request_payload(scenario, model=model, proxy_policy=False, sampler_profile=sampler_profile)
     if arm == "proxy":
         system = payload["messages"][0]
         content = system.get("content")
@@ -224,6 +243,15 @@ def cache_prime_payload(scenario: Any, *, model: str, arm: str) -> dict[str, Any
         system["content"] = content + HARNESS_SYSTEM_SUFFIX
     phase = "acquisition" if payload.get("tools") else "terminal"
     return PhasePlanner().plan(payload, phase=phase)
+
+
+def _sampler_profile(profile: SamplerProfile) -> dict[str, Any]:
+    """Copy one immutable named sampler contract; caller values never override it."""
+
+    try:
+        return copy.deepcopy(_SAMPLER_PROFILES[profile])
+    except KeyError as error:
+        raise PreflightFailure("sampler profile is invalid") from error
 
 
 def contract_fingerprints(
@@ -594,12 +622,14 @@ def _preflight_payload(
     proxy_policy: bool,
     no_tools: bool,
     cache_mode: str = "warm-prefix",
+    sampler_profile: SamplerProfile = "corrected-parity-v1",
 ) -> dict[str, Any]:
     payload = request_payload(
         scenario,
         model=model,
         proxy_policy=proxy_policy and not no_tools,
         cache_mode=cache_mode,
+        sampler_profile=sampler_profile,
     )
     if no_tools:
         payload.pop("tools", None)
@@ -638,6 +668,7 @@ def failure_row(
     proxy_policy: bool,
     wall_s: float,
     cache_mode: str = "warm-prefix",
+    sampler_profile: SamplerProfile = "corrected-parity-v1",
     actual_contract_fingerprints: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a prompt-free benchmark row when the client cannot return a response."""
@@ -719,6 +750,7 @@ def failure_row(
                 model=model,
                 proxy_policy=proxy_policy,
                 cache_mode=cache_mode,
+                sampler_profile=sampler_profile,
             ),
             scenario_order,
             policy_delta={"x-shiftedx-require-receipt": True} if proxy_policy else {},
@@ -868,6 +900,12 @@ def main() -> None:
         default="warm-prefix",
         help="Use deterministic session-cache bypass or the normal primed-prefix lane.",
     )
+    parser.add_argument(
+        "--sampler-profile",
+        choices=tuple(_SAMPLER_PROFILES),
+        default="corrected-parity-v1",
+        help="Use one immutable named sampler contract; individual sampler overrides are not accepted.",
+    )
     parser.add_argument("--direct-model-attempt-ledger", type=Path)
     parser.add_argument("--model-attempt-ledger", type=Path)
     parser.add_argument("--cache-prime-only", action="store_true")
@@ -937,6 +975,7 @@ def main() -> None:
                     model=args.model,
                     proxy_policy=args.proxy_policy,
                     cache_mode=args.cache_mode,
+                    sampler_profile=args.sampler_profile,
                 )
                 for item in selected
             ],
@@ -967,11 +1006,7 @@ def main() -> None:
     proxy_request_accounting = ProxyRequestAccounting() if args.proxy_policy else None
     for scenario in selected:
         overrides: dict[str, Any] = {
-            "temperature": 0.0,
-            "top_p": 0.95,
-            "top_k": 20,
-            "thinking": {"enabled": True},
-            "reasoning_effort": "medium",
+            **_sampler_profile(args.sampler_profile),
             "response_format": response_format(
                 scenario.case_id,
                 scenario.final_keys,
@@ -1033,6 +1068,7 @@ def main() -> None:
                     proxy_policy=args.proxy_policy,
                     wall_s=time.perf_counter() - started,
                     cache_mode=args.cache_mode,
+                    sampler_profile=args.sampler_profile,
                     actual_contract_fingerprints=(
                         planned_client.actual_contract_fingerprints() if planned_client is not None else None
                     ),
@@ -1060,7 +1096,9 @@ def _run_cache_prime(args: argparse.Namespace, selected: list[Any]) -> None:
     _require_fresh_attempt_path(args.model_attempt_ledger)
     api_key = _read_key(args.api_key_file)
     client = ProjectionAwareOpenAIClient(args.base_url, api_key=api_key, timeout_s=600.0)
-    payload = cache_prime_payload(selected[0], model=args.model, arm=args.cache_prime_arm)
+    payload = cache_prime_payload(
+        selected[0], model=args.model, arm=args.cache_prime_arm, sampler_profile=args.sampler_profile
+    )
     try:
         response = client.complete(payload, stream=False)
     except Exception as error:
@@ -1141,11 +1179,13 @@ def _run_paired_preflight(args: argparse.Namespace, selected: list[Any]) -> None
     if tool_scenario is None:
         raise SystemExit("selected agentic set has no tool-required scenario for preflight")
     scenario_order = [item.case_id for item in selected]
+    sampler_profile = getattr(args, "sampler_profile", "corrected-parity-v1")
     contract_digests = _qualification_contract_digests(
         args.model,
         selected,
         scenario_order,
         args.run_manifest_sha256,
+        sampler_profile,
     )
     runtime_attestation: RuntimeAttestation | None = None
     try:
@@ -1196,6 +1236,7 @@ def _run_paired_preflight(args: argparse.Namespace, selected: list[Any]) -> None
                 proxy_policy=proxy_policy,
                 no_tools=False,
                 cache_mode=getattr(args, "cache_mode", "warm-prefix"),
+                sampler_profile=sampler_profile,
             )
             try:
                 _run_preflight_path(tool_client, tool_payload, tool_required=True)
@@ -1221,6 +1262,7 @@ def _run_paired_preflight(args: argparse.Namespace, selected: list[Any]) -> None
                 proxy_policy=False,
                 no_tools=True,
                 cache_mode=getattr(args, "cache_mode", "warm-prefix"),
+                sampler_profile=sampler_profile,
             )
             try:
                 _run_preflight_path(terminal_client, terminal_payload, tool_required=False)
@@ -1269,6 +1311,7 @@ def _qualification_contract_digests(
     selected: list[Any],
     scenario_order: list[str],
     run_manifest_sha256: str,
+    sampler_profile: SamplerProfile = "corrected-parity-v1",
 ) -> dict[str, dict[str, str]]:
     return {
         lane: {
@@ -1279,6 +1322,7 @@ def _qualification_contract_digests(
                         model=model,
                         proxy_policy=arm == "proxy",
                         cache_mode="bypass" if lane == "cold" else "warm-prefix",
+                        sampler_profile=sampler_profile,
                     )
                     for item in selected
                 ],

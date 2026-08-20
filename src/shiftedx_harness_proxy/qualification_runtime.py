@@ -507,6 +507,7 @@ class RuntimeLease:
     model: str
     benchmark_revision: str
     agentic_set: str
+    sampler_profile: Literal["corrected-parity-v1", "historical-aeon-v1"]
     scenario_order_sha256: str
     scenario_count: int
     benchmark_source_path: Path
@@ -584,6 +585,7 @@ class _BenchmarkSpec:
     checkout_path: Path
     interpreter_sha256: str
     agentic_set: str
+    sampler_profile: Literal["corrected-parity-v1", "historical-aeon-v1"]
     scenario_order_sha256: str
     scenario_count: int
 
@@ -1055,6 +1057,8 @@ class QualificationCampaignReadinessProbe:
             # never-written sentinel under the already-owned ``slots`` parent.
             _validate_private_run_dir(request.private_run_dir.parent)
             _validate_credentials(spec.credentials, upstream_authenticated=spec.model.upstream_authenticated)
+            if _model_readiness_state(runner, spec, request.stage, binding) == "offline":
+                return ReadinessResult("restart_required", None)
             session = _begin_model_evidence(
                 runner,
                 spec,
@@ -1069,6 +1073,39 @@ class QualificationCampaignReadinessProbe:
                 return ReadinessResult("restart_required", None)
             raise
         return ReadinessResult("ready", session.runtime_instance_sha256)
+
+
+def _model_readiness_state(
+    runner: RuntimeCommandRunner,
+    spec: _RuntimeSpec,
+    stage: RuntimeStage,
+    binding: _StageBinding,
+) -> Literal["offline", "responding"]:
+    """Classify only the hardened transport's no-response sentinel as retryable.
+
+    ``RuntimeCommandRunner.http_json`` uses the same no-proxy, no-redirect,
+    bounded transport as the rest of the runtime.  A zero status is its typed
+    no-listener/transport sentinel; every HTTP response, including malformed,
+    unauthorized, or wrong-model responses, must continue into C1 and fail
+    closed there rather than being mistaken for a planned restart.
+    """
+
+    parsed = urlsplit(spec.model.upstream_url)
+    host = parsed.hostname
+    port = parsed.port
+    if host is None or port is None:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    try:
+        # The injected test seam needs the same immutable contract as its C1
+        # adapter. Production does not expose this hook and stays entirely on
+        # the hardened HTTP path below.
+        prepare = getattr(runner, "prepare_model_evidence_contract", None)
+        if callable(prepare):
+            prepare(_model_evidence_contract(spec, stage, binding))
+        status, _document = runner.http_json(f"http://{_url_host(host)}:{port}/health", timeout=5.0)
+    except Exception as error:
+        raise QualificationRuntimeFailure("model_probe_failed") from error
+    return "offline" if status == 0 else "responding"
 
 
 def _reserved_stage_paths(
@@ -1373,6 +1410,7 @@ def _parse_benchmark(value: Any) -> _BenchmarkSpec:
             "checkout_path",
             "interpreter_sha256",
             "agentic_set",
+            "sampler_profile",
             "scenario_order_sha256",
             "scenario_count",
         },
@@ -1389,6 +1427,9 @@ def _parse_benchmark(value: Any) -> _BenchmarkSpec:
     agentic_set = _required_text(benchmark.get("agentic_set"))
     if agentic_set not in {"core", "expanded", "repo"}:
         raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    sampler_profile = benchmark.get("sampler_profile")
+    if sampler_profile not in {"corrected-parity-v1", "historical-aeon-v1"}:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
     order_hash = _exact_string(benchmark, "scenario_order_sha256", _SHA256)
     count = _positive_int(benchmark.get("scenario_count"))
     return _BenchmarkSpec(
@@ -1398,6 +1439,7 @@ def _parse_benchmark(value: Any) -> _BenchmarkSpec:
         checkout_path,
         interpreter_sha256,
         agentic_set,
+        sampler_profile,
         order_hash,
         count,
     )
@@ -2266,6 +2308,7 @@ def _proxy_lease(
         model=spec.model.public_id,
         benchmark_revision=spec.benchmark.revision,
         agentic_set=spec.benchmark.agentic_set,
+        sampler_profile=spec.benchmark.sampler_profile,
         scenario_order_sha256=spec.benchmark.scenario_order_sha256,
         scenario_count=spec.benchmark.scenario_count,
         benchmark_source_path=spec.benchmark.checkout_path / "src",
@@ -2308,6 +2351,7 @@ def _direct_lease(
         model=spec.model.public_id,
         benchmark_revision=spec.benchmark.revision,
         agentic_set=spec.benchmark.agentic_set,
+        sampler_profile=spec.benchmark.sampler_profile,
         scenario_order_sha256=spec.benchmark.scenario_order_sha256,
         scenario_count=spec.benchmark.scenario_count,
         benchmark_source_path=spec.benchmark.checkout_path / "src",
