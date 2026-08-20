@@ -199,7 +199,7 @@ def _frozen_host_command(
         return None
     requested = argv[0]
     tool_name = requested if requested in _FROZEN_HOST_TOOLS else Path(requested).name
-    candidates = _FROZEN_HOST_TOOLS.get(tool_name)
+    candidates: tuple[Path, ...] | None = _FROZEN_HOST_TOOLS.get(tool_name)
     if candidates is None:
         return argv, env
 
