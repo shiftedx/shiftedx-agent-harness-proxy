@@ -296,17 +296,13 @@ class ProxyRequestAccounting:
 
     def record_success(
         self,
-        response: dict[str, Any],
+        accounting: dict[str, int],
         observer_records: tuple[ModelBoundaryRecord, ...],
         *,
         local_projection: bool,
     ) -> None:
-        accounting = _take_proxy_response_accounting(response)
-        phases = [record.fields["compatibility"]["phase"] for record in observer_records]
-        retry_count = len(observer_records) - len(set(phases))
         if (
             accounting["upstream_calls"] != len(observer_records)
-            or accounting["corrections"] != retry_count
             or local_projection
             and (observer_records or any(accounting.values()))
         ):
@@ -315,6 +311,7 @@ class ProxyRequestAccounting:
             observer_records,
             outcome="succeeded",
             local_projection=local_projection,
+            corrections=accounting["corrections"],
             blocked_duplicates=accounting["blocked_duplicates"],
             blocked_stalls=accounting["blocked_stalls"],
         )
@@ -337,6 +334,7 @@ class ProxyRequestAccounting:
             observer_records,
             outcome=outcome,
             local_projection=False,
+            corrections=0,
             blocked_duplicates=0,
             blocked_stalls=0,
         )
@@ -347,6 +345,7 @@ class ProxyRequestAccounting:
         *,
         outcome: RequestOutcome,
         local_projection: bool,
+        corrections: int,
         blocked_duplicates: int,
         blocked_stalls: int,
     ) -> None:
@@ -371,6 +370,7 @@ class ProxyRequestAccounting:
                 retry_attempt_count=retry_count,
                 blocked_duplicate_count=blocked_duplicates,
                 blocked_stall_count=blocked_stalls,
+                correction_count=corrections,
             )
         )
 
@@ -470,6 +470,9 @@ class CompatibilityClient:
         prior_turn_count = len(self.observer.record_turns) if self.observer is not None else 0
         records: tuple[ModelBoundaryRecord, ...] = ()
         call_started = False
+        local_projection = False
+        response_accounting: dict[str, int] | None = None
+        accounting_attempted = False
         if self.observer is not None:
             self.observer.begin_turn()
         try:
@@ -479,10 +482,14 @@ class CompatibilityClient:
                 records = self._consume_proxy_observations(payload, require_records=True)
                 raise PreflightFailure("preflight_response_malformed")
             local_projection = _is_local_projection(response)
+            if self.request_accounting is not None:
+                response_accounting = _take_proxy_response_accounting(response)
             records = self._consume_proxy_observations(payload, require_records=not local_projection)
             if self.request_accounting is not None:
+                assert response_accounting is not None
+                accounting_attempted = True
                 self.request_accounting.record_success(
-                    response,
+                    response_accounting,
                     records,
                     local_projection=local_projection,
                 )
@@ -502,7 +509,14 @@ class CompatibilityClient:
                 and self.request_accounting is not None
                 and len(self.request_accounting.records) == prior_request_count
             ):
-                self.request_accounting.record_failure(records, error)
+                if response_accounting is not None and not accounting_attempted:
+                    self.request_accounting.record_success(
+                        response_accounting,
+                        records,
+                        local_projection=local_projection,
+                    )
+                else:
+                    self.request_accounting.record_failure(records, error)
             raise
 
     def _consume_proxy_observations(

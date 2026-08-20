@@ -82,6 +82,7 @@ _REQUEST_RECORD_KEYS = frozenset(
         "successful_attempt_count",
         "phase_counts",
         "retry_attempt_count",
+        "correction_count",
         "blocked_duplicate_count",
         "blocked_stall_count",
     }
@@ -177,6 +178,7 @@ class RequestAccountingRecord:
     retry_attempt_count: int
     blocked_duplicate_count: int
     blocked_stall_count: int
+    correction_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -234,6 +236,7 @@ def read_request_accounting_ledger(path: Path) -> tuple[RequestAccountingRecord,
                 retry_attempt_count=value["retry_attempt_count"],
                 blocked_duplicate_count=value["blocked_duplicate_count"],
                 blocked_stall_count=value["blocked_stall_count"],
+                correction_count=value["correction_count"],
             )
             if not _valid_request_scalars(record):
                 raise ValueError
@@ -277,6 +280,7 @@ def write_request_accounting_ledger(
                     "successful_attempt_count": record.successful_attempt_count,
                     "phase_counts": dict(record.phase_counts),
                     "retry_attempt_count": record.retry_attempt_count,
+                    "correction_count": record.correction_count,
                     "blocked_duplicate_count": record.blocked_duplicate_count,
                     "blocked_stall_count": record.blocked_stall_count,
                 }
@@ -641,7 +645,7 @@ def _derive(
         "acquisition_count": acquisition,
         "finalization_count": finalization,
         "successful_corrections": sum(
-            item.retry_attempt_count for item in requests if item.outcome == "succeeded"
+            item.correction_count for item in requests if item.outcome == "succeeded"
         ),
         "total_retry_attempts": sum(item.retry_attempt_count for item in requests),
         "local_projection_count": sum(item.local_projection for item in requests),
@@ -752,6 +756,7 @@ def _attempt_partition_matches(
                 or record.attempt_count != 0
                 or record.successful_attempt_count != 0
                 or record.retry_attempt_count != 0
+                or record.correction_count != 0
                 or any(record.phase_counts.values())
             ):
                 return False
@@ -819,6 +824,7 @@ def _valid_request_scalars(record: object) -> bool:
         record.attempt_count,
         record.successful_attempt_count,
         record.retry_attempt_count,
+        record.correction_count,
         record.blocked_duplicate_count,
         record.blocked_stall_count,
         *phase_values,
