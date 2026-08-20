@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
 import types
+from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,8 +30,19 @@ from shiftedx_harness_proxy.qualification_contract import (
     load_runtime_outcome,
     read_model_boundary_observer_records,
 )
+from shiftedx_harness_proxy.qualification_reconciliation import (
+    ReconciliationFailure,
+    read_request_accounting_ledger,
+)
 
 _RUN_MANIFEST_SHA256 = "1" * 64
+
+
+def _lane_contract_digests(direct: str = "1" * 64, proxy: str = "2" * 64):
+    return {
+        "cold": {"direct": direct, "proxy": proxy},
+        "warm-prefix": {"direct": direct, "proxy": proxy},
+    }
 
 
 def test_load_model_evidence_binds_a_passed_private_artifact_to_stage_manifest_and_contract(tmp_path) -> None:
@@ -156,6 +170,11 @@ def test_runtime_outcome_binds_the_exact_passed_model_evidence_bytes(tmp_path) -
         "model_evidence_sha256": hashlib.sha256(evidence.read_bytes()).hexdigest(),
         "output_ledger_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
         "output_record_count": 1,
+        "proxy_reconciliation_sha256": None,
+        "campaign_id_sha256": "c" * 64,
+        "slot_ordinal": 0,
+        "cache_lane": "preflight",
+        "pair_index": 0,
     }
     outcome.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")), encoding="utf-8")
     outcome.chmod(0o600)
@@ -311,6 +330,8 @@ def test_client_failure_is_recorded_without_response_body_and_run_continues(monk
             str(direct_outcome),
             "--proxy-observer-ledger",
             str(tmp_path / "scored-observer.jsonl"),
+            "--proxy-request-ledger",
+            str(tmp_path / "scored-proxy-requests.jsonl"),
         ],
     )
 
@@ -543,12 +564,8 @@ def test_model_boundary_fingerprint_binds_only_safe_cache_mode_policy(monkeypatc
     bypass = copy.deepcopy(normal)
     bypass["metadata"] = {"cache_mode": "bypass"}
 
-    normal_fingerprint = runner.model_boundary_fingerprint(
-        runner.PhasePlanner().plan(normal, phase="acquisition")
-    )
-    bypass_fingerprint = runner.model_boundary_fingerprint(
-        runner.PhasePlanner().plan(bypass, phase="acquisition")
-    )
+    normal_fingerprint = runner.model_boundary_fingerprint(runner.PhasePlanner().plan(normal, phase="acquisition"))
+    bypass_fingerprint = runner.model_boundary_fingerprint(runner.PhasePlanner().plan(bypass, phase="acquisition"))
 
     assert normal_fingerprint.fields["cache_mode_policy"] is None
     assert bypass_fingerprint.fields["cache_mode_policy"] == "bypass"
@@ -612,7 +629,7 @@ def test_preflight_ledger_retains_only_hashes_and_allowlisted_outcomes(monkeypat
         ],
         source_commit="a" * 40,
         image_digest="sha256:" + "0" * 64,
-        contract_digests={"direct": "one", "proxy": "two"},
+        contract_digests=_lane_contract_digests(),
         run_manifest_sha256=_RUN_MANIFEST_SHA256,
     )
 
@@ -666,6 +683,7 @@ def test_scored_mode_requires_a_successful_paired_preflight_and_exact_provenance
             candidate_image_digest="sha256:" + "0" * 64,
             contract_digest="not-the-current-contract",
             arm="direct",
+            cache_lane="warm-prefix",
             model="model",
             run_manifest_sha256=_RUN_MANIFEST_SHA256,
         )
@@ -718,6 +736,526 @@ def test_proxy_preflight_counts_native_tool_calls_from_returned_responses(monkey
     runner._run_preflight_path(client, payload, tool_required=True)
 
     assert client.observation(tool_required=True, original_payload=payload).native_acquisition_tool_calls == 1
+
+
+def test_proxy_request_accounting_records_one_safe_row_for_the_actual_downstream_call(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    observer_path = tmp_path / "observer.jsonl"
+    payload = runner.request_payload(scenario, model="private-model", proxy_policy=True)
+    planner = runner.PhasePlanner()
+
+    class ProxyModel:
+        def complete(self, _payload, *, stream=False):
+            assert stream is False
+            for sequence, phase in enumerate(("acquisition", "acquisition", "finalization"), start=1):
+                observed = planner.plan(payload, phase=phase)
+                observed["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
+                _append_observer_record(runner, observer_path, observed, sequence)
+            return {
+                "content": '{"status":"passed"}',
+                "tool_calls": [],
+                runner.PROXY_RESPONSE_ACCOUNTING: {
+                    "upstream_calls": 3,
+                    "corrections": 1,
+                    "blocked_duplicates": 2,
+                    "blocked_stalls": 1,
+                },
+            }
+
+    accounting = runner.ProxyRequestAccounting()
+    client = runner.CompatibilityClient(
+        ProxyModel(),
+        arm="proxy",
+        scenario_order=[scenario.case_id],
+        proxy_policy=True,
+        observer=runner.ModelBoundaryObserverCursor(observer_path, [scenario.case_id]),
+        request_accounting=accounting,
+    )
+
+    response = client.complete(payload)
+
+    assert runner.PROXY_RESPONSE_ACCOUNTING not in response
+    assert accounting.records == (
+        runner.ProxyRequestRecord(
+            sequence=1,
+            outcome="succeeded",
+            local_projection=False,
+            attempt_sequence_start=1,
+            attempt_sequence_end=3,
+            attempt_count=3,
+            successful_attempt_count=3,
+            phase_counts={"acquisition": 2, "finalization": 1},
+            retry_attempt_count=1,
+            blocked_duplicate_count=2,
+            blocked_stall_count=1,
+        ),
+    )
+
+
+def test_proxy_request_accounting_records_local_projection_with_exactly_zero_attempts(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    observer_path = tmp_path / "observer.jsonl"
+
+    class ProjectingProxy:
+        def complete(self, _payload, *, stream=False):
+            assert stream is False
+            return {
+                LOCAL_PROJECTION_EXTENSION: local_projection_accounting(),
+                runner.PROXY_RESPONSE_ACCOUNTING: {
+                    "upstream_calls": 0,
+                    "corrections": 0,
+                    "blocked_duplicates": 0,
+                    "blocked_stalls": 0,
+                },
+            }
+
+    accounting = runner.ProxyRequestAccounting()
+    client = runner.CompatibilityClient(
+        ProjectingProxy(),
+        arm="proxy",
+        scenario_order=[scenario.case_id],
+        proxy_policy=True,
+        observer=runner.ModelBoundaryObserverCursor(observer_path, [scenario.case_id]),
+        request_accounting=accounting,
+    )
+
+    client.complete(runner.request_payload(scenario, model="model", proxy_policy=True))
+
+    assert accounting.records[0] == runner.ProxyRequestRecord(
+        sequence=1,
+        outcome="succeeded",
+        local_projection=True,
+        attempt_sequence_start=None,
+        attempt_sequence_end=None,
+        attempt_count=0,
+        successful_attempt_count=0,
+        phase_counts={"acquisition": 0, "finalization": 0},
+        retry_attempt_count=0,
+        blocked_duplicate_count=0,
+        blocked_stall_count=0,
+    )
+    assert not observer_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("error", "outcome"),
+    [
+        (ConnectionError("private transport"), "failed"),
+        (TimeoutError("private timeout"), "deadline"),
+        (asyncio.CancelledError("private cancellation"), "cancelled"),
+    ],
+)
+def test_proxy_request_accounting_classifies_failed_deadline_and_cancelled_calls(monkeypatch, tmp_path, error, outcome):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    observer_path = tmp_path / "observer.jsonl"
+    payload = runner.request_payload(scenario, model="model", proxy_policy=True)
+    observed = runner.PhasePlanner().plan(payload, phase="acquisition")
+    observed["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
+
+    class FailingProxy:
+        def complete(self, _payload, *, stream=False):
+            assert stream is False
+            _append_observer_record(runner, observer_path, observed, 1, cache=False, status_code=None)
+            raise error
+
+    accounting = runner.ProxyRequestAccounting()
+    client = runner.CompatibilityClient(
+        FailingProxy(),
+        arm="proxy",
+        scenario_order=[scenario.case_id],
+        proxy_policy=True,
+        observer=runner.ModelBoundaryObserverCursor(observer_path, [scenario.case_id]),
+        request_accounting=accounting,
+    )
+
+    with pytest.raises(type(error)):
+        client.complete(payload)
+
+    assert accounting.records[0] == runner.ProxyRequestRecord(
+        sequence=1,
+        outcome=outcome,
+        local_projection=False,
+        attempt_sequence_start=1,
+        attempt_sequence_end=1,
+        attempt_count=1,
+        successful_attempt_count=0,
+        phase_counts={"acquisition": 1, "finalization": 0},
+        retry_attempt_count=0,
+        blocked_duplicate_count=0,
+        blocked_stall_count=0,
+    )
+
+
+@pytest.mark.parametrize("failure_kind", ["cache", "observer"])
+def test_proxy_request_accounting_is_exactly_once_after_post_response_validation_failure(
+    monkeypatch, tmp_path, failure_kind
+):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    observer_path = tmp_path / "observer.jsonl"
+    payload = runner.request_payload(scenario, model="model", proxy_policy=True)
+    observed = runner.PhasePlanner().plan(payload, phase="acquisition")
+    observed["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
+    if failure_kind == "observer":
+        observed["top_k"] = 999
+
+    class Proxy:
+        def complete(self, _payload, *, stream=False):
+            assert stream is False
+            _append_observer_record(
+                runner,
+                observer_path,
+                observed,
+                1,
+                cache=failure_kind != "cache",
+            )
+            return {
+                "content": "",
+                "tool_calls": [],
+                runner.PROXY_RESPONSE_ACCOUNTING: {
+                    "upstream_calls": 1,
+                    "corrections": 0,
+                    "blocked_duplicates": 0,
+                    "blocked_stalls": 0,
+                },
+            }
+
+    accounting = runner.ProxyRequestAccounting()
+    client = runner.CompatibilityClient(
+        Proxy(),
+        arm="proxy",
+        scenario_order=[scenario.case_id],
+        proxy_policy=True,
+        observer=runner.ModelBoundaryObserverCursor(observer_path, [scenario.case_id]),
+        require_cache_evidence=True,
+        request_accounting=accounting,
+    )
+
+    with pytest.raises(runner.PreflightFailure):
+        client.complete(payload)
+
+    assert len(accounting.records) == 1
+    assert accounting.records[0].outcome == "failed"
+    assert accounting.records[0].attempt_sequence_start == 1
+    assert accounting.records[0].attempt_sequence_end == 1
+    assert accounting.records[0].attempt_count == 1
+
+
+def test_proxy_http_client_projects_only_exact_safe_telemetry_headers(monkeypatch) -> None:
+    runner = load_runner(monkeypatch)
+    headers = Message()
+    headers["X-Shiftedx-Upstream-Calls"] = "3"
+    headers["X-Shiftedx-Corrections"] = "1"
+    headers["X-Shiftedx-Blocked-Duplicates"] = "2"
+    headers["X-Shiftedx-Blocked-Stalls"] = "0"
+    headers["X-Private-Diagnostic"] = "must-not-survive"
+
+    class Response:
+        def __init__(self):
+            self.headers = headers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return b'{"choices":[{"message":{"content":"ok"}}]}'
+
+        def geturl(self):
+            return "http://proxy.invalid/v1/chat/completions"
+
+    monkeypatch.setattr(runner._NO_PROXY_OPENER, "open", lambda *_args, **_kwargs: Response())
+    client = runner.ProjectionAwareOpenAIClient("http://proxy.invalid/v1")
+    client.capture_proxy_accounting = True
+    client.timeout_s = 1.0
+    client._request = lambda _payload: SimpleNamespace(full_url="http://proxy.invalid/v1/chat/completions")
+
+    response = client.complete({"model": "model"})
+
+    assert response[runner.PROXY_RESPONSE_ACCOUNTING] == {
+        "upstream_calls": 3,
+        "corrections": 1,
+        "blocked_duplicates": 2,
+        "blocked_stalls": 0,
+    }
+    assert "must-not-survive" not in json.dumps(response)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "duplicate", "nonnumeric", "negative", "leading-zero"])
+def test_proxy_http_client_rejects_missing_duplicate_or_noncanonical_accounting_headers(monkeypatch, mutation) -> None:
+    runner = load_runner(monkeypatch)
+    headers = Message()
+    for name in (
+        "Upstream-Calls",
+        "Corrections",
+        "Blocked-Duplicates",
+        "Blocked-Stalls",
+    ):
+        headers[f"X-Shiftedx-{name}"] = "0"
+    if mutation == "missing":
+        del headers["X-Shiftedx-Corrections"]
+    elif mutation == "duplicate":
+        headers["X-Shiftedx-Corrections"] = "7"
+    elif mutation == "nonnumeric":
+        headers.replace_header("X-Shiftedx-Corrections", "private-value")
+    elif mutation == "negative":
+        headers.replace_header("X-Shiftedx-Corrections", "-1")
+    else:
+        headers.replace_header("X-Shiftedx-Corrections", "01")
+
+    with pytest.raises(runner.PreflightFailure, match="^proxy response accounting is unavailable$"):
+        runner._proxy_accounting_from_headers(headers)
+
+
+def test_proxy_http_transport_disables_ambient_proxies_and_rejects_redirects(monkeypatch) -> None:
+    monkeypatch.setenv("HTTPS_PROXY", "http://private-proxy.invalid")
+    runner = load_runner(monkeypatch)
+    redirect_handlers = [
+        handler for handler in runner._NO_PROXY_OPENER.handlers if isinstance(handler, runner._RejectAllRedirects)
+    ]
+
+    assert runner._NO_PROXY_HANDLER.proxies == {}
+    assert len(redirect_handlers) == 1
+    assert redirect_handlers[0].redirect_request(None, None, None, None, None, None) is None
+
+
+def test_proxy_http_client_accepts_canonical_zero_header_local_projection(monkeypatch) -> None:
+    runner = load_runner(monkeypatch)
+    body = json.dumps(
+        {
+            "choices": [{"message": {"content": '{"status":"passed"}'}}],
+            LOCAL_PROJECTION_EXTENSION: local_projection_accounting(),
+        }
+    ).encode()
+
+    class Response:
+        headers = Message()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return body
+
+        def geturl(self):
+            return "http://proxy.invalid/v1/chat/completions"
+
+    monkeypatch.setattr(runner._NO_PROXY_OPENER, "open", lambda *_args, **_kwargs: Response())
+    client = runner.ProjectionAwareOpenAIClient("http://proxy.invalid/v1")
+    client.capture_proxy_accounting = True
+    client.timeout_s = 1.0
+    client._request = lambda _payload: SimpleNamespace(full_url="http://proxy.invalid/v1/chat/completions")
+
+    response = client.complete({"model": "model"})
+
+    assert response[runner.PROXY_RESPONSE_ACCOUNTING] == {
+        "upstream_calls": 0,
+        "corrections": 0,
+        "blocked_duplicates": 0,
+        "blocked_stalls": 0,
+    }
+    assert response[LOCAL_PROJECTION_EXTENSION]["origin"] == "local_projection"
+
+
+def test_proxy_http_client_rejects_oversized_or_redirected_responses(monkeypatch) -> None:
+    runner = load_runner(monkeypatch)
+
+    class Response:
+        headers = Message()
+
+        def __init__(self, *, redirected=False, oversized=False):
+            self.redirected = redirected
+            self.oversized = oversized
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, limit):
+            return b"x" * limit if self.oversized else b"{}"
+
+        def geturl(self):
+            return "http://redirect.invalid/" if self.redirected else "http://proxy.invalid/v1/chat/completions"
+
+    client = runner.ProjectionAwareOpenAIClient("http://proxy.invalid/v1")
+    client.capture_proxy_accounting = True
+    client.timeout_s = 1.0
+    client._request = lambda _payload: SimpleNamespace(full_url="http://proxy.invalid/v1/chat/completions")
+    monkeypatch.setattr(runner._NO_PROXY_OPENER, "open", lambda *_args, **_kwargs: Response(redirected=True))
+    with pytest.raises(runner.PreflightFailure, match="final URL differed"):
+        client.complete({"model": "model"})
+
+    monkeypatch.setattr(runner._NO_PROXY_OPENER, "open", lambda *_args, **_kwargs: Response(oversized=True))
+    with pytest.raises(runner.PreflightFailure, match="exceeded size limit"):
+        client.complete({"model": "model"})
+
+
+def test_proxy_http_client_suppresses_private_malformed_body_and_transport_causes(monkeypatch) -> None:
+    runner = load_runner(monkeypatch)
+    private_marker = "private-response-and-endpoint-marker"
+
+    class MalformedResponse:
+        headers = Message()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return (private_marker + "{").encode()
+
+        def geturl(self):
+            return "http://proxy.invalid/v1/chat/completions"
+
+    client = runner.ProjectionAwareOpenAIClient("http://proxy.invalid/v1")
+    client.capture_proxy_accounting = True
+    client.timeout_s = 1.0
+    client._request = lambda _payload: SimpleNamespace(full_url="http://proxy.invalid/v1/chat/completions")
+    monkeypatch.setattr(runner._NO_PROXY_OPENER, "open", lambda *_args, **_kwargs: MalformedResponse())
+
+    with pytest.raises(runner.PreflightFailure) as malformed:
+        client.complete({"model": "model"})
+    assert str(malformed.value) == "proxy response is malformed"
+    assert malformed.value.__cause__ is None
+    assert private_marker not in str(malformed.value)
+
+    private_transport = runner.urllib.error.URLError(private_marker)
+    monkeypatch.setattr(
+        runner._NO_PROXY_OPENER,
+        "open",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(private_transport),
+    )
+    with pytest.raises(ConnectionError) as transport:
+        client.complete({"model": "model"})
+    assert str(transport.value) == "proxy transport failed"
+    assert transport.value.__cause__ is None
+    assert private_marker not in str(transport.value)
+
+
+def test_proxy_http_504_is_body_free_and_classified_as_deadline(monkeypatch) -> None:
+    runner = load_runner(monkeypatch)
+    failure = runner.urllib.error.HTTPError(
+        "http://proxy.invalid/v1/chat/completions",
+        504,
+        "private reason",
+        Message(),
+        io.BytesIO(b"private response body and credential"),
+    )
+    monkeypatch.setattr(runner._NO_PROXY_OPENER, "open", lambda *_args, **_kwargs: (_ for _ in ()).throw(failure))
+    client = runner.ProjectionAwareOpenAIClient("http://proxy.invalid/v1")
+    client.capture_proxy_accounting = True
+    client.timeout_s = 1.0
+    client._request = lambda _payload: SimpleNamespace(full_url="http://proxy.invalid/v1/chat/completions")
+
+    with pytest.raises(runner.ProxyHTTPFailure) as raised:
+        client.complete({"model": "model"})
+
+    assert raised.value.status_code == 504
+    assert raised.value.__cause__ is None
+    assert "private" not in str(raised.value)
+    accounting = runner.ProxyRequestAccounting()
+    accounting.record_failure((), raised.value)
+    assert accounting.records[0].outcome == "deadline"
+
+
+def test_proxy_request_ledger_is_exact_private_atomic_and_no_clobber(monkeypatch, tmp_path) -> None:
+    runner = load_runner(monkeypatch)
+    output = tmp_path / "proxy-requests.jsonl"
+    records = [
+        runner.ProxyRequestRecord(
+            sequence=1,
+            outcome="succeeded",
+            local_projection=False,
+            attempt_sequence_start=1,
+            attempt_sequence_end=2,
+            attempt_count=2,
+            successful_attempt_count=2,
+            phase_counts={"acquisition": 1, "finalization": 1},
+            retry_attempt_count=0,
+            blocked_duplicate_count=1,
+            blocked_stall_count=0,
+        ),
+        runner.ProxyRequestRecord(
+            sequence=2,
+            outcome="succeeded",
+            local_projection=True,
+            attempt_sequence_start=None,
+            attempt_sequence_end=None,
+            attempt_count=0,
+            successful_attempt_count=0,
+            phase_counts={"acquisition": 0, "finalization": 0},
+            retry_attempt_count=0,
+            blocked_duplicate_count=0,
+            blocked_stall_count=0,
+        ),
+    ]
+
+    runner.write_request_accounting_ledger(output, records)
+
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert rows == [
+        {
+            "sequence": 1,
+            "outcome": "succeeded",
+            "local_projection": False,
+            "attempt_sequence_start": 1,
+            "attempt_sequence_end": 2,
+            "attempt_count": 2,
+            "successful_attempt_count": 2,
+            "phase_counts": {"acquisition": 1, "finalization": 1},
+            "retry_attempt_count": 0,
+            "blocked_duplicate_count": 1,
+            "blocked_stall_count": 0,
+        },
+        {
+            "sequence": 2,
+            "outcome": "succeeded",
+            "local_projection": True,
+            "attempt_sequence_start": None,
+            "attempt_sequence_end": None,
+            "attempt_count": 0,
+            "successful_attempt_count": 0,
+            "phase_counts": {"acquisition": 0, "finalization": 0},
+            "retry_attempt_count": 0,
+            "blocked_duplicate_count": 0,
+            "blocked_stall_count": 0,
+        },
+    ]
+    assert output.stat().st_mode & 0o777 == 0o600
+    prior = output.read_bytes()
+    with pytest.raises(ReconciliationFailure, match="reconciliation_request_ledger_exists"):
+        runner.write_request_accounting_ledger(output, records)
+    assert output.read_bytes() == prior
+
+
+def test_proxy_request_ledger_rejects_symlink_and_untyped_private_input(monkeypatch, tmp_path) -> None:
+    runner = load_runner(monkeypatch)
+    target = tmp_path / "prior.jsonl"
+    target.write_text('{"private":"prior"}\n', encoding="utf-8")
+    target.chmod(0o600)
+    symlink = tmp_path / "proxy-requests.jsonl"
+    symlink.symlink_to(target)
+
+    with pytest.raises(ReconciliationFailure, match="reconciliation_request_ledger_exists"):
+        runner.write_request_accounting_ledger(symlink, [])
+    assert target.read_text(encoding="utf-8") == '{"private":"prior"}\n'
+
+    invalid = tmp_path / "invalid.jsonl"
+    with pytest.raises(ReconciliationFailure, match="reconciliation_request_ledger_invalid"):
+        runner.write_request_accounting_ledger(invalid, [{"private_prompt": "must-not-survive"}])
+    assert not invalid.exists()
 
 
 def test_direct_client_records_each_actual_attempt_in_sequence_with_safe_cache(monkeypatch):
@@ -1034,11 +1572,20 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
                     sequence[0] += 1
                     _append_observer_record(runner, observer, observed, sequence[0])
             if payload.get("tools") and not any(message.get("role") == "tool" for message in payload["messages"]):
-                return _cache_response(
+                response = _cache_response(
                     tool_calls=[{"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}],
                     bypass=True,
                 )
-            return _cache_response(content='{"status":"passed"}', bypass=True)
+            else:
+                response = _cache_response(content='{"status":"passed"}', bypass=True)
+            if self.is_proxy:
+                response[runner.PROXY_RESPONSE_ACCOUNTING] = {
+                    "upstream_calls": len(observed_payloads),
+                    "corrections": 0,
+                    "blocked_duplicates": 0,
+                    "blocked_stalls": 0,
+                }
+            return response
 
     runner.ProjectionAwareOpenAIClient = FakeClient
     metric_values = iter(({"acquisition": 0, "finalization": 0}, {"acquisition": 2, "finalization": 1}))
@@ -1066,6 +1613,7 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
         runtime_attestation=runtime_attestation,
         cache_mode="bypass",
         direct_model_attempt_ledger=tmp_path / "direct-attempts.jsonl",
+        proxy_request_ledger=tmp_path / "proxy-requests.jsonl",
         output=tmp_path / "preflight.jsonl",
     )
 
@@ -1190,7 +1738,7 @@ def test_failed_preflight_writes_safe_unscored_ledger_and_never_creates_scored_o
             ],
             source_commit="a" * 40,
             image_digest="sha256:" + "0" * 64,
-            contract_digests={"direct": "one", "proxy": "two"},
+            contract_digests=_lane_contract_digests(),
             run_manifest_sha256=_RUN_MANIFEST_SHA256,
         )
 
@@ -1207,9 +1755,7 @@ def test_scoring_gate_rejects_a_different_scenario_contract(monkeypatch, tmp_pat
     source_commit = _source_commit()
     image_digest = "sha256:" + "0" * 64
     ledger = tmp_path / "preflight.jsonl"
-    _write_passing_preflight(
-        runner, ledger, source_commit, image_digest, contract_digests={"direct": "one", "proxy": "two"}
-    )
+    _write_passing_preflight(runner, ledger, source_commit, image_digest, contract_digests=_lane_contract_digests())
 
     with pytest.raises(SystemExit, match="qualification contract"):
         runner.require_scoring_gate(
@@ -1219,6 +1765,7 @@ def test_scoring_gate_rejects_a_different_scenario_contract(monkeypatch, tmp_pat
             candidate_image_digest=image_digest,
             contract_digest="different",
             arm="direct",
+            cache_lane="warm-prefix",
             model="model",
             run_manifest_sha256=_RUN_MANIFEST_SHA256,
         )
@@ -1272,7 +1819,7 @@ def test_preflight_ledger_never_overwrites_existing_evidence(monkeypatch, tmp_pa
             [],
             source_commit="a" * 40,
             image_digest="sha256:" + "0" * 64,
-            contract_digests={"direct": "one", "proxy": "two"},
+            contract_digests=_lane_contract_digests(),
             run_manifest_sha256="1" * 64,
         )
 
@@ -1334,7 +1881,8 @@ def test_scoring_gate_rejects_manifest_and_model_identity_mismatch(monkeypatch, 
             preflight_ledger=ledger,
             candidate_source_commit=source_commit,
             candidate_image_digest=image_digest,
-            contract_digest=summary["qualification_contract_digests"]["direct"],
+            contract_digest=summary["qualification_contract_digests"]["warm-prefix"]["direct"],
+            cache_lane="warm-prefix",
             arm="direct",
             model="model",
             run_manifest_sha256="2" * 64,
@@ -1345,7 +1893,8 @@ def test_scoring_gate_rejects_manifest_and_model_identity_mismatch(monkeypatch, 
             preflight_ledger=ledger,
             candidate_source_commit=source_commit,
             candidate_image_digest=image_digest,
-            contract_digest=summary["qualification_contract_digests"]["direct"],
+            contract_digest=summary["qualification_contract_digests"]["warm-prefix"]["direct"],
+            cache_lane="warm-prefix",
             arm="direct",
             model="other-model",
             run_manifest_sha256=_RUN_MANIFEST_SHA256,
@@ -1376,7 +1925,8 @@ def test_direct_scoring_requires_the_exact_preflight_runtime_attestation(monkeyp
         preflight_ledger=ledger,
         candidate_source_commit=source_commit,
         candidate_image_digest=image_digest,
-        contract_digest=summary["qualification_contract_digests"]["direct"],
+        contract_digest=summary["qualification_contract_digests"]["warm-prefix"]["direct"],
+        cache_lane="warm-prefix",
         arm="direct",
         model="model",
         run_manifest_sha256=_RUN_MANIFEST_SHA256,
@@ -1393,7 +1943,8 @@ def test_direct_scoring_requires_the_exact_preflight_runtime_attestation(monkeyp
             preflight_ledger=ledger,
             candidate_source_commit=source_commit,
             candidate_image_digest=image_digest,
-            contract_digest=summary["qualification_contract_digests"]["direct"],
+            contract_digest=summary["qualification_contract_digests"]["warm-prefix"]["direct"],
+            cache_lane="warm-prefix",
             arm="direct",
             model="model",
             run_manifest_sha256=_RUN_MANIFEST_SHA256,
@@ -1438,7 +1989,8 @@ def test_scoring_gate_rejects_invalid_preflight_runtime_outcome(monkeypatch, tmp
             preflight_ledger=ledger,
             candidate_source_commit=source_commit,
             candidate_image_digest=image_digest,
-            contract_digest=summary["qualification_contract_digests"]["direct"],
+            contract_digest=summary["qualification_contract_digests"]["warm-prefix"]["direct"],
+            cache_lane="warm-prefix",
             arm="direct",
             model="model",
             run_manifest_sha256=_RUN_MANIFEST_SHA256,
@@ -1500,7 +2052,8 @@ def test_proxy_scoring_requires_a_passed_direct_runtime_outcome(monkeypatch, tmp
             preflight_ledger=ledger,
             candidate_source_commit=source_commit,
             candidate_image_digest=image_digest,
-            contract_digest=summary["qualification_contract_digests"]["proxy"],
+            contract_digest=summary["qualification_contract_digests"]["warm-prefix"]["proxy"],
+            cache_lane="warm-prefix",
             arm="proxy",
             model="model",
             run_manifest_sha256=_RUN_MANIFEST_SHA256,
@@ -1537,7 +2090,8 @@ def test_proxy_scoring_rejects_coordinated_preflight_attestation_and_outcome_rep
             preflight_ledger=ledger,
             candidate_source_commit=source_commit,
             candidate_image_digest=image_digest,
-            contract_digest=summary["qualification_contract_digests"]["proxy"],
+            contract_digest=summary["qualification_contract_digests"]["warm-prefix"]["proxy"],
+            cache_lane="warm-prefix",
             arm="proxy",
             model="model",
             run_manifest_sha256=_RUN_MANIFEST_SHA256,
@@ -1558,9 +2112,7 @@ def test_proxy_scoring_rejects_runtime_contract_drift_before_provenance_or_outpu
     image_digest = "sha256:" + "0" * 64
     ledger = tmp_path / "preflight.jsonl"
     preflight_attestation = _write_passing_preflight(runner, ledger, source_commit, image_digest)
-    preflight_outcome, direct_outcome = _write_passing_scored_prerequisites(
-        tmp_path, ledger, preflight_attestation
-    )
+    preflight_outcome, direct_outcome = _write_passing_scored_prerequisites(tmp_path, ledger, preflight_attestation)
     scored_attestation = _write_runtime_attestation(
         tmp_path / "scored-proxy-runtime-attestation.json",
         stage="scored_proxy",
@@ -1583,7 +2135,8 @@ def test_proxy_scoring_rejects_runtime_contract_drift_before_provenance_or_outpu
             preflight_ledger=ledger,
             candidate_source_commit=source_commit,
             candidate_image_digest=image_digest,
-            contract_digest=summary["qualification_contract_digests"]["proxy"],
+            contract_digest=summary["qualification_contract_digests"]["warm-prefix"]["proxy"],
+            cache_lane="warm-prefix",
             arm="proxy",
             model="model",
             run_manifest_sha256=_RUN_MANIFEST_SHA256,
@@ -1623,7 +2176,8 @@ def test_proxy_scoring_requires_a_fresh_runtime_instance(monkeypatch, tmp_path):
             preflight_ledger=ledger,
             candidate_source_commit=source_commit,
             candidate_image_digest=image_digest,
-            contract_digest=summary["qualification_contract_digests"]["proxy"],
+            contract_digest=summary["qualification_contract_digests"]["warm-prefix"]["proxy"],
+            cache_lane="warm-prefix",
             arm="proxy",
             model="model",
             run_manifest_sha256=_RUN_MANIFEST_SHA256,
@@ -1800,12 +2354,70 @@ def test_scored_proxy_cli_requires_a_new_observer_ledger(monkeypatch, tmp_path):
         runner.main()
 
 
+def test_scored_proxy_cli_requires_a_fresh_request_accounting_ledger_before_client(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    source_commit = _source_commit()
+    image_digest = "sha256:" + "0" * 64
+    preflight = tmp_path / "preflight.jsonl"
+    preflight_attestation = _write_passing_preflight(runner, preflight, source_commit, image_digest)
+    preflight_outcome, direct_outcome = _write_passing_scored_prerequisites(tmp_path, preflight, preflight_attestation)
+    runtime_attestation = _write_runtime_attestation(
+        tmp_path / "scored-proxy-runtime-attestation.json",
+        stage="scored_proxy",
+        source_commit=source_commit,
+        image_digest=image_digest,
+        runtime_instance_sha256="5" * 64,
+    )
+
+    class UnexpectedClient:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("request-accounting path must be required before client construction")
+
+    runner.ProjectionAwareOpenAIClient = UnexpectedClient
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_paired_agentic_trial.py",
+            "--base-url",
+            "http://proxy.invalid/v1",
+            "--model",
+            "model",
+            "--output",
+            str(tmp_path / "scored.jsonl"),
+            "--variant",
+            "proxy",
+            "--proxy-policy",
+            "--preflight-ledger",
+            str(preflight),
+            "--candidate-source-commit",
+            source_commit,
+            "--candidate-image-digest",
+            image_digest,
+            "--run-manifest-sha256",
+            _RUN_MANIFEST_SHA256,
+            "--runtime-attestation",
+            str(runtime_attestation),
+            "--preflight-runtime-outcome",
+            str(preflight_outcome),
+            "--direct-runtime-outcome",
+            str(direct_outcome),
+            "--proxy-observer-ledger",
+            str(tmp_path / "observer.jsonl"),
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="requires --proxy-request-ledger"):
+        runner.main()
+
+
 def test_scored_proxy_rows_use_actual_observer_fingerprints_and_failures_keep_safe_subset(monkeypatch, tmp_path):
     runner = load_runner(monkeypatch)
     source_commit = _source_commit()
     image_digest = "sha256:" + "0" * 64
     preflight = tmp_path / "preflight.jsonl"
     observer_path = tmp_path / "scored-observer.jsonl"
+    request_path = tmp_path / "scored-proxy-requests.jsonl"
     output = tmp_path / "scored.jsonl"
     preflight_attestation = _write_passing_preflight(runner, preflight, source_commit, image_digest)
     preflight_outcome, direct_outcome = _write_passing_scored_prerequisites(tmp_path, preflight, preflight_attestation)
@@ -1828,7 +2440,16 @@ def test_scored_proxy_rows_use_actual_observer_fingerprints_and_failures_keep_sa
             observed["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
             self.sequence += 1
             _append_observer_record(runner, observer_path, observed, self.sequence)
-            return {"content": "", "tool_calls": [{"id": f"call-{self.sequence}"}]}
+            return {
+                "content": "",
+                "tool_calls": [{"id": f"call-{self.sequence}"}],
+                runner.PROXY_RESPONSE_ACCOUNTING: {
+                    "upstream_calls": 1,
+                    "corrections": 0,
+                    "blocked_duplicates": 0,
+                    "blocked_stalls": 0,
+                },
+            }
 
     def run_cases(*, client, model, output_path, case_id, **_kwargs):
         scenario = next(item for item in runner.scenario_set("expanded") if item.case_id == case_id)
@@ -1873,6 +2494,8 @@ def test_scored_proxy_rows_use_actual_observer_fingerprints_and_failures_keep_sa
             str(direct_outcome),
             "--proxy-observer-ledger",
             str(observer_path),
+            "--proxy-request-ledger",
+            str(request_path),
         ],
     )
 
@@ -1889,6 +2512,12 @@ def test_scored_proxy_rows_use_actual_observer_fingerprints_and_failures_keep_sa
     serialized = output.read_text()
     assert "private-scored-body" not in serialized
     assert "private prompt marker" not in serialized
+    request_records = read_request_accounting_ledger(request_path)
+    assert [record.sequence for record in request_records] == [1, 2]
+    assert [(record.attempt_sequence_start, record.attempt_sequence_end) for record in request_records] == [
+        (1, 1),
+        (2, 2),
+    ]
 
 
 def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_records(monkeypatch, tmp_path):
@@ -1898,6 +2527,7 @@ def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_re
     preflight = tmp_path / "preflight.jsonl"
     observer_path = tmp_path / "scored-observer.jsonl"
     output = tmp_path / "scored.jsonl"
+    request_path = tmp_path / "scored-proxy-requests.jsonl"
     preflight_attestation = _write_passing_preflight(runner, preflight, source_commit, image_digest)
     preflight_outcome, direct_outcome = _write_passing_scored_prerequisites(tmp_path, preflight, preflight_attestation)
     runtime_attestation = _write_runtime_attestation(
@@ -1911,7 +2541,14 @@ def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_re
 
     def complete(self, _payload, *, stream=False):
         assert stream is False
-        return self._normalize({LOCAL_PROJECTION_EXTENSION: local_projection_accounting()}, wall_s=0.1, ttft_s=None)
+        response = self._normalize({LOCAL_PROJECTION_EXTENSION: local_projection_accounting()}, wall_s=0.1, ttft_s=None)
+        response[runner.PROXY_RESPONSE_ACCOUNTING] = {
+            "upstream_calls": 0,
+            "corrections": 0,
+            "blocked_duplicates": 0,
+            "blocked_stalls": 0,
+        }
+        return response
 
     def run_cases(*, client, model, output_path, case_id, **_kwargs):
         clients.append(client)
@@ -1956,6 +2593,8 @@ def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_re
             str(direct_outcome),
             "--proxy-observer-ledger",
             str(observer_path),
+            "--proxy-request-ledger",
+            str(request_path),
         ],
     )
 
@@ -1973,6 +2612,9 @@ def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_re
     assert not observer_path.exists()
     assert all(client.attempt_records == () for client in clients)
     assert "private prompt marker" not in output.read_text()
+    request_records = read_request_accounting_ledger(request_path)
+    assert [record.sequence for record in request_records] == [1, 2]
+    assert all(record.local_projection and record.attempt_count == 0 for record in request_records)
 
 
 @pytest.mark.parametrize(
@@ -2198,7 +2840,7 @@ def _suffix_pair_observations(runner, proxy_system_mutation):
     ]
 
 
-def _append_observer_record(runner, path, payload, sequence, *, cache=True):
+def _append_observer_record(runner, path, payload, sequence, *, cache=True, status_code=200):
     fingerprint = runner.model_boundary_fingerprint(payload)
     bypass = fingerprint.fields["cache_mode_policy"] == "bypass"
     with path.open("a", encoding="utf-8") as handle:
@@ -2210,7 +2852,7 @@ def _append_observer_record(runner, path, payload, sequence, *, cache=True):
                     "digest": fingerprint.digest,
                     "fields": fingerprint.fields,
                     "response": {
-                        "status_code": 200,
+                        "status_code": status_code,
                         "cache": {
                             "prompt_tokens": 11,
                             "cached_tokens": 0 if bypass else 5,
@@ -2222,7 +2864,7 @@ def _append_observer_record(runner, path, payload, sequence, *, cache=True):
                             "request_session_bank_bypass": bypass,
                             "postcommit_stored": not bypass,
                         }
-                        if cache
+                        if cache and status_code is not None
                         else None,
                     },
                 },
@@ -2253,6 +2895,7 @@ def _preflight_args(tmp_path):
         proxy_base_url="http://proxy.invalid/v1",
         proxy_metrics_url="http://metrics.invalid",
         proxy_observer_ledger=tmp_path / "observer.jsonl",
+        proxy_request_ledger=tmp_path / "proxy-requests.jsonl",
         candidate_source_commit=source_commit,
         candidate_image_digest=image_digest,
         model="model",
@@ -2436,6 +3079,7 @@ def _write_runtime_outcome(
             stage={"preflight": "preflight", "scored-direct": "score-direct", "scored-proxy": "score-proxy"}[stage],
             model_identity_sha256=model_identity_sha256,
         )
+    slot_ordinal, cache_lane, pair_index = (0, "preflight", 0) if stage == "preflight" else (4, "warm-prefix", 1)
     document = {
         "schema_version": "1.0",
         "record_type": "qualification_runtime_outcome",
@@ -2448,6 +3092,11 @@ def _write_runtime_outcome(
         "model_evidence_sha256": hashlib.sha256(model_evidence.read_bytes()).hexdigest(),
         "output_ledger_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
         "output_record_count": output_record_count,
+        "proxy_reconciliation_sha256": None,
+        "campaign_id_sha256": "c" * 64,
+        "slot_ordinal": slot_ordinal,
+        "cache_lane": cache_lane,
+        "pair_index": pair_index,
     }
     path.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")), encoding="utf-8")
     path.chmod(0o600)
@@ -2516,15 +3165,12 @@ def _write_passing_preflight(runner, output, source_commit, image_digest, contra
     ]
     if contract_digests is None:
         scenarios = runner.scenario_set("expanded")
-        contract_digests = {
-            arm: runner.qualification_contract_digest(
-                [runner.request_payload(item, model="model", proxy_policy=arm == "proxy") for item in scenarios],
-                [item.case_id for item in scenarios],
-                policy_delta={"x-shiftedx-require-receipt": True} if arm == "proxy" else {},
-                run_manifest_sha256=_RUN_MANIFEST_SHA256,
-            )
-            for arm in ("direct", "proxy")
-        }
+        contract_digests = runner._qualification_contract_digests(
+            "model",
+            scenarios,
+            [item.case_id for item in scenarios],
+            _RUN_MANIFEST_SHA256,
+        )
     runtime_attestation_path = output.with_name(f"{output.stem}-runtime-attestation.json")
     _write_runtime_attestation(
         runtime_attestation_path,
