@@ -3,12 +3,13 @@
 [![CI](https://github.com/shiftedx/shiftedx-agent-harness-proxy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/shiftedx/shiftedx-agent-harness-proxy/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Status: v0.1 release candidate.** The supported v1 surface is implementation-complete, covered by
-213 automated tests, and verified by hardened multi-architecture image CI, dependency and image
-scanning, SBOM generation, provenance attestation, and bounded-load checks. Model-backed production
-qualification is pre-registered and requires an operator-approved model-server window; no stable
-package or container release has been promoted. See [Release status](RELEASE_STATUS.md), the
-[qualification plan](benchmark-reports/v1-qualification-plan.md), and the
+**Status: v0.1 release candidate — do not promote.** The supported v1 surface is
+implementation-complete, covered by 214 automated tests, and verified by hardened
+multi-architecture image CI, dependency and image scanning, SBOM generation, provenance
+attestation, and bounded-load checks. The first complete cold model-backed qualification missed
+the quality and observability gates, so no stable package or container release has been promoted.
+See [Release status](RELEASE_STATUS.md), the
+[qualification result](benchmark-reports/v1-qualification-result-2026-08-20.md), and the
 [operator runbook](docs/operator-runbook.md).
 
 A small, stateless policy proxy for OpenAI-compatible Chat Completions. It blocks repeated or
@@ -196,13 +197,14 @@ uv run mypy src
 ./scripts/docker-smoke.sh
 ```
 
-The release-candidate branch has 213 tests. CI also runs the near-body-limit admission soak,
+The release-candidate branch has 214 tests. CI also runs the near-body-limit admission soak,
 dependency audit, multi-architecture OCI build, hardened production-profile smoke, exact-image
 vulnerability/secret/misconfiguration scan, SBOM generation, release-manifest capture, and SLSA
 provenance attestation. The complete evidence boundary is summarized in
 [Release status](RELEASE_STATUS.md); benchmark methodology and frozen promotion gates are documented
-in [benchmarking](docs/benchmarking.md) and the
-[v1 qualification plan](benchmark-reports/v1-qualification-plan.md).
+in [benchmarking](docs/benchmarking.md), the
+[v1 qualification plan](benchmark-reports/v1-qualification-plan.md), and the
+[qualification result](benchmark-reports/v1-qualification-result-2026-08-20.md).
 
 This is an unreleased `0.1.0` release candidate. The source repository is suitable for review and
 evaluation, but no package or container image has been promoted as a stable public release.
