@@ -116,7 +116,7 @@ async def test_http_surface_auth_health_streaming_and_unknown_request_passthroug
             assert upstream.requests[-1]["vendor_extension"] == {"preserve": True}
             assert (await client.get("/readyz")).json() == {"status": "ready"}
             metrics = await client.get("/metrics", headers=headers)
-            assert "shiftedx_proxy_downstream_requests_total 1" in metrics.text
+            assert "shiftedx_proxy_downstream_requests_total 2" in metrics.text
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,8 @@ For each of at least three complete trials:
    corrections, projections, **upstream-model** prompt/completion tokens, wall time, weighted
    decode throughput, and upstream calls per downstream request. Report client-input tokenization
    separately only when it is actually available; a Local Projection never estimates it.
+   Reconcile the aggregate proxy upstream-attempt counter to the model server's authoritative
+   operation count, including retries and failures; report a zero delta or stop the candidate.
 6. Measure proxy-only processing latency around a scripted upstream and report p50/p95 separately
    from network and inference. The initial reference target is p95 under 15 ms, subject to measured
    revision rather than marketing claims.

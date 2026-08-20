@@ -189,6 +189,19 @@ an ordinary single upstream request.
 `shiftedx_proxy_phase_acquisition_total`, `shiftedx_proxy_phase_finalization_total`, and
 `shiftedx_proxy_phase_schema_rejections_total`. They have no request-derived labels or content.
 
+### Request and attempt accounting
+
+`shiftedx_proxy_downstream_requests_total` counts each Chat Completions request once after successful
+authentication and admission, before its body is read. Authentication, admission, and principal-rate
+rejections are outside that denominator and remain in their own rejection counters. `/v1/models` and
+readiness traffic are also outside it. `shiftedx_proxy_upstream_calls_total` retains its compatibility
+name and counts every actual upstream Chat Completions operation once: after an upstream slot has been
+acquired and immediately before delegation, including failed, cancelled, timed-out, malformed, and
+retried operations. A rejected upstream slot is not an attempt. The phase counters are the same
+post-slot count restricted to started acquisition or finalization operations; passthrough attempts do
+not affect either phase counter. All of these counters remain aggregate-only and prompt-, principal-,
+credential-, endpoint-, and payload-free.
+
 ### Local projection accounting
 
 A locally projected completion is a standard `chat.completion` response with an always-present
