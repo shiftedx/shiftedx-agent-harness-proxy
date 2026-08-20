@@ -28,6 +28,49 @@ an evaluation adapter, not benchmark or proxy policy derived from expected answe
 `--proxy-policy` only for the proxy endpoint. The benchmark runner's control profile remains
 `baseline` in both treatments so policy is not applied twice.
 
+## Parity preflight and score gate
+
+The replacement qualification uses the frozen sampler `temperature=0.0`, `top_p=0.95`,
+`top_k=20`, thinking enabled, reasoning effort `medium`, and `max_tokens=1024`. Temperature `1.0`
+is a distinct future experiment and must not share a ledger with this parity run.
+
+Before a scored command, run the paired preflight against the direct and proxy arms. It uses the
+same versioned phase planner on each arm while keeping the proxy's downstream request standard:
+tool acquisition has tools but no terminal grammar; forced finalization has terminal grammar but
+no tools. The proxy arm also compares its aggregate acquisition/finalization counter delta with
+the synthetic one-tool path. The preflight writes only `scored:false` hash-only rows; it never
+copies prompts, schemas, tool calls or arguments/results, model output, credentials, endpoints,
+or host paths.
+
+```bash
+uv run scripts/run_paired_agentic_trial.py \
+  --paired-preflight --model "$PUBLIC_MODEL_ID" --agentic-set expanded \
+  --direct-base-url "$DIRECT_URL" --proxy-base-url "$PROXY_URL" \
+  --proxy-metrics-url "$PRIVATE_PROXY_METRICS_URL" \
+  --direct-api-key-file secrets/direct_key --proxy-api-key-file secrets/proxy_key \
+  --output benchmark-reports/private/preflight.jsonl \
+  --candidate-source-commit "$CANDIDATE_SOURCE_COMMIT" \
+  --candidate-image-digest "$CANDIDATE_IMAGE_DIGEST"
+```
+
+The command fails before any scored row when either arm produces zero native acquisition calls,
+phase/field fingerprints differ outside the declared proxy receipt policy, proxy phase counters do
+not prove the equivalent split, or either terminal response fails strict-schema validation. A
+scored command requires that passed ledger and exactly matching checked-out source and immutable
+image digest:
+
+```bash
+uv run scripts/run_paired_agentic_trial.py \
+  --base-url "$DIRECT_URL" --model "$PUBLIC_MODEL_ID" --variant direct \
+  --output benchmark-reports/private/direct.jsonl --agentic-set expanded \
+  --preflight-ledger benchmark-reports/private/preflight.jsonl \
+  --candidate-source-commit "$CANDIDATE_SOURCE_COMMIT" \
+  --candidate-image-digest "$CANDIDATE_IMAGE_DIGEST"
+```
+
+Run the equivalent proxy command with `--proxy-policy`. Never invoke either command without the
+same frozen candidate provenance; the runner refuses to append to an existing scored output.
+
 Pass authenticated proxy credentials with `--api-key-file`; never put a bearer value directly in
 the command line. If the benchmark client cannot obtain a response (for example, a bounded proxy
 `502`), the runner writes a failed row with only the exception type, HTTP status when available,
