@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -342,6 +343,11 @@ def supervise_qualification_runtime(
     observer: ManagedProcess | None = None
     container_id: str | None = None
     volume_name: str | None = None
+    initializer_name: str | None = None
+    proxy_name: str | None = None
+    volume_attempted = False
+    initializer_attempted = False
+    proxy_attempted = False
     spec: _RuntimeSpec | None = None
     instance: str | None = None
 
@@ -376,18 +382,22 @@ def supervise_qualification_runtime(
             instance = _instance_token(spec.manifest_sha256, stage)
             _assert_no_stale_owned_resources(runner, spec.manifest_sha256)
             image_id = _inspect_exact_image(runner, spec.image)
-            new_volume_name = _volume_name(instance)
+            volume_name = _volume_name(instance)
+            initializer_name = _initializer_name(instance, stage)
+            proxy_name = _container_name(instance, stage)
             _validate_credentials(spec.credentials, upstream_authenticated=spec.model.upstream_authenticated)
-            _create_volume(runner, new_volume_name, spec.manifest_sha256, instance, stage)
-            volume_name = new_volume_name
+            volume_attempted = True
+            _create_volume(runner, volume_name, spec.manifest_sha256, instance, stage)
             _validate_credentials(spec.credentials, upstream_authenticated=spec.model.upstream_authenticated)
-            _initialize_secrets(runner, spec, volume_name, instance, stage)
+            initializer_attempted = True
+            _initialize_secrets(runner, spec, volume_name, initializer_name, instance, stage)
             observer_ledger = _observer_ledger_path(private_run_dir, stage)
             observer_identity = _observer_identity(spec.manifest_sha256, instance)
             observer = _start_observer(runner, spec, observer_ledger, observer_identity)
             _wait_for_observer(runner, spec.observer, observer_identity)
             _validate_fresh_observer_ledger(observer_ledger)
-            container_id = _launch_proxy(runner, spec, volume_name, instance, stage)
+            proxy_attempted = True
+            container_id = _launch_proxy(runner, spec, volume_name, proxy_name, instance, stage)
             _verify_proxy(
                 runner,
                 spec,
@@ -426,10 +436,15 @@ def supervise_qualification_runtime(
         if _cleanup_runtime(
             runner,
             observer,
-            container_id,
+            proxy_name,
+            initializer_name,
             volume_name,
+            proxy_attempted=proxy_attempted,
+            initializer_attempted=initializer_attempted,
+            volume_attempted=volume_attempted,
             spec_manifest_sha256=spec.manifest_sha256 if spec is not None else None,
             instance=instance,
+            stage=stage,
         ):
             status = "failed"
             failure_category = "runtime_cleanup_failed"
@@ -609,7 +624,9 @@ def _validate_benchmark_checkout(runner: RuntimeCommandRunner, benchmark: _Bench
         raise QualificationRuntimeFailure("runtime_benchmark_invalid")
     head = runner.run(("git", "-C", str(benchmark.checkout_path), "rev-parse", "HEAD"))
     tree = runner.run(("git", "-C", str(benchmark.checkout_path), "rev-parse", "HEAD^{tree}"))
-    clean = runner.run(("git", "-C", str(benchmark.checkout_path), "status", "--porcelain", "--untracked-files=no"))
+    clean = runner.run(
+        ("git", "-C", str(benchmark.checkout_path), "status", "--porcelain=v1", "--untracked-files=all")
+    )
     if (
         head.returncode != 0
         or head.stdout.strip() != benchmark.revision
@@ -619,29 +636,52 @@ def _validate_benchmark_checkout(runner: RuntimeCommandRunner, benchmark: _Bench
         or clean.stdout.strip()
     ):
         raise QualificationRuntimeFailure("runtime_benchmark_invalid")
+    project = runner.run(("git", "-C", str(benchmark.checkout_path), "show", "HEAD:pyproject.toml"))
+    _validate_tracked_benchmark_project(project, benchmark.package)
+    package_init = runner.run(
+        ("git", "-C", str(benchmark.checkout_path), "cat-file", "-e", "HEAD:src/shiftedx_bench/__init__.py")
+    )
+    if package_init.returncode != 0:
+        raise QualificationRuntimeFailure("runtime_benchmark_invalid")
     probe = runner.run(
-        (sys.executable, "-c", _BENCHMARK_IMPORT_PROBE),
-        env=_benchmark_child_environment(source),
+        (sys.executable, "-I", "-S", "-c", _BENCHMARK_SOURCE_PROBE, str(source)),
     )
     document = _parse_command_json(probe.stdout, "runtime_benchmark_invalid")
     module = document.get("module")
     if (
         probe.returncode != 0
-        or document.get("package") != benchmark.package
         or not isinstance(module, str)
         or not _is_path_beneath(Path(module), source)
     ):
         raise QualificationRuntimeFailure("runtime_benchmark_invalid")
 
 
-_BENCHMARK_IMPORT_PROBE = "\n".join(
+def _validate_tracked_benchmark_project(project: CommandResult, expected_package: str) -> None:
+    if project.returncode != 0:
+        raise QualificationRuntimeFailure("runtime_benchmark_invalid")
+    try:
+        document = tomllib.loads(project.stdout)
+    except tomllib.TOMLDecodeError as error:
+        raise QualificationRuntimeFailure("runtime_benchmark_invalid") from error
+    value = document.get("project")
+    if not isinstance(value, dict) or value.get("name") != "shiftedx-bench" or value.get("version") != "0.5.1":
+        raise QualificationRuntimeFailure("runtime_benchmark_invalid")
+    if f"shiftedx-bench=={value['version']}" != expected_package:
+        raise QualificationRuntimeFailure("runtime_benchmark_invalid")
+
+
+_BENCHMARK_SOURCE_PROBE = "\n".join(
     (
-        "import importlib.metadata",
+        "import importlib.util",
         "import json",
         "import pathlib",
-        "import shiftedx_bench",
-        "print(json.dumps({'package': 'shiftedx-bench==' + importlib.metadata.version('shiftedx-bench'), "
-        "'module': str(pathlib.Path(shiftedx_bench.__file__).resolve())}, sort_keys=True, separators=(',', ':'))) ",
+        "import sys",
+        "source = pathlib.Path(sys.argv[1]).resolve()",
+        "sys.path[:] = [str(source)]",
+        "spec = importlib.util.find_spec('shiftedx_bench')",
+        "origin = spec.origin if spec is not None else None",
+        "print(json.dumps({'module': str(pathlib.Path(origin).resolve()) if isinstance(origin, str) else None}, "
+        "sort_keys=True, separators=(',', ':')))",
     )
 )
 
@@ -864,6 +904,8 @@ def _create_volume(
             f"{_LABEL_PREFIX}.instance={instance}",
             "--label",
             f"{_LABEL_PREFIX}.stage={_attestation_stage(stage)}",
+            "--label",
+            f"{_LABEL_PREFIX}.resource=secrets-volume",
             volume_name,
         )
     )
@@ -875,6 +917,7 @@ def _initialize_secrets(
     runner: RuntimeCommandRunner,
     spec: _RuntimeSpec,
     volume_name: str,
+    initializer_name: str,
     instance: str,
     stage: RuntimeStage,
 ) -> None:
@@ -889,9 +932,11 @@ def _initialize_secrets(
     argv: list[str] = [
         "docker",
         "run",
-        "--rm",
+        "--detach",
         "--pull",
         "never",
+        "--name",
+        initializer_name,
         "--network",
         "none",
         "--read-only",
@@ -906,9 +951,13 @@ def _initialize_secrets(
         "--security-opt",
         "no-new-privileges:true",
         "--label",
+        f"{_LABEL_PREFIX}.manifest={spec.manifest_sha256}",
+        "--label",
         f"{_LABEL_PREFIX}.instance={instance}",
         "--label",
         f"{_LABEL_PREFIX}.stage={_attestation_stage(stage)}",
+        "--label",
+        f"{_LABEL_PREFIX}.resource=initializer",
     ]
     for path, target_name in source_mounts:
         argv.extend(("--mount", f"type=bind,src={path},dst=/source/{target_name},readonly"))
@@ -924,7 +973,20 @@ def _initialize_secrets(
         )
     )
     result = runner.run(tuple(argv))
-    if result.returncode != 0:
+    initializer_id = result.stdout.strip()
+    if result.returncode != 0 or _SHA256.fullmatch(initializer_id) is None:
+        raise QualificationRuntimeFailure("runtime_secret_initialize_failed")
+    wait = runner.run(("docker", "container", "wait", initializer_id))
+    if wait.returncode != 0 or wait.stdout.strip() != "0":
+        raise QualificationRuntimeFailure("runtime_secret_initialize_failed")
+    state_result = runner.run(("docker", "container", "inspect", "--format", "{{json .State}}", initializer_id))
+    state = _parse_command_json(state_result.stdout, "runtime_secret_initialize_failed")
+    if (
+        state_result.returncode != 0
+        or state.get("Running") is not False
+        or state.get("ExitCode") != 0
+        or not _owned_container(runner, initializer_name, spec.manifest_sha256, instance, stage, "initializer")
+    ):
         raise QualificationRuntimeFailure("runtime_secret_initialize_failed")
 
 
@@ -1012,9 +1074,13 @@ def _validate_fresh_observer_ledger(path: Path) -> None:
 
 
 def _launch_proxy(
-    runner: RuntimeCommandRunner, spec: _RuntimeSpec, volume_name: str, instance: str, stage: RuntimeStage
+    runner: RuntimeCommandRunner,
+    spec: _RuntimeSpec,
+    volume_name: str,
+    container_name: str,
+    instance: str,
+    stage: RuntimeStage,
 ) -> str:
-    name = _container_name(instance, stage)
     settings = spec.proxy.settings
     env_values = {
         "DEPLOYMENT_PROFILE": settings["deployment_profile"],
@@ -1045,7 +1111,7 @@ def _launch_proxy(
         "--pull",
         "never",
         "--name",
-        name,
+        container_name,
         "--init",
         "--stop-timeout",
         str(spec.proxy.stop_timeout_seconds),
@@ -1072,6 +1138,8 @@ def _launch_proxy(
         f"{_LABEL_PREFIX}.instance={instance}",
         "--label",
         f"{_LABEL_PREFIX}.stage={_attestation_stage(stage)}",
+        "--label",
+        f"{_LABEL_PREFIX}.resource=proxy",
     ]
     for key, value in env_values.items():
         argv.extend(("--env", f"{key}={value}"))
@@ -1111,6 +1179,7 @@ def _verify_proxy(
         f"{_LABEL_PREFIX}.manifest": spec.manifest_sha256,
         f"{_LABEL_PREFIX}.instance": instance,
         f"{_LABEL_PREFIX}.stage": _attestation_stage(stage),
+        f"{_LABEL_PREFIX}.resource": "proxy",
     }
     if not isinstance(labels, dict) or any(labels.get(key) != value for key, value in expected_labels.items()):
         raise QualificationRuntimeFailure("runtime_inspect_drift")
@@ -1136,7 +1205,11 @@ def _verify_proxy(
     volume = _parse_command_json(volume_result.stdout, "runtime_inspect_drift")
     volume_labels = volume.get("Labels")
     if not isinstance(volume_labels, dict) or any(
-        volume_labels.get(key) != value for key, value in expected_labels.items()
+        volume_labels.get(key) != value
+        for key, value in {
+            **expected_labels,
+            f"{_LABEL_PREFIX}.resource": "secrets-volume",
+        }.items()
     ):
         raise QualificationRuntimeFailure("runtime_inspect_drift")
 
@@ -1151,6 +1224,7 @@ def _verify_resources(host_config: dict[str, Any], proxy: _ProxySpec) -> None:
         or not isinstance(security_options, list)
         or "no-new-privileges:true" not in security_options
         or host_config.get("PidsLimit") != proxy.pids_limit
+        or host_config.get("StopTimeout") != proxy.stop_timeout_seconds
         or host_config.get("Memory") != proxy.memory_bytes
         or host_config.get("NanoCpus") != int(proxy.cpus * Decimal("1000000000"))
         or host_config.get("Init") is not True
@@ -1678,11 +1752,16 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 def _cleanup_runtime(
     runner: RuntimeCommandRunner,
     observer: ManagedProcess | None,
-    container_id: str | None,
+    proxy_name: str | None,
+    initializer_name: str | None,
     volume_name: str | None,
     *,
+    proxy_attempted: bool,
+    initializer_attempted: bool,
+    volume_attempted: bool,
     spec_manifest_sha256: str | None,
     instance: str | None,
+    stage: RuntimeStage,
 ) -> bool:
     failed = False
     if observer is not None:
@@ -1696,53 +1775,125 @@ def _cleanup_runtime(
                 observer.wait(timeout=5)
             except Exception:
                 failed = True
-    if container_id is not None:
+    if proxy_name is not None and proxy_attempted:
         try:
-            if not _owned_container(runner, container_id, spec_manifest_sha256, instance):
-                failed = True
-            else:
-                result = runner.run(("docker", "rm", "--force", container_id))
-                failed = failed or result.returncode != 0
+            failed = failed or _remove_owned_container(
+                runner,
+                proxy_name,
+                spec_manifest_sha256,
+                instance,
+                stage,
+                "proxy",
+            )
         except Exception:
             failed = True
-    if volume_name is not None:
+    if initializer_name is not None and initializer_attempted:
         try:
-            if not _owned_volume(runner, volume_name, spec_manifest_sha256, instance):
-                failed = True
-            else:
-                result = runner.run(("docker", "volume", "rm", volume_name))
-                failed = failed or result.returncode != 0
+            failed = failed or _remove_owned_container(
+                runner,
+                initializer_name,
+                spec_manifest_sha256,
+                instance,
+                stage,
+                "initializer",
+            )
+        except Exception:
+            failed = True
+    if volume_name is not None and volume_attempted:
+        try:
+            failed = failed or _remove_owned_volume(runner, volume_name, spec_manifest_sha256, instance, stage)
         except Exception:
             failed = True
     return failed
 
 
-def _owned_container(
-    runner: RuntimeCommandRunner, container_id: str, manifest_sha256: str | None, instance: str | None
+def _remove_owned_container(
+    runner: RuntimeCommandRunner,
+    name: str,
+    manifest_sha256: str | None,
+    instance: str | None,
+    stage: RuntimeStage,
+    resource: Literal["initializer", "proxy"],
 ) -> bool:
-    if manifest_sha256 is None or instance is None:
-        return False
+    """Delete only a predeclared resource after proving its exact labels, if it exists."""
+
+    result = runner.run(("docker", "container", "inspect", "--format", "{{json .Config.Labels}}", name))
+    if result.returncode != 0:
+        return not _resource_is_absent(result)
+    if not _owned_container_labels(result.stdout, manifest_sha256, instance, stage, resource):
+        return True
+    return runner.run(("docker", "rm", "--force", name)).returncode != 0
+
+
+def _remove_owned_volume(
+    runner: RuntimeCommandRunner,
+    volume_name: str,
+    manifest_sha256: str | None,
+    instance: str | None,
+    stage: RuntimeStage,
+) -> bool:
+    """Delete only the predeclared labelled secret volume, after both containers are resolved."""
+
+    result = runner.run(("docker", "volume", "inspect", "--format", "{{json .Labels}}", volume_name))
+    if result.returncode != 0:
+        return not _resource_is_absent(result)
+    if not _owned_volume_labels(result.stdout, manifest_sha256, instance, stage):
+        return True
+    return runner.run(("docker", "volume", "rm", volume_name)).returncode != 0
+
+
+def _owned_container(
+    runner: RuntimeCommandRunner,
+    container_id: str,
+    manifest_sha256: str | None,
+    instance: str | None,
+    stage: RuntimeStage,
+    resource: Literal["initializer", "proxy"],
+) -> bool:
     result = runner.run(("docker", "container", "inspect", "--format", "{{json .Config.Labels}}", container_id))
     if result.returncode != 0:
         return False
-    value = _parse_command_json_or_none(result.stdout)
-    return isinstance(value, dict) and value.get(f"{_LABEL_PREFIX}.manifest") == manifest_sha256 and value.get(
-        f"{_LABEL_PREFIX}.instance"
-    ) == instance
+    return _owned_container_labels(result.stdout, manifest_sha256, instance, stage, resource)
 
 
-def _owned_volume(
-    runner: RuntimeCommandRunner, volume_name: str, manifest_sha256: str | None, instance: str | None
+def _resource_is_absent(result: CommandResult) -> bool:
+    """Accept a Docker not-found response but fail closed for other cleanup inspection failures."""
+
+    return result.returncode == 1 and "no such" in result.stderr.lower()
+
+
+def _owned_container_labels(
+    serialized: str,
+    manifest_sha256: str | None,
+    instance: str | None,
+    stage: RuntimeStage,
+    resource: Literal["initializer", "proxy"],
 ) -> bool:
     if manifest_sha256 is None or instance is None:
         return False
-    result = runner.run(("docker", "volume", "inspect", "--format", "{{json .Labels}}", volume_name))
-    if result.returncode != 0:
+    value = _parse_command_json_or_none(serialized)
+    return (
+        isinstance(value, dict)
+        and value.get(f"{_LABEL_PREFIX}.manifest") == manifest_sha256
+        and value.get(f"{_LABEL_PREFIX}.instance") == instance
+        and value.get(f"{_LABEL_PREFIX}.stage") == _attestation_stage(stage)
+        and value.get(f"{_LABEL_PREFIX}.resource") == resource
+    )
+
+
+def _owned_volume_labels(
+    serialized: str, manifest_sha256: str | None, instance: str | None, stage: RuntimeStage
+) -> bool:
+    if manifest_sha256 is None or instance is None:
         return False
-    value = _parse_command_json_or_none(result.stdout)
-    return isinstance(value, dict) and value.get(f"{_LABEL_PREFIX}.manifest") == manifest_sha256 and value.get(
-        f"{_LABEL_PREFIX}.instance"
-    ) == instance
+    value = _parse_command_json_or_none(serialized)
+    return (
+        isinstance(value, dict)
+        and value.get(f"{_LABEL_PREFIX}.manifest") == manifest_sha256
+        and value.get(f"{_LABEL_PREFIX}.instance") == instance
+        and value.get(f"{_LABEL_PREFIX}.stage") == _attestation_stage(stage)
+        and value.get(f"{_LABEL_PREFIX}.resource") == "secrets-volume"
+    )
 
 
 def _runtime_contract_sha256(spec: _RuntimeSpec) -> str:
@@ -1868,6 +2019,10 @@ def _observer_identity(manifest_sha256: str, instance: str) -> str:
 
 def _volume_name(instance: str) -> str:
     return f"shiftedx-qualification-secrets-{instance}"
+
+
+def _initializer_name(instance: str, stage: RuntimeStage) -> str:
+    return f"shiftedx-qualification-initializer-{_attestation_stage(stage)}-{instance}"
 
 
 def _container_name(instance: str, stage: RuntimeStage) -> str:

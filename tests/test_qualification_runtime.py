@@ -7,12 +7,14 @@ import os
 import signal
 import socket
 import stat
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from shiftedx_harness_proxy.qualification_contract import BENCHMARK_REVISION
 from shiftedx_harness_proxy.qualification_runtime import Outcome, RuntimeLease, supervise_qualification_runtime
 
 
@@ -119,18 +121,88 @@ def _benchmark_checkout(tmp_path: Path) -> dict[str, str]:
     package_root = checkout / "src" / "shiftedx_bench"
     package_root.mkdir(parents=True)
     (package_root / "__init__.py").write_text("__all__ = []\n", encoding="utf-8")
-    distribution = checkout / "src" / "shiftedx_bench-0.5.1.dist-info"
-    distribution.mkdir()
-    (distribution / "METADATA").write_text(
-        "Metadata-Version: 2.1\nName: shiftedx-bench\nVersion: 0.5.1\n",
-        encoding="utf-8",
-    )
     return {
         "revision": "335e6694e4aec13e9370af8a993d8c8f14d7ffb5",
         "tree": "c" * 40,
         "checkout_path": str(checkout),
         "interpreter_sha256": hashlib.sha256(Path(sys.executable).read_bytes()).hexdigest(),
     }
+
+
+def _tracked_benchmark_pyproject(*, version: str = "0.5.1") -> str:
+    return "\n".join(
+        (
+            "[project]",
+            'name = "shiftedx-bench"',
+            f'version = "{version}"',
+            "",
+        )
+    )
+
+
+def _authoritative_benchmark_manifest(tmp_path: Path) -> tuple[Path, Path]:
+    """Create a source-only committed Shiftedx Bench checkout for the public runtime seam."""
+
+    manifest = _manifest(tmp_path)
+    checkout = tmp_path / "authoritative-shiftedx-bench"
+    package = checkout / "src" / "shiftedx_bench"
+    package.mkdir(parents=True)
+    (checkout / "pyproject.toml").write_text(
+        "\n".join(
+            (
+                "[build-system]",
+                'requires = ["hatchling>=1.27"]',
+                'build-backend = "hatchling.build"',
+                "",
+                "[project]",
+                'name = "shiftedx-bench"',
+                'version = "0.5.1"',
+                'requires-python = ">=3.11"',
+                "",
+                "[tool.hatch.build.targets.wheel]",
+                'packages = ["src/shiftedx_bench"]',
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    (package / "__init__.py").write_text("__all__ = []\n", encoding="utf-8")
+    for argv in (
+        ("git", "init", str(checkout)),
+        ("git", "-C", str(checkout), "add", "pyproject.toml", "src/shiftedx_bench/__init__.py"),
+        (
+            "git",
+            "-C",
+            str(checkout),
+            "-c",
+            "user.name=Qualification Test",
+            "-c",
+            "user.email=qualification-test@example.invalid",
+            "commit",
+            "-m",
+            "source fixture",
+        ),
+    ):
+        subprocess.run(argv, check=True, capture_output=True, text=True)  # noqa: S603 - fixed test fixture vectors
+    tree = subprocess.run(  # noqa: S603 - fixed test fixture vector
+        ("git", "-C", str(checkout), "rev-parse", "HEAD^{tree}"),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()  # noqa: S603 - fixed test fixture vector
+    document = _manifest_document(manifest)
+    benchmark = document["qualification_runtime"]["benchmark"]
+    assert isinstance(benchmark, dict)
+    benchmark.update(
+        {
+            "revision": BENCHMARK_REVISION,
+            "tree": tree,
+            "checkout_path": str(checkout),
+            "interpreter_sha256": hashlib.sha256(Path(sys.executable).read_bytes()).hexdigest(),
+        }
+    )
+    _store_manifest(manifest, document)
+    return manifest, checkout
 
 
 class _FakeProcess:
@@ -161,17 +233,20 @@ class _FakeRuntimeRunner:
     def __init__(self, *, failure: str | None = None, drift: str | None = None) -> None:
         self.calls: list[tuple[str, tuple[str, ...], dict[str, str] | None]] = []
         self.observer = _FakeProcess(signal_on_terminate=failure == "signal_cleanup_observer")
-        self.labels: dict[str, str] = {}
+        self.container_labels: dict[str, dict[str, str]] = {}
+        self.volume_labels: dict[str, dict[str, str]] = {}
         self.volume_name = "expected-volume"
         self.failure = failure
         self.drift = drift
         self.container_running = True
 
-    def _capture_labels(self, argv: tuple[str, ...]) -> None:
+    def _labels(self, argv: tuple[str, ...]) -> dict[str, str]:
+        labels: dict[str, str] = {}
         for index, value in enumerate(argv[:-1]):
             if value == "--label":
                 key, label_value = argv[index + 1].split("=", 1)
-                self.labels[key] = label_value
+                labels[key] = label_value
+        return labels
 
     def _capture_volume(self, argv: tuple[str, ...]) -> None:
         for value in argv:
@@ -195,17 +270,24 @@ class _FakeRuntimeRunner:
                 stdout=" M src/shiftedx_bench/__init__.py\n" if self.failure == "benchmark_dirty" else "",
                 stderr="",
             )
-        if argv[:2] == (sys.executable, "-c"):
-            assert env is not None
-            source = Path(env["PYTHONPATH"])
+        if argv[:4] == ("git", "-C", argv[2], "show"):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=_tracked_benchmark_pyproject(
+                    version="0.5.0" if self.failure == "benchmark_project" else "0.5.1"
+                ),
+                stderr="",
+            )
+        if argv[:4] == (sys.executable, "-I", "-S", "-c"):
+            assert env is None
+            source = Path(argv[-1])
             return SimpleNamespace(
                 returncode=0,
                 stdout=json.dumps(
                     {
-                        "package": "other-package==9.9.9"
-                        if self.failure == "benchmark_import"
-                        else "shiftedx-bench==0.5.1",
-                        "module": str(source / "shiftedx_bench" / "__init__.py"),
+                        "module": "/outside/shiftedx_bench/__init__.py"
+                        if self.failure == "benchmark_source"
+                        else str(source / "shiftedx_bench" / "__init__.py"),
                     }
                 ),
                 stderr="",
@@ -230,25 +312,43 @@ class _FakeRuntimeRunner:
         if argv[:3] == ("docker", "volume", "create"):
             if self.failure == "volume_create":
                 return SimpleNamespace(returncode=1, stdout="", stderr="")
-            self._capture_labels(argv)
             self.volume_name = argv[-1]
+            self.volume_labels[self.volume_name] = self._labels(argv)
+            if self.failure == "signal_volume_create":
+                os.kill(os.getpid(), signal.SIGTERM)
             return SimpleNamespace(returncode=0, stdout=self.volume_name + "\n", stderr="")
-        if argv[:3] == ("docker", "run", "--rm") and self.failure == "signal_initializer":
-            os.kill(os.getpid(), signal.SIGTERM)
-        if argv[:3] == ("docker", "run", "--rm") and self.failure == "initializer":
-            return SimpleNamespace(returncode=1, stdout="", stderr="")
         if argv[:3] == ("docker", "run", "--detach"):
-            if self.failure == "launch":
+            if self.failure == "launch" and "--entrypoint" not in argv:
                 return SimpleNamespace(returncode=1, stdout="", stderr="")
-            self._capture_labels(argv)
+            name = argv[argv.index("--name") + 1]
+            labels = self._labels(argv)
+            identifier = "e" * 64 if "--entrypoint" in argv else "f" * 64
+            self.container_labels[name] = labels
+            self.container_labels[identifier] = labels
             self._capture_volume(argv)
-            return SimpleNamespace(returncode=0, stdout="f" * 64 + "\n", stderr="")
+            if (self.failure == "signal_initializer" and "--entrypoint" in argv) or (
+                self.failure == "signal_launch" and "--entrypoint" not in argv
+            ):
+                os.kill(os.getpid(), signal.SIGTERM)
+            if self.failure == "initializer" and "--entrypoint" in argv:
+                return SimpleNamespace(returncode=1, stdout="", stderr="")
+            return SimpleNamespace(returncode=0, stdout=identifier + "\n", stderr="")
+        if argv[:3] == ("docker", "container", "wait"):
+            return SimpleNamespace(returncode=0, stdout="0\n", stderr="")
         if argv[:3] == ("docker", "container", "inspect"):
             if "{{json .Config.Labels}}" in argv:
-                return SimpleNamespace(returncode=0, stdout=json.dumps(self.labels), stderr="")
+                if self.failure == "cleanup_inspect":
+                    return SimpleNamespace(returncode=125, stdout="", stderr="daemon unavailable")
+                labels = self.container_labels.get(argv[-1])
+                if labels is None:
+                    return SimpleNamespace(returncode=1, stdout="", stderr="No such container")
+                return SimpleNamespace(returncode=0, stdout=json.dumps(labels), stderr="")
+            if "{{json .State}}" in argv:
+                return SimpleNamespace(returncode=0, stdout=json.dumps({"Running": False, "ExitCode": 0}), stderr="")
             if self.failure == "inspect":
                 return SimpleNamespace(returncode=1, stdout="", stderr="")
-            document = _runtime_inspect(self.labels, self.volume_name, running=self.container_running)
+            labels = self.container_labels.get(argv[-1], {})
+            document = _runtime_inspect(labels, self.volume_name, running=self.container_running)
             if self.drift == "resources":
                 document["HostConfig"]["ReadonlyRootfs"] = False
             elif self.drift == "bind":
@@ -259,15 +359,20 @@ class _FakeRuntimeRunner:
                 document["Config"]["Env"] = ["DEPLOYMENT_PROFILE=development"]
             elif self.drift == "image":
                 document["Image"] = "sha256:" + "d" * 64
+            elif self.drift == "stop_timeout":
+                document["HostConfig"]["StopTimeout"] = 1
             return SimpleNamespace(
                 returncode=0,
                 stdout=json.dumps(document),
                 stderr="",
             )
         if argv[:3] == ("docker", "volume", "inspect"):
+            labels = self.volume_labels.get(argv[-1])
+            if labels is None:
+                return SimpleNamespace(returncode=1, stdout="", stderr="No such volume")
             if "{{json .Labels}}" in argv:
-                return SimpleNamespace(returncode=0, stdout=json.dumps(self.labels), stderr="")
-            return SimpleNamespace(returncode=0, stdout=json.dumps({"Labels": self.labels}), stderr="")
+                return SimpleNamespace(returncode=0, stdout=json.dumps(labels), stderr="")
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"Labels": labels}), stderr="")
         if argv[:3] == ("docker", "exec", "--user"):
             if self.failure == "auth":
                 return SimpleNamespace(returncode=1, stdout="", stderr="")
@@ -291,10 +396,18 @@ class _FakeRuntimeRunner:
             return SimpleNamespace(returncode=1, stdout="", stderr="")
         if argv[:3] == ("docker", "rm", "--force") and self.failure == "signal_cleanup_container":
             os.kill(os.getpid(), signal.SIGTERM)
+        if argv[:3] == ("docker", "rm", "--force"):
+            labels = self.container_labels.pop(argv[-1], None)
+            if labels is not None:
+                for name, candidate in list(self.container_labels.items()):
+                    if candidate is labels:
+                        del self.container_labels[name]
         if argv[:3] == ("docker", "volume", "rm") and self.failure == "cleanup_volume":
             return SimpleNamespace(returncode=1, stdout="", stderr="")
         if argv[:3] == ("docker", "volume", "rm") and self.failure == "signal_cleanup_volume":
             os.kill(os.getpid(), signal.SIGTERM)
+        if argv[:3] == ("docker", "volume", "rm"):
+            self.volume_labels.pop(argv[-1], None)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     def spawn(self, argv: tuple[str, ...], *, env: dict[str, str]) -> _FakeProcess:
@@ -326,6 +439,32 @@ class _FakeRuntimeRunner:
             "status": "live",
             "instance_sha256": observer_environment["QUALIFICATION_OBSERVER_INSTANCE_SHA256"],
         }
+
+
+class _SourceCheckoutRunner(_FakeRuntimeRunner):
+    """Run only benchmark Git/Python probes locally; retain fake Docker lifecycle behavior."""
+
+    def run(
+        self, argv: tuple[str, ...], *, env: dict[str, str] | None = None, timeout: float | None = None
+    ) -> SimpleNamespace:
+        if argv[0] == "git" or argv[0] == sys.executable:
+            self.calls.append(("run", argv, env))
+            completed = subprocess.run(  # noqa: S603 - fixed test seam vectors
+                argv,
+                capture_output=True,
+                check=False,
+                env=env,
+                text=True,
+                timeout=timeout,
+            )
+            if argv[:4] == ("git", "-C", argv[2], "rev-parse") and argv[-1] == "HEAD":
+                return SimpleNamespace(returncode=0, stdout=BENCHMARK_REVISION + "\n", stderr="")
+            return SimpleNamespace(
+                returncode=completed.returncode,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+            )
+        return super().run(argv, env=env, timeout=timeout)
 
 
 def _manifest_settings() -> dict[str, object]:
@@ -374,6 +513,7 @@ def _runtime_inspect(labels: dict[str, str], volume_name: str, *, running: bool 
             "CapDrop": ["ALL"],
             "SecurityOpt": ["no-new-privileges:true"],
             "PidsLimit": 128,
+            "StopTimeout": 20,
             "Memory": 536870912,
             "NanoCpus": 1000000000,
             "Init": True,
@@ -434,7 +574,9 @@ def test_preflight_supervisor_writes_safe_attestation_before_action_and_cleans(m
     assert "FOWNER" not in argv
     assert "--pull never" in argv
     initializer = next(
-        call[1] for call in runner.calls if call[0] == "run" and call[1][:3] == ("docker", "run", "--rm")
+        call[1]
+        for call in runner.calls
+        if call[0] == "run" and call[1][:3] == ("docker", "run", "--detach") and "--entrypoint" in call[1]
     )
     initializer_script = initializer[-1]
     assert initializer_script.index("cp /source/") < initializer_script.index("chmod 0400")
@@ -654,11 +796,11 @@ def _docker_commands(runner: _FakeRuntimeRunner) -> list[tuple[str, ...]]:
         ("image", "runtime_image_unavailable", False),
         ("image_metadata", "runtime_image_unavailable", False),
         ("volume_create", "runtime_volume_create_failed", False),
-        ("initializer", "runtime_secret_initialize_failed", False),
-        ("observer_spawn", "runtime_observer_start_failed", False),
-        ("observer_ready", "runtime_observer_unhealthy", False),
-        ("observer_ledger", "runtime_observer_ledger_invalid", False),
-        ("launch", "runtime_proxy_launch_failed", False),
+        ("initializer", "runtime_secret_initialize_failed", True),
+        ("observer_spawn", "runtime_observer_start_failed", True),
+        ("observer_ready", "runtime_observer_unhealthy", True),
+        ("observer_ledger", "runtime_observer_ledger_invalid", True),
+        ("launch", "runtime_proxy_launch_failed", True),
         ("inspect", "runtime_inspect_drift", True),
         ("proxy_ready", "runtime_proxy_unready", True),
         ("auth", "runtime_proxy_auth_failed", True),
@@ -702,7 +844,7 @@ def test_setup_failures_never_invoke_action_and_clean_only_created_resources(
         assert container_cleanup < volume_cleanup
 
 
-@pytest.mark.parametrize("drift", ["resources", "bind", "settings", "image"])
+@pytest.mark.parametrize("drift", ["resources", "bind", "settings", "image", "stop_timeout"])
 def test_inspect_drift_fails_closed_before_action_and_cleans(drift, tmp_path) -> None:
     manifest = _manifest(tmp_path)
     private_run_dir = _private_run(tmp_path)
@@ -788,7 +930,9 @@ def test_duplicate_json_manifest_keys_are_rejected_before_runtime_side_effects(l
     assert _docker_commands(runner) == []
 
 
-@pytest.mark.parametrize("failure", ["benchmark_head", "benchmark_tree", "benchmark_dirty", "benchmark_import"])
+@pytest.mark.parametrize(
+    "failure", ["benchmark_head", "benchmark_tree", "benchmark_dirty", "benchmark_project", "benchmark_source"]
+)
 def test_benchmark_identity_drift_is_rejected_before_runtime_resources(failure, tmp_path) -> None:
     runner = _FakeRuntimeRunner(failure=failure)
 
@@ -802,6 +946,50 @@ def test_benchmark_identity_drift_is_rejected_before_runtime_resources(failure, 
 
     assert outcome.failure_category == "runtime_benchmark_invalid"
     assert _docker_commands(runner) == []
+
+
+def test_tracked_source_checkout_without_installed_metadata_passes_in_isolation(tmp_path) -> None:
+    manifest, checkout = _authoritative_benchmark_manifest(tmp_path)
+    assert not list((checkout / "src").glob("*.dist-info"))
+    runner = _SourceCheckoutRunner()
+
+    outcome = supervise_qualification_runtime(
+        manifest=manifest,
+        stage="preflight",
+        private_run_dir=_private_run(tmp_path),
+        action=_write_complete_ledger,
+        command_runner=runner,
+    )
+
+    assert outcome.status == "passed"
+    source_probes = [call for call in runner.calls if call[0] == "run" and call[1][0] == sys.executable]
+    assert len(source_probes) == 1
+    assert source_probes[0][1][1:3] == ("-I", "-S")
+    assert source_probes[0][2] is None
+
+
+def test_untracked_sitecustomize_is_rejected_before_isolated_source_probe_can_execute(tmp_path) -> None:
+    manifest, checkout = _authoritative_benchmark_manifest(tmp_path)
+    marker = tmp_path / "sitecustomize-executed"
+    (checkout / "src" / "sitecustomize.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('executed')\n",
+        encoding="utf-8",
+    )
+    runner = _SourceCheckoutRunner()
+
+    outcome = supervise_qualification_runtime(
+        manifest=manifest,
+        stage="preflight",
+        private_run_dir=_private_run(tmp_path),
+        action=lambda _lease: pytest.fail("untracked source must not invoke action"),
+        command_runner=runner,
+    )
+
+    assert outcome.failure_category == "runtime_benchmark_invalid"
+    assert not marker.exists()
+    assert not [call for call in runner.calls if call[0] == "run" and call[1][0] == sys.executable]
+    status_commands = [call[1] for call in runner.calls if call[0] == "run" and call[1][0] == "git"]
+    assert any("--untracked-files=all" in command for command in status_commands)
 
 
 @pytest.mark.parametrize(
@@ -1179,6 +1367,90 @@ def test_interruption_keeps_handlers_through_every_cleanup_boundary_and_ignores_
     commands = _docker_commands(runner)
     assert any(command[:3] == ("docker", "rm", "--force") for command in commands)
     assert any(command[:3] == ("docker", "volume", "rm") for command in commands)
+
+
+@pytest.mark.parametrize(
+    ("failure", "name_fragment"),
+    [
+        ("signal_initializer", "shiftedx-qualification-initializer-preflight-"),
+        ("signal_launch", "shiftedx-qualification-preflight-"),
+    ],
+)
+def test_interrupted_detached_resources_are_removed_by_predeclared_owned_names(
+    failure, name_fragment, tmp_path
+) -> None:
+    runner = _FakeRuntimeRunner(failure=failure)
+    manifest = _manifest(tmp_path)
+    manifest_sha256 = _sha256_file(manifest)
+
+    outcome = supervise_qualification_runtime(
+        manifest=manifest,
+        stage="preflight",
+        private_run_dir=_private_run(tmp_path),
+        action=lambda _lease: pytest.fail("interrupted setup must not invoke action"),
+        command_runner=runner,
+    )
+
+    assert outcome.status == "interrupted"
+    detached = [
+        command
+        for command in _docker_commands(runner)
+        if command[:3] == ("docker", "run", "--detach")
+    ]
+    assert detached
+    resource = next(
+        command
+        for command in detached
+        if name_fragment in command[command.index("--name") + 1]
+    )
+    name = resource[resource.index("--name") + 1]
+    assert name_fragment in name
+    assert f"io.shiftedx.qualification.manifest={manifest_sha256}" in resource
+    cleanup = [command for command in _docker_commands(runner) if command[:3] == ("docker", "rm", "--force")]
+    assert any(command[-1] == name for command in cleanup)
+    cleanup_index = next(index for index, command in enumerate(_docker_commands(runner)) if command[-1:] == (name,))
+    volume_index = next(
+        index for index, command in enumerate(_docker_commands(runner)) if command[:3] == ("docker", "volume", "rm")
+    )
+    assert cleanup_index < volume_index
+
+
+def test_interrupted_volume_create_is_resolved_by_its_predeclared_owned_name(tmp_path) -> None:
+    runner = _FakeRuntimeRunner(failure="signal_volume_create")
+
+    outcome = supervise_qualification_runtime(
+        manifest=_manifest(tmp_path),
+        stage="preflight",
+        private_run_dir=_private_run(tmp_path),
+        action=lambda _lease: pytest.fail("interrupted setup must not invoke action"),
+        command_runner=runner,
+    )
+
+    assert outcome.status == "interrupted"
+    commands = _docker_commands(runner)
+    volume_create = next(command for command in commands if command[:3] == ("docker", "volume", "create"))
+    volume_name = volume_create[-1]
+    assert any(command == ("docker", "volume", "rm", volume_name) for command in commands)
+    assert not [command for command in commands if command[:3] == ("docker", "rm", "--force")]
+
+
+def test_unresolved_owned_resource_during_cleanup_fails_the_stage(tmp_path) -> None:
+    runner = _FakeRuntimeRunner()
+
+    def action(lease: RuntimeLease) -> int:
+        runner.failure = "cleanup_inspect"
+        return _write_complete_ledger(lease)
+
+    outcome = supervise_qualification_runtime(
+        manifest=_manifest(tmp_path),
+        stage="preflight",
+        private_run_dir=_private_run(tmp_path),
+        action=action,
+        command_runner=runner,
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.failure_category == "runtime_cleanup_failed"
 
 
 def test_existing_evidence_is_never_clobbered_and_direct_stage_uses_preflight_attestation(tmp_path) -> None:

@@ -200,16 +200,21 @@ keys, is validated by `Settings`, and carries only the reviewed production value
 second hand-maintained settings file or substitute environment overrides.
 
 The supervisor validates this object through `Settings`, verifies the benchmark checkout's pinned
-HEAD/tree, tracked-clean state, pinned package import rooted under `checkout_path/src`, and the
-current interpreter SHA-256. It gives the paired child only that source tree on `PYTHONPATH` with
-user site packages and bytecode writes disabled; an ambient `shiftedx-bench` installation cannot
-qualify. It starts a fresh identity-bound observer,
+HEAD/tree, an empty `git status --untracked-files=all`, the exact `shiftedx-bench==0.5.1` version
+from tracked `HEAD:pyproject.toml`, and the current interpreter SHA-256. Before any normal child
+starts, an isolated `-I -S` source-resolution probe confirms that `shiftedx_bench` is rooted under
+`checkout_path/src`; it never consults ambient package metadata. Thus an untracked source file
+(including `src/sitecustomize.py`) rejects the run before Python can execute it. The paired child
+receives only that source tree on `PYTHONPATH` with user site packages and bytecode writes disabled;
+an ambient `shiftedx-bench` installation cannot qualify. It starts a fresh identity-bound observer,
 checks local exact-image metadata, Docker inspect hardening/bind/mount/resources, effective
 non-secret settings, trusted metrics authorization, and `/healthz` plus `/readyz` before it writes
 the attestation or invokes the paired benchmark child. It verifies the owned observer and container
-again after the child returns, then only cleans the captured labelled IDs and volume. Cleanup failure
-fails the stage. SIGINT/SIGTERM records an interruption outcome after the same scoped cleanup;
-additional interrupts are held until that cleanup and the atomic outcome write finish.
+again after the child returns, including the effective Docker stop timeout. The secret initializer
+and proxy use predeclared, labelled detached names; cleanup re-resolves only those exact owned
+resources before removing the labelled volume. Cleanup failure fails the stage. SIGINT/SIGTERM
+records an interruption outcome after the same scoped cleanup; additional interrupts are held until
+that cleanup and the atomic outcome write finish.
 
 The outcome is a mode-`600`, no-clobber JSON record written only after cleanup. Its exact fields
 bind the manifest, attestation, output-ledger SHA-256, and output count. A passed preflight requires
