@@ -40,6 +40,8 @@ def paired_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
         lease.run_manifest_sha256,
         "--cache-mode",
         _cache_mode(lease),
+        "--sampler-profile",
+        lease.sampler_profile,
     ]
     if lease.stage == "preflight":
         proxy_base_url, proxy_metrics_url, proxy_api_key_file, observer_ledger, attestation_path = _require_proxy_lease(
@@ -179,6 +181,8 @@ def _prime_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
         lease.run_manifest_sha256,
         "--cache-mode",
         "warm-prefix",
+        "--sampler-profile",
+        lease.sampler_profile,
         "--variant",
         _variant(lease, arm),
         "--base-url",

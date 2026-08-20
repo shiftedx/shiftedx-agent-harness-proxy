@@ -79,6 +79,7 @@ AttestationStage = Literal["preflight", "scored_proxy"]
 OutcomeStage = Literal["preflight", "scored-direct", "scored-proxy"]
 OutcomeStatus = Literal["passed", "failed", "interrupted"]
 CampaignLane = Literal["preflight", "cold", "warm-prefix"]
+LoopbackListenerState = Literal["listening", "refused", "indeterminate"]
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SOURCE_COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -283,6 +284,10 @@ class RuntimeCommandRunner(Protocol):
         self, url: str, *, headers: dict[str, str] | None = None, timeout: float = 5.0
     ) -> tuple[int, dict[str, Any] | None]: ...
 
+    def loopback_listener_state(
+        self, host: str, port: int, *, timeout: float = 1.0
+    ) -> LoopbackListenerState: ...
+
 
 class _ContainerMetricsReader:
     """Read one authenticated, exact metrics snapshot from the owned proxy only."""
@@ -449,6 +454,20 @@ class SubprocessRuntimeCommandRunner:
             return status, None
         return status, document if isinstance(document, dict) else None
 
+    def loopback_listener_state(
+        self, host: str, port: int, *, timeout: float = 1.0
+    ) -> LoopbackListenerState:
+        """Distinguish a refused loopback connection from all ambiguous failures."""
+
+        try:
+            connection = socket.create_connection((host, port), timeout=timeout)
+        except ConnectionRefusedError:
+            return "refused"
+        except (OSError, ValueError):
+            return "indeterminate"
+        connection.close()
+        return "listening"
+
 
 class _RuntimeModelEvidenceProbe:
     """Adapt the supervisor's narrow runtime seam to C1's read-only probe seam."""
@@ -507,6 +526,7 @@ class RuntimeLease:
     model: str
     benchmark_revision: str
     agentic_set: str
+    sampler_profile: Literal["corrected-parity-v1", "historical-aeon-v1"]
     scenario_order_sha256: str
     scenario_count: int
     benchmark_source_path: Path
@@ -584,6 +604,7 @@ class _BenchmarkSpec:
     checkout_path: Path
     interpreter_sha256: str
     agentic_set: str
+    sampler_profile: Literal["corrected-parity-v1", "historical-aeon-v1"]
     scenario_order_sha256: str
     scenario_count: int
 
@@ -1055,6 +1076,8 @@ class QualificationCampaignReadinessProbe:
             # never-written sentinel under the already-owned ``slots`` parent.
             _validate_private_run_dir(request.private_run_dir.parent)
             _validate_credentials(spec.credentials, upstream_authenticated=spec.model.upstream_authenticated)
+            if _model_readiness_state(runner, spec) == "offline":
+                return ReadinessResult("restart_required", None)
             session = _begin_model_evidence(
                 runner,
                 spec,
@@ -1069,6 +1092,28 @@ class QualificationCampaignReadinessProbe:
                 return ReadinessResult("restart_required", None)
             raise
         return ReadinessResult("ready", session.runtime_instance_sha256)
+
+
+def _model_readiness_state(
+    runner: RuntimeCommandRunner,
+    spec: _RuntimeSpec,
+) -> Literal["offline", "responding"]:
+    """Classify only a typed refused loopback connection as retryable."""
+
+    parsed = urlsplit(spec.model.upstream_url)
+    host = parsed.hostname
+    port = parsed.port
+    if host is None or port is None:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    try:
+        state = runner.loopback_listener_state(host, port, timeout=1.0)
+    except Exception as error:
+        raise QualificationRuntimeFailure("model_listener_probe_failed") from error
+    if state == "refused":
+        return "offline"
+    if state == "listening":
+        return "responding"
+    raise QualificationRuntimeFailure("model_listener_probe_failed")
 
 
 def _reserved_stage_paths(
@@ -1373,6 +1418,7 @@ def _parse_benchmark(value: Any) -> _BenchmarkSpec:
             "checkout_path",
             "interpreter_sha256",
             "agentic_set",
+            "sampler_profile",
             "scenario_order_sha256",
             "scenario_count",
         },
@@ -1389,6 +1435,9 @@ def _parse_benchmark(value: Any) -> _BenchmarkSpec:
     agentic_set = _required_text(benchmark.get("agentic_set"))
     if agentic_set not in {"core", "expanded", "repo"}:
         raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    sampler_profile = benchmark.get("sampler_profile")
+    if sampler_profile not in {"corrected-parity-v1", "historical-aeon-v1"}:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
     order_hash = _exact_string(benchmark, "scenario_order_sha256", _SHA256)
     count = _positive_int(benchmark.get("scenario_count"))
     return _BenchmarkSpec(
@@ -1398,6 +1447,7 @@ def _parse_benchmark(value: Any) -> _BenchmarkSpec:
         checkout_path,
         interpreter_sha256,
         agentic_set,
+        sampler_profile,
         order_hash,
         count,
     )
@@ -2266,6 +2316,7 @@ def _proxy_lease(
         model=spec.model.public_id,
         benchmark_revision=spec.benchmark.revision,
         agentic_set=spec.benchmark.agentic_set,
+        sampler_profile=spec.benchmark.sampler_profile,
         scenario_order_sha256=spec.benchmark.scenario_order_sha256,
         scenario_count=spec.benchmark.scenario_count,
         benchmark_source_path=spec.benchmark.checkout_path / "src",
@@ -2308,6 +2359,7 @@ def _direct_lease(
         model=spec.model.public_id,
         benchmark_revision=spec.benchmark.revision,
         agentic_set=spec.benchmark.agentic_set,
+        sampler_profile=spec.benchmark.sampler_profile,
         scenario_order_sha256=spec.benchmark.scenario_order_sha256,
         scenario_count=spec.benchmark.scenario_count,
         benchmark_source_path=spec.benchmark.checkout_path / "src",

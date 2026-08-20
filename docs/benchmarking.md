@@ -30,9 +30,17 @@ an evaluation adapter, not benchmark or proxy policy derived from expected answe
 
 ## Parity preflight and score gate
 
-The replacement qualification uses the frozen sampler `temperature=0.0`, `top_p=0.95`,
-`top_k=20`, thinking enabled, reasoning effort `medium`, and `max_tokens=1024`. Temperature `1.0`
-is a distinct future experiment and must not share a ledger with this parity run.
+The default replacement qualification uses the named `corrected-parity-v1` sampler:
+`temperature=0.0`, `top_p=0.95`, `top_k=20`, thinking enabled, reasoning effort `medium`, and
+`max_tokens=1024`.
+
+`historical-aeon-v1` is the separate historical AEON parity profile. It uses exactly
+`temperature=1.0`, `top_p=0.95`, `top_k=20`, thinking enabled, reasoning effort `medium`, and
+`max_tokens=1024`, matching the recorded AEON benchmark setting. The profile name is immutable
+manifest material: it is forwarded to preflight, cold scoring, warm priming, and scoring; its
+constants are therefore included in the downstream/model-boundary fingerprints and score gates.
+There are no individual sampler command-line overrides, and ledgers from these profiles must never
+be compared or combined.
 
 Before a scored command, run the paired preflight against the direct and proxy arms. It uses the
 same versioned phase planner on each arm while keeping the proxy's downstream request standard:
@@ -75,10 +83,17 @@ uv run python scripts/run_qualification_runtime.py \
 Run that same command again only after it reports the prior stage complete. It advances one event
 at a time in this fixed order: the sole preflight, then direct/proxy for cold pairs 1–3, then
 direct/proxy for warm-prefix pairs 1–3. An exit status of `2` means the next scored stage requires
-the independently operated MTPLX restart; restart the exact frozen model process, then repeat the
-same command. A failure retains its safe outcome after scoped cleanup, appends a terminal campaign
-event, and never authorizes a rerun. A stale labelled container or volume is a failure, never an
-automatic deletion target.
+the independently operated MTPLX restart; this includes an intentionally stopped model listener.
+The supervisor recognizes only a typed connection-refused result from its dedicated loopback
+listener probe as offline, and returns `2` before reserving a slot directory, evidence file, or
+terminal campaign event. A timeout or other socket error is indeterminate and fails closed; a live
+listener still proceeds through the hardened no-proxy, no-redirect, bounded HTTP and model-identity
+checks. Restart the exact frozen model process, then repeat the same command. Any responding but
+redirecting, oversized, malformed, unauthorized, wrong, non-fresh, or otherwise drifted model
+remains fail-closed. A
+failure retains its safe outcome after scoped cleanup, appends a terminal campaign event, and never
+authorizes a rerun. A stale labelled container or volume is a failure, never an automatic deletion
+target.
 The local MTPLX server is outside the supervisor lifecycle: restart it from the exact frozen model
 launch contract before `score-direct`, then restart it again before `score-proxy`. Each measured
 treatment needs its own dedicated process with `requests_completed == 0`; the supervisor rejects
@@ -151,6 +166,7 @@ uses `"schema_version": "1.0"` and exactly these keys:
       "checkout_path": "/absolute/private/path/shiftedx-bench",
       "interpreter_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
       "agentic_set": "expanded",
+      "sampler_profile": "corrected-parity-v1",
       "scenario_order_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
       "scenario_count": 12
     },

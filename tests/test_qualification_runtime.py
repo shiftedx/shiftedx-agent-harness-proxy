@@ -21,6 +21,7 @@ import pytest
 
 import shiftedx_harness_proxy.qualification_runtime as runtime_module
 from shiftedx_harness_proxy.qualification_campaign import (
+    CampaignFailure,
     CampaignSlot,
     ReadinessResult,
     StageRequest,
@@ -231,6 +232,7 @@ def _manifest(tmp_path: Path) -> Path:
                 "checkout_path": benchmark["checkout_path"],
                 "interpreter_sha256": benchmark["interpreter_sha256"],
                 "agentic_set": "expanded",
+                "sampler_profile": "corrected-parity-v1",
                 "scenario_order_sha256": _canonical_sha256(scenario_order),
                 "scenario_count": len(scenario_order),
             },
@@ -621,6 +623,10 @@ class _FakeRuntimeRunner:
 
     def prepare_model_evidence_contract(self, contract) -> None:
         self.model_contract = contract
+
+    def loopback_listener_state(self, host, port, *, timeout=1.0):
+        del host, port, timeout
+        return "listening"
 
     def _labels(self, argv: tuple[str, ...]) -> dict[str, str]:
         labels: dict[str, str] = {}
@@ -1170,6 +1176,40 @@ def test_subprocess_runtime_command_runner_fails_closed_when_no_pinned_tool_exis
 
     assert result.returncode == 125
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [(ConnectionRefusedError(), "refused"), (TimeoutError(), "indeterminate"), (OSError(), "indeterminate")],
+)
+def test_loopback_listener_probe_distinguishes_only_connection_refused(monkeypatch, failure, expected) -> None:
+    def fail_connection(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(runtime_module.socket, "create_connection", fail_connection)
+
+    state = runtime_module.SubprocessRuntimeCommandRunner().loopback_listener_state(
+        "127.0.0.1", 19999
+    )
+
+    assert state == expected
+
+
+def test_loopback_listener_probe_closes_a_live_connection(monkeypatch) -> None:
+    connection = SimpleNamespace(closed=False)
+
+    def close():
+        connection.closed = True
+
+    connection.close = close
+    monkeypatch.setattr(runtime_module.socket, "create_connection", lambda *_args, **_kwargs: connection)
+
+    state = runtime_module.SubprocessRuntimeCommandRunner().loopback_listener_state(
+        "127.0.0.1", 19999
+    )
+
+    assert state == "listening"
+    assert connection.closed is True
 
 
 def test_subprocess_runtime_command_runner_rejects_an_unallowlisted_absolute_tool(monkeypatch, tmp_path) -> None:
@@ -2363,6 +2403,129 @@ def test_campaign_advance_uses_runtime_adapter_and_binds_the_first_event(tmp_pat
     assert record["model_runtime_instance_sha256"] is not None
 
 
+def test_campaign_readiness_returns_restart_required_for_a_stopped_model_without_slot_artifacts(tmp_path) -> None:
+    """An intentional offline boundary is retryable, while live drift remains fail-closed."""
+
+    manifest = _manifest(tmp_path)
+    private_campaign_dir = _private_run(tmp_path, "offline-ready-private-campaign")
+    first = advance_qualification_campaign(
+        manifest,
+        private_campaign_dir,
+        stage_runner=runtime_module.QualificationCampaignStageRunner(
+            action=_write_complete_ledger,
+            command_runner=_FakeRuntimeRunner(),
+        ),
+        readiness_probe=runtime_module.QualificationCampaignReadinessProbe(command_runner=_FakeRuntimeRunner()),
+    )
+    assert first.kind == "stage_completed"
+
+    class OfflineRunner(_FakeRuntimeRunner):
+        def loopback_listener_state(self, host, port, *, timeout=1.0):
+            del host, port, timeout
+            return "refused"
+
+    offline = OfflineRunner()
+    advance = advance_qualification_campaign(
+        manifest,
+        private_campaign_dir,
+        stage_runner=runtime_module.QualificationCampaignStageRunner(
+            action=lambda _lease: pytest.fail("offline readiness must not start a scored stage"),
+            command_runner=offline,
+        ),
+        readiness_probe=runtime_module.QualificationCampaignReadinessProbe(command_runner=offline),
+    )
+
+    assert (advance.kind, advance.sequence, advance.stage) == ("restart_required", 2, "score-direct")
+    assert not (private_campaign_dir / "slots" / "01-cold-pair1").exists()
+    assert len(list((private_campaign_dir / "campaign-events").glob("*.json"))) == 1
+    assert not list((private_campaign_dir / "slots").glob(".readiness-*-model-cache-evidence.json"))
+
+
+def test_campaign_readiness_does_not_treat_a_responding_wrong_model_as_offline(tmp_path) -> None:
+    """Only the hardened no-response signal is a retryable restart boundary."""
+
+    manifest = _manifest(tmp_path)
+    private_campaign_dir = _private_run(tmp_path, "wrong-model-private-campaign")
+    first = advance_qualification_campaign(
+        manifest,
+        private_campaign_dir,
+        stage_runner=runtime_module.QualificationCampaignStageRunner(
+            action=_write_complete_ledger,
+            command_runner=_FakeRuntimeRunner(),
+        ),
+        readiness_probe=runtime_module.QualificationCampaignReadinessProbe(command_runner=_FakeRuntimeRunner()),
+    )
+    assert first.kind == "stage_completed"
+
+    class WrongLiveRunner(_FakeRuntimeRunner):
+        def http_json(self, url, *, headers=None, timeout=5.0):
+            if url.startswith("http://127.0.0.1:19999/"):
+                return 503, None
+            return super().http_json(url, headers=headers, timeout=timeout)
+
+    wrong = WrongLiveRunner()
+    with pytest.raises(CampaignFailure, match="campaign_readiness_probe_failed"):
+        advance_qualification_campaign(
+            manifest,
+            private_campaign_dir,
+            stage_runner=runtime_module.QualificationCampaignStageRunner(
+                action=lambda _lease: pytest.fail("a responding wrong model must not start a scored stage"),
+                command_runner=wrong,
+            ),
+            readiness_probe=runtime_module.QualificationCampaignReadinessProbe(command_runner=wrong),
+        )
+
+    assert not (private_campaign_dir / "slots" / "01-cold-pair1").exists()
+    assert len(list((private_campaign_dir / "campaign-events").glob("*.json"))) == 1
+
+
+@pytest.mark.parametrize("live_failure", ["redirect", "oversized"])
+def test_campaign_readiness_does_not_treat_a_live_invalid_http_endpoint_as_offline(
+    tmp_path, live_failure
+) -> None:
+    """Redirect and oversize rejection are live-protocol failures, not stopped listeners."""
+
+    manifest = _manifest(tmp_path)
+    private_campaign_dir = _private_run(tmp_path, f"{live_failure}-private-campaign")
+    first = advance_qualification_campaign(
+        manifest,
+        private_campaign_dir,
+        stage_runner=runtime_module.QualificationCampaignStageRunner(
+            action=_write_complete_ledger,
+            command_runner=_FakeRuntimeRunner(),
+        ),
+        readiness_probe=runtime_module.QualificationCampaignReadinessProbe(command_runner=_FakeRuntimeRunner()),
+    )
+    assert first.kind == "stage_completed"
+
+    class LiveInvalidRunner(_FakeRuntimeRunner):
+        def http_json(self, url, *, headers=None, timeout=5.0):
+            if url.startswith("http://127.0.0.1:19999/"):
+                # The hardened HTTP layer rejects both conditions with its
+                # generic status-zero sentinel even though TCP is listening.
+                return 0, None
+            return super().http_json(url, headers=headers, timeout=timeout)
+
+        def loopback_listener_state(self, host, port, *, timeout=1.0):
+            del host, port, timeout
+            return "listening"
+
+    live_invalid = LiveInvalidRunner()
+    with pytest.raises(CampaignFailure, match="campaign_readiness_probe_failed"):
+        advance_qualification_campaign(
+            manifest,
+            private_campaign_dir,
+            stage_runner=runtime_module.QualificationCampaignStageRunner(
+                action=lambda _lease: pytest.fail("a live invalid endpoint must not start a scored stage"),
+                command_runner=live_invalid,
+            ),
+            readiness_probe=runtime_module.QualificationCampaignReadinessProbe(command_runner=live_invalid),
+        )
+
+    assert not (private_campaign_dir / "slots" / "01-cold-pair1").exists()
+    assert len(list((private_campaign_dir / "campaign-events").glob("*.json"))) == 1
+
+
 def test_campaign_advances_a_full_first_pair_through_proxy_reconciliation(tmp_path) -> None:
     """The real adapter binds the pair-local direct result and proxy reconciliation."""
 
@@ -3017,6 +3180,7 @@ def _lease(stage: str) -> RuntimeLease:
         model="approved-model",
         benchmark_revision="335e6694e4aec13e9370af8a993d8c8f14d7ffb5",
         agentic_set="expanded",
+        sampler_profile="historical-aeon-v1",
         scenario_order_sha256="d" * 64,
         scenario_count=2,
         benchmark_source_path=Path("/private/benchmark/src"),
@@ -3072,6 +3236,7 @@ def test_thin_cli_derives_fixed_child_argv_without_secret_values(stage) -> None:
     assert "--candidate-source-commit" in argv
     assert "--candidate-image-digest" in argv
     assert "--run-manifest-sha256" in argv
+    assert argv[argv.index("--sampler-profile") + 1] == "historical-aeon-v1"
     assert argv[argv.index("--run-id") + 1] == "qualified-run"
     assert argv[argv.index("--cache-mode") + 1] == ("bypass" if stage == "preflight" else "warm-prefix")
     assert "private-secret-value" not in serialized
@@ -3124,6 +3289,7 @@ def test_thin_cli_runs_child_with_only_pinned_benchmark_source_environment(monke
     assert prime[prime.index("--cache-prime-arm") + 1] == "direct"
     assert prime[prime.index("--model-attempt-ledger") + 1] == ("/private/scored-direct-prime-model-boundary.jsonl")
     assert prime[prime.index("--base-url") + 1] == "https://private-model.invalid/v1"
+    assert prime[prime.index("--sampler-profile") + 1] == "historical-aeon-v1"
     scored = captured[1]
     assert scored["check"] is False
     assert scored["env"] == {
