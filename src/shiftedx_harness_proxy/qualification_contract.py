@@ -10,9 +10,11 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -125,6 +127,137 @@ def request_fingerprints(
     return downstream, model_facing
 
 
+def model_boundary_fingerprint(
+    payload: JsonObject, *, scenario_order: list[str] | None = None
+) -> SafeFingerprint:
+    """Fingerprint fields actually visible at one model-facing request boundary.
+
+    This intentionally excludes user turns, model output, tool arguments/results,
+    endpoints, and credentials. A transparent qualification observer can emit
+    this exact representation from proxy-to-model traffic without retaining a
+    request body.
+    """
+    fields = _model_boundary_fields(payload)
+    if scenario_order is not None:
+        fields.update(_model_boundary_context(scenario_order))
+    return SafeFingerprint("model_facing_observed", _sha256(fields), fields)
+
+
+def read_model_boundary_observer_ledger(path: Path) -> tuple[SafeFingerprint, ...]:
+    """Read a fresh private observer ledger without admitting payload-bearing fields."""
+    try:
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    except (OSError, json.JSONDecodeError) as error:
+        raise PreflightFailure("proxy model-boundary observer ledger is unavailable") from error
+    expected_keys = set(_model_boundary_field_keys())
+    fingerprints: list[SafeFingerprint] = []
+    for row in rows:
+        fields = row.get("fields") if isinstance(row, dict) else None
+        digest = row.get("digest") if isinstance(row, dict) else None
+        if (
+            not isinstance(row, dict)
+            or row.get("record_type") != "qualification_model_boundary"
+            or not isinstance(fields, dict)
+            or set(fields) != expected_keys
+            or not isinstance(digest, str)
+            or digest != _sha256(fields)
+        ):
+            raise PreflightFailure("proxy model-boundary observer ledger is invalid")
+        fingerprints.append(SafeFingerprint("model_facing_observed", digest, fields))
+    return tuple(fingerprints)
+
+
+def bind_model_boundary_context(
+    fingerprints: tuple[SafeFingerprint, ...], scenario_order: list[str]
+) -> tuple[SafeFingerprint, ...]:
+    """Bind observer component hashes to the frozen planner/benchmark/order context."""
+    context = _model_boundary_context(scenario_order)
+    return tuple(
+        SafeFingerprint(
+            fingerprint.boundary,
+            _sha256({**fingerprint.fields, **context}),
+            {**fingerprint.fields, **context},
+        )
+        for fingerprint in fingerprints
+    )
+
+
+def _model_boundary_fields(payload: JsonObject) -> dict[str, Any]:
+    return {
+        "system_prompt_sha256": _sha256(
+            next(
+                (
+                    message.get("content")
+                    for message in payload.get("messages", [])
+                    if isinstance(message, dict) and message.get("role") == "system"
+                ),
+                None,
+            )
+        ),
+        "tool_schema_sha256": _sha256(payload.get("tools")),
+        "tool_choice_policy": _safe_policy(payload.get("tool_choice")),
+        "terminal_schema_sha256": _sha256(payload.get("response_format")),
+        "sampler": {
+            "temperature": payload.get("temperature"),
+            "top_p": payload.get("top_p"),
+            "top_k": payload.get("top_k"),
+        },
+        "reasoning": {
+            "thinking_enabled": _thinking_enabled(payload.get("thinking")),
+            "effort": _safe_policy(payload.get("reasoning_effort")),
+        },
+        "token_budget": payload.get("max_tokens"),
+    }
+
+
+def _model_boundary_field_keys() -> tuple[str, ...]:
+    return (
+        "system_prompt_sha256",
+        "tool_schema_sha256",
+        "tool_choice_policy",
+        "terminal_schema_sha256",
+        "sampler",
+        "reasoning",
+        "token_budget",
+    )
+
+
+def _model_boundary_context(scenario_order: list[str]) -> dict[str, Any]:
+    return {
+        "compatibility": {"mode": COMPATIBILITY_MODE, "version": COMPATIBILITY_VERSION},
+        "benchmark_revision": BENCHMARK_REVISION,
+        "scenario_order": {"sha256": _sha256(scenario_order), "count": len(scenario_order)},
+    }
+
+
+def qualification_contract_digest(
+    payloads: list[JsonObject],
+    scenario_order: list[str],
+    *,
+    policy_delta: dict[str, bool],
+) -> str:
+    """Bind a scored invocation to every selected scenario's safe contract."""
+    planner = PhasePlanner()
+    return _sha256(
+        {
+            "compatibility": {"mode": planner.mode, "version": planner.version},
+            "benchmark_revision": BENCHMARK_REVISION,
+            "scenario_order": {"sha256": _sha256(scenario_order), "count": len(scenario_order)},
+            "contracts": [
+                contract_fingerprint(
+                    "downstream",
+                    payload,
+                    scenario_order,
+                    policy_delta=policy_delta,
+                    planner=planner,
+                    phase=None,
+                ).fields
+                for payload in payloads
+            ],
+        }
+    )
+
+
 def contract_fingerprint(
     boundary: str,
     payload: JsonObject,
@@ -228,22 +361,36 @@ def write_preflight_ledger(
     *,
     source_commit: str,
     image_digest: str,
+    contract_digests: dict[str, str],
+    failure_reason: str | None = None,
 ) -> None:
-    """Write only preflight-safe rows and a passed gate record."""
-    assert_preflight(observations)
+    """Atomically retain safe evidence for both passed and failed preflights."""
     records = [item.to_dict() for item in observations]
+    status = "passed"
+    failure = failure_reason
+    if failure is None:
+        try:
+            assert_preflight(observations)
+        except PreflightFailure as error:
+            status = "failed"
+            failure = str(error)
+    else:
+        status = "failed"
     records.append(
         {
             "schema_version": "1.0",
             "record_type": "paired_preflight_summary",
             "scored": False,
-            "status": "passed",
+            "status": status,
             "source_commit": source_commit,
             "image_digest": image_digest,
+            "qualification_contract_digests": dict(sorted(contract_digests.items())),
+            "failure": failure,
         }
     )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text("".join(_canonical(record) + "\n" for record in records), encoding="utf-8")
+    _atomic_write_jsonl(output, records)
+    if failure is not None:
+        raise PreflightFailure(failure)
 
 
 def require_scoring_gate(
@@ -252,14 +399,22 @@ def require_scoring_gate(
     preflight_ledger: Path,
     candidate_source_commit: str,
     candidate_image_digest: str,
+    contract_digest: str,
+    arm: Literal["direct", "proxy"],
 ) -> None:
     """Prohibit scored writes unless a matching paired preflight and immutable provenance exist."""
     if output.exists() and output.stat().st_size:
         raise SystemExit("refusing to append scored output; start a new output after preflight")
-    if not preflight_ledger.is_file() or not _ledger_matches(
-        preflight_ledger, candidate_source_commit, candidate_image_digest
+    summary = _ledger_summary(preflight_ledger)
+    if (
+        summary is None
+        or summary.get("status") != "passed"
+        or summary.get("source_commit") != candidate_source_commit
+        or summary.get("image_digest") != candidate_image_digest
     ):
         raise SystemExit("scored mode requires a successful paired preflight ledger with matching provenance")
+    if (summary.get("qualification_contract_digests") or {}).get(arm) != contract_digest:
+        raise SystemExit("scored mode qualification contract does not match the paired preflight")
     require_candidate_provenance(candidate_source_commit, candidate_image_digest)
 
 
@@ -306,18 +461,22 @@ def terminal_schema_valid(response: JsonObject, response_format: JsonObject | No
     return True
 
 
-def _ledger_matches(path: Path, source_commit: str, image_digest: str) -> bool:
+def _ledger_summary(path: Path) -> dict[str, Any] | None:
     try:
         rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
     except (OSError, json.JSONDecodeError):
-        return False
-    return any(
-        row.get("record_type") == "paired_preflight_summary"
-        and row.get("status") == "passed"
-        and row.get("source_commit") == source_commit
-        and row.get("image_digest") == image_digest
-        for row in rows
+        return None
+    return next(
+        (row for row in reversed(rows) if row.get("record_type") == "paired_preflight_summary"), None
     )
+
+
+def _atomic_write_jsonl(output: Path, records: list[dict[str, Any]]) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=output.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+        handle.write("".join(_canonical(record) + "\n" for record in records))
+    os.replace(temporary, output)
 
 
 def _matches_primitive(value: Any, expected: Any) -> bool:

@@ -76,6 +76,7 @@ def test_client_failure_is_recorded_without_response_body_and_run_continues(monk
             "expanded",
             "--variant",
             "proxy",
+            "--proxy-policy",
             "--run-id",
             "run-one",
             "--preflight-ledger",
@@ -225,6 +226,7 @@ def test_preflight_ledger_retains_only_hashes_and_allowlisted_outcomes(monkeypat
         ],
         source_commit="a" * 40,
         image_digest="sha256:" + "0" * 64,
+        contract_digests={"direct": "one", "proxy": "two"},
     )
 
     serialized = output.read_text()
@@ -275,6 +277,8 @@ def test_scored_mode_requires_a_successful_paired_preflight_and_exact_provenance
             preflight_ledger=missing_ledger,
             candidate_source_commit="not-the-current-source",
             candidate_image_digest="sha256:" + "0" * 64,
+            contract_digest="not-the-current-contract",
+            arm="direct",
         )
     assert not output.exists()
 
@@ -307,7 +311,250 @@ def test_fake_combined_tools_and_schema_collapse_is_recorded_as_zero_native_call
         runner.assert_preflight([observation])
 
 
-def _write_passing_preflight(runner, output, source_commit, image_digest):
+def test_proxy_preflight_counts_native_tool_calls_from_returned_responses(monkeypatch):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+
+    class ProxyModel:
+        def complete(self, payload, *, stream=False):
+            if any(message.get("role") == "tool" for message in payload["messages"]):
+                return {"content": '{"status":"passed"}', "tool_calls": []}
+            return {
+                "content": "",
+                "tool_calls": [{"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}],
+            }
+
+    payload = runner.request_payload(scenario, model="model", proxy_policy=True)
+    client = runner.CompatibilityClient(ProxyModel(), arm="proxy", scenario_order=[scenario.case_id], proxy_policy=True)
+    runner._run_preflight_path(client, payload, tool_required=True)
+
+    assert client.observation(tool_required=True, original_payload=payload).native_acquisition_tool_calls == 1
+
+
+def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    observer = tmp_path / "observer.jsonl"
+    planner = runner.PhasePlanner()
+
+    class FakeClient:
+        def __init__(self, base_url, *_args, **_kwargs):
+            self.is_proxy = "proxy" in base_url
+
+        def complete(self, payload, *, stream=False):
+            assert stream is False
+            if self.is_proxy:
+                observed_payloads = (
+                    (planner.plan(payload, phase="acquisition"),)
+                    if payload.get("tools")
+                    and not any(message.get("role") == "tool" for message in payload["messages"])
+                    else (
+                        planner.plan(payload, phase="acquisition"),
+                        planner.plan(payload, phase="finalization"),
+                    )
+                    if payload.get("tools")
+                    else (payload,)
+                )
+                with observer.open("a", encoding="utf-8") as handle:
+                    for observed in observed_payloads:
+                        fingerprint = runner.model_boundary_fingerprint(observed)
+                        handle.write(
+                            json.dumps(
+                                {
+                                    "record_type": "qualification_model_boundary",
+                                    "digest": fingerprint.digest,
+                                    "fields": fingerprint.fields,
+                                },
+                                sort_keys=True,
+                            )
+                            + "\n"
+                        )
+            if payload.get("tools") and not any(message.get("role") == "tool" for message in payload["messages"]):
+                return {
+                    "content": "",
+                    "tool_calls": [{"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}],
+                }
+            return {"content": '{"status":"passed"}', "tool_calls": []}
+
+    runner.OpenAIClient = FakeClient
+    metric_values = iter(({"acquisition": 0, "finalization": 0}, {"acquisition": 2, "finalization": 1}))
+    monkeypatch.setattr(runner, "_phase_metrics", lambda *_args: next(metric_values))
+    args = SimpleNamespace(
+        direct_base_url="http://direct.invalid/v1",
+        proxy_base_url="http://proxy.invalid/v1",
+        proxy_metrics_url="http://metrics.invalid",
+        proxy_observer_ledger=observer,
+        candidate_source_commit=_source_commit(),
+        candidate_image_digest="sha256:" + "0" * 64,
+        model="model",
+        direct_api_key_file=None,
+        proxy_api_key_file=None,
+        output=tmp_path / "preflight.jsonl",
+    )
+
+    runner._run_paired_preflight(args, [scenario])
+
+    assert '"status":"passed"' in args.output.read_text()
+
+
+def test_stale_proxy_observer_ledger_is_rejected_without_overwriting_it(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    observer = tmp_path / "observer.jsonl"
+    observer.write_text('{"old":"record"}\n')
+    output = tmp_path / "preflight.jsonl"
+    args = SimpleNamespace(
+        direct_base_url="http://direct.invalid/v1",
+        proxy_base_url="http://proxy.invalid/v1",
+        proxy_metrics_url="http://metrics.invalid",
+        proxy_observer_ledger=observer,
+        candidate_source_commit=_source_commit(),
+        candidate_image_digest="sha256:" + "0" * 64,
+        model="model",
+        direct_api_key_file=None,
+        proxy_api_key_file=None,
+        output=output,
+    )
+
+    with pytest.raises(SystemExit, match="new empty"):
+        runner._run_paired_preflight(args, [runner.scenario_set("expanded")[0]])
+
+    assert observer.read_text() == '{"old":"record"}\n'
+    assert '"status":"failed"' in output.read_text()
+
+
+def test_scored_fingerprint_uses_the_actual_compatibility_payload(monkeypatch):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+
+    class TerminalModel:
+        def complete(self, _payload, *, stream=False):
+            assert stream is False
+            return {"content": '{"status":"passed"}', "tool_calls": []}
+
+    payload = runner.request_payload(scenario, model="model", proxy_policy=False)
+    payload["top_k"] = 99
+    client = runner.CompatibilityClient(
+        TerminalModel(), arm="direct", scenario_order=[scenario.case_id], proxy_policy=False
+    )
+    client.complete(payload)
+
+    assert client.actual_contract_fingerprints()["downstream"]["fields"]["sampler"]["top_k"] == 99
+
+
+def test_observed_proxy_model_boundary_drift_is_not_masked_by_matching_plan(monkeypatch):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    payload = runner.request_payload(scenario, model="model", proxy_policy=False)
+    direct_components = runner.model_boundary_fingerprint(runner.PhasePlanner().plan(payload, phase="acquisition"))
+    drifted_payload = runner.PhasePlanner().plan(payload, phase="acquisition")
+    drifted_payload["top_k"] = 99
+    proxy_components = runner.model_boundary_fingerprint(drifted_payload)
+    terminal_payload = runner._preflight_payload(
+        scenario, model="model", proxy_policy=False, no_tools=True
+    )
+    terminal = runner.model_boundary_fingerprint(terminal_payload)
+    fingerprint = runner.SafeFingerprint("downstream", "same", {})
+    observations = [
+        runner.PreflightObservation(
+            "direct", True, 1, ("acquisition", "finalization"), True, fingerprint, (direct_components,)
+        ),
+        runner.PreflightObservation(
+            "proxy",
+            True,
+            1,
+            ("acquisition", "finalization"),
+            True,
+            fingerprint,
+            (proxy_components,),
+            {"acquisition": 2, "finalization": 1},
+        ),
+        *[
+            runner.PreflightObservation(arm, False, 0, ("terminal",), True, fingerprint, (terminal,))
+            for arm in ("direct", "proxy")
+        ],
+    ]
+
+    with pytest.raises(runner.PreflightFailure, match="model-facing contract mismatch"):
+        runner.assert_preflight(observations)
+
+
+def test_failed_preflight_writes_safe_unscored_ledger_and_never_creates_scored_output(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    payload = runner.request_payload(scenario, model="private-model", proxy_policy=False)
+    fingerprint, model_facing = runner.request_fingerprints(payload, [scenario.case_id], policy_delta={})
+    output = tmp_path / "preflight.jsonl"
+
+    with pytest.raises(runner.PreflightFailure, match="zero native acquisition tool calls"):
+        runner.write_preflight_ledger(
+            output,
+            [
+                runner.PreflightObservation(
+                    "direct", True, 0, ("acquisition", "finalization"), True, fingerprint, model_facing
+                )
+            ],
+            source_commit="a" * 40,
+            image_digest="sha256:" + "0" * 64,
+            contract_digests={"direct": "one", "proxy": "two"},
+        )
+
+    serialized = output.read_text()
+    assert '"status":"failed"' in serialized
+    assert '"scored":false' in serialized
+    assert scenario.prompt not in serialized
+    assert "read_file" not in serialized
+    assert "private-model" not in serialized
+
+
+def test_scoring_gate_rejects_a_different_scenario_contract(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    source_commit = _source_commit()
+    image_digest = "sha256:" + "0" * 64
+    ledger = tmp_path / "preflight.jsonl"
+    _write_passing_preflight(
+        runner, ledger, source_commit, image_digest, contract_digests={"direct": "one", "proxy": "two"}
+    )
+
+    with pytest.raises(SystemExit, match="qualification contract"):
+        runner.require_scoring_gate(
+            output=tmp_path / "scored.jsonl",
+            preflight_ledger=ledger,
+            candidate_source_commit=source_commit,
+            candidate_image_digest=image_digest,
+            contract_digest="different",
+            arm="direct",
+        )
+
+
+def test_failed_proxy_variant_uses_declared_proxy_policy_not_label_heuristics(monkeypatch):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    row = runner.failure_row(
+        scenario=scenario,
+        error=RuntimeError("HTTP 502"),
+        run_id="run",
+        variant="cold-pair1-proxy-expanded",
+        agentic_set="expanded",
+        model="model",
+        scenario_order=[scenario.case_id],
+        proxy_policy=True,
+        wall_s=0.1,
+    )
+
+    assert row["contract_fingerprints"]["downstream"]["fields"]["declared_policy_deltas"] == {
+        "x-shiftedx-require-receipt": True
+    }
+
+
+def _source_commit():
+    git = shutil.which("git")
+    assert git is not None
+    return subprocess.run(  # noqa: S603 - resolved executable and fixed Git arguments
+        [git, "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def _write_passing_preflight(runner, output, source_commit, image_digest, contract_digests=None):
     fingerprint = runner.SafeFingerprint("downstream", "same", {})
     model_fingerprint = runner.SafeFingerprint("model_facing", "same", {})
     observations = [
@@ -324,9 +571,20 @@ def _write_passing_preflight(runner, output, source_commit, image_digest):
         for arm in ("direct", "proxy")
         for tool_required in (True, False)
     ]
+    if contract_digests is None:
+        scenarios = runner.scenario_set("expanded")
+        contract_digests = {
+            arm: runner.qualification_contract_digest(
+                [runner.request_payload(item, model="model", proxy_policy=arm == "proxy") for item in scenarios],
+                [item.case_id for item in scenarios],
+                policy_delta={"x-shiftedx-require-receipt": True} if arm == "proxy" else {},
+            )
+            for arm in ("direct", "proxy")
+        }
     runner.write_preflight_ledger(
         output,
         observations,
         source_commit=source_commit,
         image_digest=image_digest,
+        contract_digests=contract_digests,
     )

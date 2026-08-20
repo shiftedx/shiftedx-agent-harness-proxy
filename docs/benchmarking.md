@@ -42,11 +42,36 @@ the synthetic one-tool path. The preflight writes only `scored:false` hash-only 
 copies prompts, schemas, tool calls or arguments/results, model output, credentials, endpoints,
 or host paths.
 
+For the proxy arm, place `scripts/qualification_model_boundary_observer.py` on the private hop
+between the proxy and model. Start it with `QUALIFICATION_OBSERVER_UPSTREAM` set to the approved
+model URL and `QUALIFICATION_OBSERVER_LEDGER` set to a new empty private file, then configure the
+proxy's fixed upstream URL to the observer. The observer forwards requests and records only hashes
+of the allowlisted model-boundary fields. Pass that same fresh file as `--proxy-observer-ledger`;
+the preflight rejects missing, stale, malformed, raw-field-bearing, or field-drifting observer
+records. Restore the fixed approved model URL after the preflight setup exercise; do not use this
+qualification observer as a production routing layer.
+
+For a dedicated qualification-only proxy instance, create the ledger before launch and wire its
+fixed upstream to the observer's loopback listener:
+
+```bash
+: > benchmark-reports/private/proxy-model-boundary.jsonl
+QUALIFICATION_OBSERVER_UPSTREAM="$MODEL_URL" \
+QUALIFICATION_OBSERVER_LEDGER=benchmark-reports/private/proxy-model-boundary.jsonl \
+  uv run python scripts/qualification_model_boundary_observer.py &
+UPSTREAM_BASE_URL=http://127.0.0.1:18092/v1 \
+  uv run shiftedx-agent-harness-proxy
+```
+
+The runner requires that observer ledger to be absent or empty before requests and will neither
+delete nor overwrite a non-empty one. Use a new observer and ledger for every preflight.
+
 ```bash
 uv run scripts/run_paired_agentic_trial.py \
   --paired-preflight --model "$PUBLIC_MODEL_ID" --agentic-set expanded \
   --direct-base-url "$DIRECT_URL" --proxy-base-url "$PROXY_URL" \
   --proxy-metrics-url "$PRIVATE_PROXY_METRICS_URL" \
+  --proxy-observer-ledger benchmark-reports/private/proxy-model-boundary.jsonl \
   --direct-api-key-file secrets/direct_key --proxy-api-key-file secrets/proxy_key \
   --output benchmark-reports/private/preflight.jsonl \
   --candidate-source-commit "$CANDIDATE_SOURCE_COMMIT" \
@@ -57,7 +82,10 @@ The command fails before any scored row when either arm produces zero native acq
 phase/field fingerprints differ outside the declared proxy receipt policy, proxy phase counters do
 not prove the equivalent split, or either terminal response fails strict-schema validation. A
 scored command requires that passed ledger and exactly matching checked-out source and immutable
-image digest:
+image digest. Failed preflights are atomically retained with `status:"failed"`, still contain only
+hashes/counts/allowlisted categories, and can never authorize scoring. The passed summary also
+binds each arm to its full selected scenario order and request-contract digest, so a `--case-id` or
+`--limit` preflight cannot authorize a differently selected scored run:
 
 ```bash
 uv run scripts/run_paired_agentic_trial.py \
