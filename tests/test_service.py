@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 from typing import Any
 
@@ -74,6 +75,22 @@ def request(messages: list[dict[str, Any]]) -> dict[str, Any]:
             {"type": "function", "function": {"name": "apply_patch", "parameters": {}}},
             {"type": "function", "function": {"name": "run_tests", "parameters": {}}},
         ],
+    }
+
+
+def strict_schema() -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "result",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"status": {"type": "string"}},
+                "required": ["status"],
+                "additionalProperties": False,
+            },
+        },
     }
 
 
@@ -212,6 +229,190 @@ async def test_terminal_correction_is_bounded_to_two_retries() -> None:
         await ChatService(Settings(upstream_base_url="http://upstream/v1"), upstream).complete(payload, {})
     assert raised.value.code == "harness_retry_exhausted"
     assert len(upstream.requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_phase_split_acquires_tools_then_finalizes_with_the_preserved_schema() -> None:
+    duplicate = call("again", "read_file", '{"path":"a.py"}')
+    upstream = ScriptedUpstream([completion(calls=[duplicate]), completion(content='```json\n{"status":"done"}\n```')])
+    payload = request(
+        [
+            {"role": "user", "content": "inspect"},
+            {"role": "assistant", "tool_calls": [call("old", "read_file", '{"path":"a.py"}')]},
+            {"role": "tool", "tool_call_id": "old", "content": "source"},
+        ]
+    )
+    payload["response_format"] = strict_schema()
+    payload["tool_choice"] = "auto"
+    payload["parallel_tool_calls"] = True
+
+    result = await ChatService(
+        Settings(upstream_base_url="http://upstream/v1", upstream_tool_response_capability_mode="phase_split"),
+        upstream,
+    ).complete(payload, {})
+
+    assert upstream.requests[0]["tools"] == payload["tools"]
+    assert "response_format" not in upstream.requests[0]
+    assert upstream.requests[0]["tool_choice"] == "auto"
+    assert upstream.requests[0]["parallel_tool_calls"] is True
+    assert upstream.requests[1]["response_format"] == payload["response_format"]
+    assert "tools" not in upstream.requests[1]
+    assert "tool_choice" not in upstream.requests[1]
+    assert "parallel_tool_calls" not in upstream.requests[1]
+    assert result.body["choices"][0]["message"]["content"] == '{"status":"done"}'
+
+
+@pytest.mark.asyncio
+async def test_phase_split_builds_a_fresh_outbound_payload_for_each_attempt() -> None:
+    duplicate = call("again", "read_file", '{"path":"a.py"}')
+
+    class MutatingUpstream(ScriptedUpstream):
+        async def chat(self, payload: dict[str, Any], request_headers: dict[str, str]) -> dict[str, Any]:
+            self.requests.append(copy.deepcopy(payload))
+            payload["vendor_extension"]["mutated"] = True
+            return self.responses.pop(0)
+
+    upstream = MutatingUpstream([completion(calls=[duplicate]), completion(content='{"status":"done"}')])
+    payload = request(
+        [
+            {"role": "user", "content": "inspect"},
+            {"role": "assistant", "tool_calls": [call("old", "read_file", '{"path":"a.py"}')]},
+            {"role": "tool", "tool_call_id": "old", "content": "source"},
+        ]
+    )
+    payload["response_format"] = strict_schema()
+    payload["vendor_extension"] = {"preserve": True}
+
+    await ChatService(
+        Settings(upstream_base_url="http://upstream/v1", upstream_tool_response_capability_mode="phase_split"),
+        upstream,
+    ).complete(payload, {})
+
+    assert upstream.requests[1]["vendor_extension"] == {"preserve": True}
+
+
+@pytest.mark.asyncio
+async def test_phase_split_keeps_receipt_free_and_invalid_terminals_in_acquisition_until_success() -> None:
+    upstream = ScriptedUpstream(
+        [
+            completion(content="not json"),
+            completion(content='{"status":"acquired"}'),
+            completion(content='{"status":"final"}'),
+        ]
+    )
+    payload = request([{"role": "user", "content": "answer"}])
+    payload["response_format"] = strict_schema()
+    payload["x-shiftedx-require-receipt"] = False
+
+    result = await ChatService(
+        Settings(upstream_base_url="http://upstream/v1", upstream_tool_response_capability_mode="phase_split"),
+        upstream,
+    ).complete(payload, {}, policy_extensions_allowed=True)
+
+    assert all("response_format" not in sent and "tools" in sent for sent in upstream.requests[:2])
+    assert "response_format" in upstream.requests[2]
+    assert "tools" not in upstream.requests[2]
+    assert result.body["choices"][0]["message"]["content"] == '{"status":"final"}'
+
+
+@pytest.mark.asyncio
+async def test_phase_split_never_releases_unexpected_finalization_tool_calls() -> None:
+    duplicate = call("again", "read_file", '{"path":"a.py"}')
+    unexpected = call("unexpected", "read_file", '{"path":"b.py"}')
+    upstream = ScriptedUpstream(
+        [completion(calls=[duplicate]), completion(calls=[unexpected]), completion(content='{"status":"done"}')]
+    )
+    payload = request(
+        [
+            {"role": "user", "content": "inspect"},
+            {"role": "assistant", "tool_calls": [call("old", "read_file", '{"path":"a.py"}')]},
+            {"role": "tool", "tool_call_id": "old", "content": "source"},
+        ]
+    )
+    payload["response_format"] = strict_schema()
+
+    result = await ChatService(
+        Settings(upstream_base_url="http://upstream/v1", upstream_tool_response_capability_mode="phase_split"),
+        upstream,
+    ).complete(payload, {})
+
+    assert result.body["choices"][0]["message"]["content"] == '{"status":"done"}'
+    assert all("tools" not in sent for sent in upstream.requests[1:])
+
+
+@pytest.mark.asyncio
+async def test_phase_split_returns_allowed_acquisition_tool_calls_unchanged() -> None:
+    allowed = call("new", "read_file", '{"path":"b.py"}')
+    upstream = ScriptedUpstream([completion(calls=[allowed])])
+    payload = request([{"role": "user", "content": "inspect"}])
+    payload["response_format"] = strict_schema()
+
+    result = await ChatService(
+        Settings(upstream_base_url="http://upstream/v1", upstream_tool_response_capability_mode="phase_split"),
+        upstream,
+    ).complete(payload, {})
+
+    assert result.body["choices"][0]["message"]["tool_calls"] == [allowed]
+    assert upstream.requests[0]["tools"] == payload["tools"]
+    assert "response_format" not in upstream.requests[0]
+
+
+@pytest.mark.asyncio
+async def test_phase_split_terminal_correction_exhaustion_remains_bounded() -> None:
+    upstream = ScriptedUpstream([completion(content="not json") for _ in range(3)])
+    payload = request([{"role": "user", "content": "answer"}])
+    payload["response_format"] = strict_schema()
+    payload["x-shiftedx-require-receipt"] = False
+
+    with pytest.raises(ProxyError) as raised:
+        await ChatService(
+            Settings(upstream_base_url="http://upstream/v1", upstream_tool_response_capability_mode="phase_split"),
+            upstream,
+        ).complete(payload, {}, policy_extensions_allowed=True)
+
+    assert raised.value.code == "harness_retry_exhausted"
+    assert len(upstream.requests) == 3
+    assert all("tools" in sent and "response_format" not in sent for sent in upstream.requests)
+
+
+@pytest.mark.asyncio
+async def test_phase_split_rejects_complex_combined_schema_without_an_upstream_call() -> None:
+    upstream = ScriptedUpstream([])
+    payload = request([{"role": "user", "content": "answer"}])
+    payload["response_format"] = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "result",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"nested": {"type": "array", "items": {"type": "string"}}},
+                "required": ["nested"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+    with pytest.raises(ProxyError) as raised:
+        await ChatService(
+            Settings(upstream_base_url="http://upstream/v1", upstream_tool_response_capability_mode="phase_split"),
+            upstream,
+        ).complete(payload, {})
+
+    assert raised.value.code == "unsupported_phase_split_schema"
+    assert upstream.requests == []
+
+
+@pytest.mark.asyncio
+async def test_passthrough_keeps_combined_complex_schema_payload_unchanged() -> None:
+    upstream = ScriptedUpstream([completion(calls=[call("new", "read_file", '{"path":"b.py"}')])])
+    payload = request([{"role": "user", "content": "answer"}])
+    payload["response_format"] = {"type": "json_schema", "json_schema": {"schema": {"type": "array"}}}
+
+    await ChatService(Settings(upstream_base_url="http://upstream/v1"), upstream).complete(payload, {})
+
+    assert upstream.requests[0]["tools"] == payload["tools"]
+    assert upstream.requests[0]["response_format"] == payload["response_format"]
 
 
 @pytest.mark.asyncio

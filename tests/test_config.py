@@ -80,6 +80,22 @@ def test_cache_capability_profiles_are_process_fixed_and_fail_closed() -> None:
     assert "providercachescope" in unknown.cache_namespace_fields()
 
 
+def test_tool_response_capability_mode_is_process_fixed_and_rejects_invalid_values() -> None:
+    assert Settings(upstream_base_url="http://model/v1").upstream_tool_response_capability_mode == "passthrough"
+    assert (
+        Settings(
+            upstream_base_url="http://model/v1",
+            upstream_tool_response_capability_mode="phase_split",
+        ).upstream_tool_response_capability_mode
+        == "phase_split"
+    )
+    with pytest.raises(ValidationError):
+        Settings(
+            upstream_base_url="http://model/v1",
+            upstream_tool_response_capability_mode="unsupported-provider-mode",
+        )
+
+
 @pytest.mark.parametrize(
     "configured_fields",
     ["", "provider_cache_scope,,alternate_scope", "---"],

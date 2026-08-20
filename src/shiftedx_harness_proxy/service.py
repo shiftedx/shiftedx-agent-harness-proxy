@@ -6,6 +6,7 @@ import copy
 import json
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,6 +19,7 @@ from .config import Settings, configured_roles
 from .core import HARNESS_SYSTEM_SUFFIX, AgentHarness, normalize_bare_json
 from .errors import ProxyError, UpstreamFailure
 from .projection_accounting import LOCAL_PROJECTION_EXTENSION, local_projection_accounting
+from .provider_capabilities import CapabilityPhase, outbound_payload, requires_phase_split
 from .transcript import (
     PolicyAnnotationError,
     Reconstruction,
@@ -52,11 +54,18 @@ class ChatResult:
 
 
 class ChatService:
-    def __init__(self, settings: Settings, upstream: Upstream) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        upstream: Upstream,
+        *,
+        phase_observer: Callable[[CapabilityPhase], None] | None = None,
+    ) -> None:
         self.settings = settings
         self.upstream = upstream
         self.base_roles = configured_roles(settings)
         self.cache_namespace_fields = settings.cache_namespace_fields()
+        self.phase_observer = phase_observer or _ignore_phase
 
     async def complete(
         self,
@@ -132,6 +141,23 @@ class ChatService:
                 ),
             )
         contract = response_schema_contract(forwarded.get("response_format"))
+        if (
+            self.settings.upstream_tool_response_capability_mode == "phase_split"
+            and tools
+            and "response_format" in forwarded
+            and not contract.strict_primitive_object
+        ):
+            raise ProxyError(
+                400,
+                "unsupported_phase_split_schema",
+                "The selected upstream capability mode cannot safely enforce this response schema with tools.",
+            )
+        use_phase_split = requires_phase_split(
+            self.settings.upstream_tool_response_capability_mode,
+            has_tools=bool(tools),
+            has_response_format="response_format" in forwarded,
+            strict_schema_supported=contract.strict_primitive_object,
+        )
         available = {_tool_name(tool) for tool in tools}
         require_receipt = (
             self.settings.require_receipt_when_tools_present
@@ -167,14 +193,19 @@ class ChatService:
             )
 
         working_messages = _inject_harness(copy.deepcopy(forwarded["messages"]), harness, rebuilt)
-        forwarded["messages"] = working_messages
         upstream_calls = 0
         internal_retries = 0
+        phase: CapabilityPhase | None = "acquisition" if use_phase_split else None
 
         while upstream_calls < self.settings.max_upstream_calls:
-            if harness.force_finalize:
-                forwarded["tool_choice"] = "none"
-            response = await self.upstream.chat(forwarded, request_headers)
+            if use_phase_split and harness.force_finalize:
+                phase = "finalization"
+            attempt_payload = outbound_payload(forwarded, working_messages, phase=phase)
+            if harness.force_finalize and not use_phase_split:
+                attempt_payload["tool_choice"] = "none"
+            if phase is not None:
+                self.phase_observer(phase)
+            response = await self.upstream.chat(attempt_payload, request_headers)
             upstream_calls += 1
             message = _response_message(response)
             calls = message.get("tool_calls") or []
@@ -182,6 +213,19 @@ class ChatService:
             if calls:
                 if not isinstance(calls, list):
                     raise UpstreamFailure("upstream_malformed_tool_calls")
+                if phase == "finalization":
+                    if harness.terminal_corrections >= 2 or internal_retries >= self.settings.max_internal_retries:
+                        break
+                    internal_retries += 1
+                    working_messages.append(
+                        {
+                            "role": "user",
+                            "content": harness.correction(
+                                "The finalization response cannot contain tool calls."
+                            ),
+                        }
+                    )
+                    continue
                 rejected = _rejected_results(calls, harness)
                 if not rejected:
                     return ChatResult(
@@ -222,6 +266,9 @@ class ChatService:
                 content = normalized
             issue = harness.terminal_issue(content)
             if issue is None:
+                if phase == "acquisition":
+                    phase = "finalization"
+                    continue
                 return ChatResult(
                     _without_reserved_projection_marker(response),
                     _telemetry(
@@ -250,6 +297,10 @@ def _tool_name(tool: JsonObject) -> str:
     if not isinstance(function, dict) or not isinstance(function.get("name"), str):
         raise ProxyError(400, "invalid_tools", "Every tool must contain function.name.")
     return str(function["name"])
+
+
+def _ignore_phase(_phase: CapabilityPhase) -> None:
+    return None
 
 
 def _validate_chat_payload(payload: JsonObject, *, harness_enabled: bool) -> None:

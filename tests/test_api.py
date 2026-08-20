@@ -35,6 +35,36 @@ class EchoUpstream:
         return None
 
 
+class PhaseSplitUpstream(EchoUpstream):
+    async def chat(self, payload: dict[str, Any], request_headers: dict[str, str]) -> dict[str, Any]:
+        self.requests.append(payload)
+        if "tools" in payload:
+            return {
+                "id": "chatcmpl",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "again",
+                                    "type": "function",
+                                    "function": {"name": "read_file", "arguments": '{"path":"a.py"}'},
+                                }
+                            ],
+                        }
+                    }
+                ],
+            }
+        return {
+            "id": "chatcmpl",
+            "choices": [
+                {"message": {"role": "assistant", "content": '{"status":"done"}'}}
+            ],
+        }
+
+
 @pytest.mark.asyncio
 async def test_http_surface_auth_health_streaming_and_unknown_request_passthrough() -> None:
     upstream = EchoUpstream()
@@ -118,6 +148,97 @@ async def test_local_projection_marker_and_accounting_do_not_depend_on_telemetry
     assert upstream.requests == []
     assert "shiftedx_proxy_receipt_projections_total 1" in metrics.text
     assert "shiftedx_proxy_local_projection_upstream_calls_avoided_total 1" in metrics.text
+
+
+@pytest.mark.asyncio
+async def test_http_phase_split_uses_two_safe_payload_phases_and_aggregate_only_counters() -> None:
+    upstream = PhaseSplitUpstream()
+    app = create_app(
+        Settings(upstream_base_url="http://upstream/v1", upstream_tool_response_capability_mode="phase_split"),
+        upstream,
+    )
+    schema = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "result",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"status": {"type": "string"}},
+                "required": ["status"],
+                "additionalProperties": False,
+            },
+        },
+    }
+    payload = {
+        "model": "model",
+        "messages": [
+            {"role": "user", "content": "inspect"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "old",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"path":"a.py"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "old", "content": "source"},
+        ],
+        "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+        "response_format": schema,
+    }
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
+            response = await client.post("/v1/chat/completions", json=payload)
+            metrics = await client.get("/metrics")
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == '{"status":"done"}'
+    assert "response_format" not in upstream.requests[0]
+    assert upstream.requests[0]["tools"] == payload["tools"]
+    assert upstream.requests[1]["response_format"] == schema
+    assert "tools" not in upstream.requests[1]
+    assert "tool_choice" not in upstream.requests[1]
+    assert "shiftedx_proxy_phase_acquisition_total 1" in metrics.text
+    assert "shiftedx_proxy_phase_finalization_total 1" in metrics.text
+    assert "shiftedx_proxy_phase_schema_rejections_total 0" in metrics.text
+
+
+@pytest.mark.asyncio
+async def test_http_phase_split_complex_schema_fails_closed_without_echoing_or_upstream_call() -> None:
+    upstream = EchoUpstream()
+    app = create_app(
+        Settings(upstream_base_url="http://upstream/v1", upstream_tool_response_capability_mode="phase_split"),
+        upstream,
+    )
+    payload = {
+        "model": "model",
+        "messages": [{"role": "user", "content": "answer"}],
+        "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "result",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {"items": {"type": "array", "items": {"type": "string"}}},
+                    "required": ["items"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    }
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
+            response = await client.post("/v1/chat/completions", json=payload)
+            metrics = await client.get("/metrics")
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "unsupported_phase_split_schema"
+    assert "items" not in response.text
+    assert upstream.requests == []
+    assert "shiftedx_proxy_phase_schema_rejections_total 1" in metrics.text
 
 
 @pytest.mark.asyncio

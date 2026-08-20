@@ -146,6 +146,7 @@ projection, parallel calls, and degraded transcript behavior.
 | `TRUSTED_POLICY_EXTENSION_API_KEYS` | unset | Distinct comma-separated opaque bearer capabilities allowed to disable receipt requirements or override protected tool roles |
 | `ALLOW_HARNESS_OPT_OUT` | `false` | Allows only trusted policy-extension principals to send `X-Shiftedx-Harness: off` |
 | `UPSTREAM_CACHE_CAPABILITY_MODE` | `disabled` | Generic cache capability profile; `disabled` and `unknown` reject client namespace controls |
+| `UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE` | `passthrough` | `phase_split` for upstreams such as MTPLX that cannot combine tool and strict response-schema grammars |
 | `UPSTREAM_CACHE_NAMESPACE_FIELDS` | unset | Comma-separated, nonblank additional top-level client cache namespace field names to reject |
 | `MAX_INTERNAL_RETRIES` | `4` | Internal policy retries per request |
 | `MAX_UPSTREAM_CALLS` | `7` | Total upstream-call ceiling per request |

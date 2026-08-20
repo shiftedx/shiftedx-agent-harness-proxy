@@ -15,6 +15,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .cache_policy import CacheCapabilityMode, cache_namespace_field_names
 from .core import HARNESS_PROFILE, ToolRoles
+from .provider_capabilities import ToolResponseCapabilityMode
 
 _HTTP_BEARER_TOKEN = re.compile(r"[A-Za-z0-9\-._~+/]+={0,}")
 
@@ -36,6 +37,7 @@ class Settings(BaseSettings):
     listen_port: int = Field(default=8090, ge=1, le=65535)
     trusted_policy_extension_api_keys: SecretStr | None = None
     upstream_cache_capability_mode: CacheCapabilityMode = "disabled"
+    upstream_tool_response_capability_mode: ToolResponseCapabilityMode = "passthrough"
     upstream_cache_namespace_fields: str | None = None
     harness_profile: str = HARNESS_PROFILE
     harness_config_file: Path | None = None
