@@ -542,6 +542,49 @@ def test_phase_planner_splits_tools_and_terminal_schema(monkeypatch):
     assert payload["max_tokens"] == 1024
 
 
+@pytest.mark.parametrize("arm", ("direct", "proxy"))
+def test_preflight_post_tool_continuation_disables_additional_tool_calls_for_both_arms(monkeypatch, arm):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    payload = runner.request_payload(scenario, model="model", proxy_policy=arm == "proxy")
+
+    class TemperatureOneStyleClient:
+        def __init__(self):
+            self.payloads = []
+
+        def complete(self, request):
+            self.payloads.append(copy.deepcopy(request))
+            if len(self.payloads) == 1 or request.get("tool_choice") == "auto":
+                return {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": f"call-{len(self.payloads)}",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }
+                    ],
+                }
+            return {"content": '{"status":"passed"}', "tool_calls": []}
+
+    client = TemperatureOneStyleClient()
+    runner._run_preflight_path(client, payload, tool_required=True)
+
+    assert len(client.payloads) == 2
+    assert client.payloads[0]["tool_choice"] == "auto"
+    assert client.payloads[1]["tool_choice"] == "none"
+    assert client.payloads[1]["tools"] == payload["tools"]
+    assert client.payloads[1]["response_format"] == payload["response_format"]
+    assert client.payloads[1]["messages"][-2] == {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "content": "synthetic preflight tool completed",
+    }
+    assert client.payloads[1]["messages"][-1] == {
+        "role": "user",
+        "content": runner._PREFLIGHT_FINALIZATION_PROMPT,
+    }
+
+
 def test_historical_aeon_profile_binds_payload_fingerprint_prime_and_score_gate(monkeypatch):
     """The known-good AEON sampler is a named, end-to-end qualification contract."""
 
@@ -1604,6 +1647,8 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
     observer = tmp_path / "observer.jsonl"
     planner = runner.PhasePlanner()
     sequence = [0]
+    tool_call_sequence = [0]
+    phase_metrics = {"acquisition": 0, "finalization": 0}
 
     class FakeClient:
         def __init__(self, base_url, *_args, **_kwargs):
@@ -1611,11 +1656,19 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
 
         def complete(self, payload, *, stream=False):
             assert stream is False
+            tool_result_present = any(message.get("role") == "tool" for message in payload["messages"])
+            finalization_requested = payload["messages"][-1] == {
+                "role": "user",
+                "content": runner._PREFLIGHT_FINALIZATION_PROMPT,
+            }
+            should_call_tool = bool(payload.get("tools")) and (
+                not tool_result_present or payload.get("tool_choice") == "auto"
+            )
             if self.is_proxy:
                 observed_payloads = (
                     (planner.plan(payload, phase="acquisition"),)
                     if payload.get("tools")
-                    and not any(message.get("role") == "tool" for message in payload["messages"])
+                    and (should_call_tool or not finalization_requested)
                     else (
                         planner.plan(payload, phase="acquisition"),
                         planner.plan(payload, phase="finalization"),
@@ -1624,14 +1677,24 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
                     else (payload,)
                 )
                 for observed in observed_payloads:
+                    if payload.get("tools"):
+                        phase_metrics["acquisition" if observed.get("tools") else "finalization"] += 1
                     observed["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
                     sequence[0] += 1
                     _append_observer_record(runner, observer, observed, sequence[0])
-            if payload.get("tools") and not any(message.get("role") == "tool" for message in payload["messages"]):
+            if should_call_tool:
+                tool_call_sequence[0] += 1
                 response = _cache_response(
-                    tool_calls=[{"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}],
+                    tool_calls=[
+                        {
+                            "id": f"call-{tool_call_sequence[0]}",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }
+                    ],
                     bypass=True,
                 )
+            elif payload.get("tools") and not finalization_requested:
+                response = _cache_response(content="not terminal schema", bypass=True)
             else:
                 response = _cache_response(content='{"status":"passed"}', bypass=True)
             if self.is_proxy:
@@ -1644,8 +1707,7 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
             return response
 
     runner.ProjectionAwareOpenAIClient = FakeClient
-    metric_values = iter(({"acquisition": 0, "finalization": 0}, {"acquisition": 2, "finalization": 1}))
-    monkeypatch.setattr(runner, "_phase_metrics", lambda *_args: next(metric_values))
+    monkeypatch.setattr(runner, "_phase_metrics", lambda *_args: dict(phase_metrics))
     source_commit = _source_commit()
     image_digest = "sha256:" + "0" * 64
     runtime_attestation = _write_runtime_attestation(
@@ -1678,11 +1740,36 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
     assert '"status":"passed"' in args.output.read_text()
     direct_attempts = read_model_boundary_observer_records(args.direct_model_attempt_ledger)
     assert [record.sequence for record in direct_attempts] == [1, 2, 3, 4]
+    assert [record.fields["compatibility"]["phase"] for record in direct_attempts] == [
+        "acquisition",
+        "acquisition",
+        "finalization",
+        "finalization",
+    ]
     assert all(record.fields["cache_mode_policy"] == "bypass" for record in direct_attempts)
     assert all(record.cache.request_session_bank_bypass for record in direct_attempts if record.cache)
     proxy_attempts = read_model_boundary_observer_records(observer)
+    assert [record.fields["compatibility"]["phase"] for record in proxy_attempts] == [
+        "acquisition",
+        "acquisition",
+        "finalization",
+        "finalization",
+    ]
     assert all(record.fields["cache_mode_policy"] == "bypass" for record in proxy_attempts)
     assert all(record.cache.request_session_bank_bypass for record in proxy_attempts if record.cache)
+    records = [json.loads(line) for line in args.output.read_text().splitlines()]
+    tool_records = {record["arm"]: record for record in records if record.get("path") == "tool_required"}
+    assert {arm: record["native_acquisition_tool_calls"] for arm, record in tool_records.items()} == {
+        "direct": 1,
+        "proxy": 1,
+    }
+    assert tool_records["proxy"]["proxy_phase_counts"] == {"acquisition": 2, "finalization": 1}
+    proxy_requests = read_request_accounting_ledger(args.proxy_request_ledger)
+    assert [record.phase_counts for record in proxy_requests] == [
+        {"acquisition": 1, "finalization": 0},
+        {"acquisition": 1, "finalization": 1},
+        {"acquisition": 0, "finalization": 1},
+    ]
 
 
 def test_stale_proxy_observer_ledger_is_rejected_without_overwriting_it(monkeypatch, tmp_path):

@@ -66,6 +66,10 @@ _SYSTEM_PROMPT = (
     "You are an autonomous coding agent in a deterministic sandbox. Use supplied tools, never invent "
     "results, recover from failures, verify completion, and obey the requested final JSON format."
 )
+_PREFLIGHT_FINALIZATION_PROMPT = (
+    "Preflight finalization: do not call tools. Return the exact requested bare JSON object now, "
+    "without commentary or fences."
+)
 _HTTP_STATUS = re.compile(r"\bHTTP ([1-5][0-9]{2})\b")
 _CANONICAL_COUNTER = re.compile(r"^(?:0|[1-9][0-9]{0,19})$")
 _MAX_PROXY_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -651,8 +655,10 @@ def _run_preflight_path(client: CompatibilityClient, payload: dict[str, Any], *,
                     "content": "synthetic preflight tool completed",
                 }
             )
+        messages.append({"role": "user", "content": _PREFLIGHT_FINALIZATION_PROMPT})
         continued = dict(payload)
         continued["messages"] = messages
+        continued["tool_choice"] = "none"
         client.complete(continued)
 
 
