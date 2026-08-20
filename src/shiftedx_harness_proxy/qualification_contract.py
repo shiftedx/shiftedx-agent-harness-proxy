@@ -18,7 +18,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from .core import HARNESS_SYSTEM_SUFFIX
 
@@ -45,6 +45,10 @@ class RuntimeAttestationFailure(PreflightFailure):
 
 class RuntimeOutcomeFailure(PreflightFailure):
     """Raised when a prior supervised stage did not produce exact passing evidence."""
+
+
+class ModelEvidenceFailure(PreflightFailure):
+    """Raised when immutable MTPLX identity/cache evidence is missing or invalid."""
 
 
 @dataclass(frozen=True)
@@ -155,6 +159,7 @@ class RuntimeAttestation:
     benchmark_revision: str
     scenario_order_sha256: str
     scenario_order_count: int
+    model_identity_sha256: str
     runtime_contract_sha256: str
     runtime_instance_sha256: str
     checks: dict[str, bool]
@@ -168,9 +173,183 @@ class RuntimeOutcome:
     stage: Literal["preflight", "scored-direct", "scored-proxy"]
     run_manifest_sha256: str
     attestation_sha256: str
+    model_evidence_sha256: str
     output_ledger_sha256: str
     output_record_count: int
     file_sha256: str
+
+
+@dataclass(frozen=True)
+class ModelEvidence:
+    """Validated, hash-only identity of one passed C1 model-evidence artifact."""
+
+    stage: Literal["preflight", "score-direct", "score-proxy"]
+    run_manifest_sha256: str
+    model_identity_sha256: str
+    model_contract_sha256: str
+    runtime_instance_sha256: str
+    file_sha256: str
+
+
+def load_model_evidence(
+    path: Path,
+    *,
+    expected_stage: Literal["preflight", "score-direct", "score-proxy"],
+    run_manifest_sha256: str,
+    model_identity_sha256: str,
+    model_contract_sha256: str | None = None,
+) -> ModelEvidence:
+    """Load exactly one passed, private C1 artifact without admitting payload-bearing fields."""
+
+    try:
+        serialized = _read_private_regular_file(path)
+        document = json.loads(serialized, object_pairs_hook=_unique_json_object)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise ModelEvidenceFailure("model_evidence_invalid") from error
+    root_keys = {
+        "schema_version",
+        "record_type",
+        "stage",
+        "status",
+        "failure_category",
+        "run_manifest_sha256",
+        "model_identity_sha256",
+        "model_contract_sha256",
+        "runtime_instance_sha256",
+        "live_before_sha256",
+        "live_after_sha256",
+        "request_window",
+        "prime",
+        "first_attempt",
+        "checks",
+    }
+    checks = document.get("checks") if isinstance(document, dict) else None
+    request_window = document.get("request_window") if isinstance(document, dict) else None
+    prime = document.get("prime") if isinstance(document, dict) else None
+    first_attempt = document.get("first_attempt") if isinstance(document, dict) else None
+    if (
+        not isinstance(document, dict)
+        or set(document) != root_keys
+        or document.get("schema_version") != "1.0"
+        or document.get("record_type") != "qualification_model_cache_evidence"
+        or document.get("stage") != expected_stage
+        or document.get("status") != "passed"
+        or document.get("failure_category") is not None
+        or _SHA256_HEX.fullmatch(run_manifest_sha256) is None
+        or document.get("run_manifest_sha256") != run_manifest_sha256
+        or _SHA256_HEX.fullmatch(model_identity_sha256) is None
+        or document.get("model_identity_sha256") != model_identity_sha256
+        or not _sha256_value(document.get("model_contract_sha256"))
+        or model_contract_sha256 is not None
+        and (
+            _SHA256_HEX.fullmatch(model_contract_sha256) is None
+            or document.get("model_contract_sha256") != model_contract_sha256
+        )
+        or not _sha256_value(document.get("runtime_instance_sha256"))
+        or not _sha256_value(document.get("live_before_sha256"))
+        or not _sha256_value(document.get("live_after_sha256"))
+        or not _valid_model_request_window(request_window)
+        or not _valid_model_prime(prime)
+        or not _valid_model_first_attempt(first_attempt)
+        or not isinstance(checks, dict)
+        or set(checks) != {"contract", "live_before", "attempts", "request_window", "live_after"}
+        or any(value is not True for value in checks.values())
+    ):
+        raise ModelEvidenceFailure("model_evidence_invalid")
+    return ModelEvidence(
+        stage=expected_stage,
+        run_manifest_sha256=run_manifest_sha256,
+        model_identity_sha256=model_identity_sha256,
+        model_contract_sha256=cast(str, document["model_contract_sha256"]),
+        runtime_instance_sha256=document["runtime_instance_sha256"],
+        file_sha256=hashlib.sha256(serialized).hexdigest(),
+    )
+
+
+def _sha256_value(value: Any) -> bool:
+    return isinstance(value, str) and _SHA256_HEX.fullmatch(value) is not None
+
+
+def _nonnegative_model_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _optional_sha256(value: Any) -> bool:
+    return value is None or _sha256_value(value)
+
+
+def _valid_model_request_window(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "before",
+        "after",
+        "delta",
+        "expected",
+        "successful_measured",
+    }:
+        return False
+    before = value.get("before")
+    after = value.get("after")
+    delta = value.get("delta")
+    expected = value.get("expected")
+    successful = value.get("successful_measured")
+    values = (before, after, delta, expected, successful)
+    if not all(_nonnegative_model_count(item) for item in values):
+        return False
+    before_count, after_count, delta_count, expected_count, successful_count = cast(
+        tuple[int, int, int, int, int], values
+    )
+    return (
+        after_count - before_count == delta_count
+        and expected_count == delta_count
+        and successful_count <= expected_count
+    )
+
+
+def _valid_model_prime(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {"record_sha256", "count", "request_digest"}:
+        return False
+    count = value.get("count")
+    if not isinstance(count, int) or isinstance(count, bool) or count not in {0, 1}:
+        return False
+    record_sha256 = value.get("record_sha256")
+    request_digest = value.get("request_digest")
+    return (
+        _optional_sha256(record_sha256)
+        and _optional_sha256(request_digest)
+        and (count == 1 if record_sha256 is not None and request_digest is not None else count == 0)
+    )
+
+
+def _valid_model_first_attempt(value: Any) -> bool:
+    keys = {
+        "record_sha256",
+        "status",
+        "measured_count",
+        "successful_count",
+        "prompt_tokens",
+        "cached_tokens",
+        "new_prefill_tokens",
+    }
+    if not isinstance(value, dict) or set(value) != keys:
+        return False
+    measured = value.get("measured_count")
+    successful = value.get("successful_count")
+    status = value.get("status")
+    counts = (value.get("prompt_tokens"), value.get("cached_tokens"), value.get("new_prefill_tokens"))
+    if not _nonnegative_model_count(measured) or not _nonnegative_model_count(successful):
+        return False
+    measured_count, successful_count = cast(tuple[int, int], (measured, successful))
+    if successful_count > measured_count:
+        return False
+    if status is not None and status not in {"succeeded", "failed"}:
+        return False
+    if not _optional_sha256(value.get("record_sha256")):
+        return False
+    if any(item is not None and not _nonnegative_model_count(item) for item in counts):
+        return False
+    if measured_count == 0:
+        return status is None and value.get("record_sha256") is None and all(item is None for item in counts)
+    return status is not None and value.get("record_sha256") is not None and all(item is not None for item in counts)
 
 
 def load_runtime_outcome(
@@ -179,17 +358,34 @@ def load_runtime_outcome(
     expected_stage: Literal["preflight", "scored-direct", "scored-proxy"],
     run_manifest_sha256: str,
     attestation: Path,
+    model_evidence: Path,
+    model_identity_sha256: str,
     output_ledger: Path,
     expected_output_record_count: int,
+    model_contract_sha256: str | None = None,
 ) -> RuntimeOutcome:
     """Load a passed outcome bound to the exact private attestation and output bytes."""
 
     try:
         serialized = _read_private_regular_file(path)
         attestation_bytes = _read_private_regular_file(attestation)
+        if expected_stage == "preflight":
+            evidence_stage: Literal["preflight", "score-direct", "score-proxy"] = "preflight"
+        elif expected_stage == "scored-direct":
+            evidence_stage = "score-direct"
+        else:
+            evidence_stage = "score-proxy"
+        loaded_model_evidence = load_model_evidence(
+            model_evidence,
+            expected_stage=evidence_stage,
+            run_manifest_sha256=run_manifest_sha256,
+            model_identity_sha256=model_identity_sha256,
+            model_contract_sha256=model_contract_sha256,
+        )
         output_bytes = _read_private_regular_file(output_ledger)
+        attestation_document = json.loads(attestation_bytes, object_pairs_hook=_unique_json_object)
         document = json.loads(serialized, object_pairs_hook=_unique_json_object)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+    except (ModelEvidenceFailure, OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise RuntimeOutcomeFailure("runtime_outcome_invalid") from error
     root_keys = {
         "schema_version",
@@ -200,6 +396,7 @@ def load_runtime_outcome(
         "failure_category",
         "run_manifest_sha256",
         "attestation_sha256",
+        "model_evidence_sha256",
         "output_ledger_sha256",
         "output_record_count",
     }
@@ -219,6 +416,9 @@ def load_runtime_outcome(
         or _SHA256_HEX.fullmatch(run_manifest_sha256) is None
         or document.get("run_manifest_sha256") != run_manifest_sha256
         or document.get("attestation_sha256") != attestation_sha256
+        or document.get("model_evidence_sha256") != loaded_model_evidence.file_sha256
+        or not isinstance(attestation_document, dict)
+        or attestation_document.get("model_identity_sha256") != loaded_model_evidence.model_identity_sha256
         or document.get("output_ledger_sha256") != output_ledger_sha256
         or not isinstance(expected_output_record_count, int)
         or isinstance(expected_output_record_count, bool)
@@ -235,6 +435,7 @@ def load_runtime_outcome(
         stage=expected_stage,
         run_manifest_sha256=run_manifest_sha256,
         attestation_sha256=attestation_sha256,
+        model_evidence_sha256=loaded_model_evidence.file_sha256,
         output_ledger_sha256=output_ledger_sha256,
         output_record_count=expected_output_record_count,
         file_sha256=hashlib.sha256(serialized).hexdigest(),
@@ -299,6 +500,7 @@ def load_runtime_attestation(
         "model_id_sha256",
         "benchmark_revision",
         "scenario_order",
+        "model_identity_sha256",
         "runtime_contract_sha256",
         "runtime_instance_sha256",
         "checks",
@@ -314,12 +516,9 @@ def load_runtime_attestation(
     }
     checks = document.get("checks") if isinstance(document, dict) else None
     order_identity = document.get("scenario_order") if isinstance(document, dict) else None
-    runtime_contract_sha256 = (
-        document.get("runtime_contract_sha256") if isinstance(document, dict) else None
-    )
-    runtime_instance_sha256 = (
-        document.get("runtime_instance_sha256") if isinstance(document, dict) else None
-    )
+    runtime_contract_sha256 = document.get("runtime_contract_sha256") if isinstance(document, dict) else None
+    model_identity_sha256 = document.get("model_identity_sha256") if isinstance(document, dict) else None
+    runtime_instance_sha256 = document.get("runtime_instance_sha256") if isinstance(document, dict) else None
     if (
         not isinstance(document, dict)
         or set(document) != root_keys
@@ -341,6 +540,8 @@ def load_runtime_attestation(
         or not isinstance(order_identity.get("count"), int)
         or isinstance(order_identity.get("count"), bool)
         or order_identity.get("count") != len(scenario_order)
+        or not isinstance(model_identity_sha256, str)
+        or _SHA256_HEX.fullmatch(model_identity_sha256) is None
         or not isinstance(runtime_contract_sha256, str)
         or _SHA256_HEX.fullmatch(runtime_contract_sha256) is None
         or not isinstance(runtime_instance_sha256, str)
@@ -359,6 +560,7 @@ def load_runtime_attestation(
         benchmark_revision=BENCHMARK_REVISION,
         scenario_order_sha256=expected_order_sha256,
         scenario_order_count=len(scenario_order),
+        model_identity_sha256=model_identity_sha256,
         runtime_contract_sha256=runtime_contract_sha256,
         runtime_instance_sha256=runtime_instance_sha256,
         checks=checks,
@@ -429,9 +631,7 @@ def request_fingerprints(
     return downstream, model_facing
 
 
-def model_boundary_fingerprint(
-    payload: JsonObject, *, scenario_order: list[str] | None = None
-) -> SafeFingerprint:
+def model_boundary_fingerprint(payload: JsonObject, *, scenario_order: list[str] | None = None) -> SafeFingerprint:
     """Fingerprint fields actually visible at one model-facing request boundary.
 
     This intentionally excludes user turns, model output, tool arguments/results,
@@ -456,10 +656,7 @@ def cache_observation_from_response(response: Any) -> CacheObservation | None:
     postcommit = stats.get("session_postcommit_snapshot")
     if isinstance(postcommit, dict):
         postcommit_stored = postcommit.get("stored")
-    elif (
-        "session_postcommit_snapshot" not in stats
-        and stats.get("request_session_bank_bypass") is True
-    ):
+    elif "session_postcommit_snapshot" not in stats and stats.get("request_session_bank_bypass") is True:
         postcommit_stored = False
     else:
         return None
@@ -496,29 +693,20 @@ def model_boundary_record(
     )
 
 
-def read_model_boundary_observer_ledger(
-    path: Path, *, allow_missing: bool = False
-) -> tuple[SafeFingerprint, ...]:
+def read_model_boundary_observer_ledger(path: Path, *, allow_missing: bool = False) -> tuple[SafeFingerprint, ...]:
     """Project strict observer records to the legacy fingerprint-only interface."""
     return tuple(
-        record.fingerprint
-        for record in read_model_boundary_observer_records(path, allow_missing=allow_missing)
+        record.fingerprint for record in read_model_boundary_observer_records(path, allow_missing=allow_missing)
     )
 
 
-def read_model_boundary_observer_records(
-    path: Path, *, allow_missing: bool = False
-) -> tuple[ModelBoundaryRecord, ...]:
+def read_model_boundary_observer_records(path: Path, *, allow_missing: bool = False) -> tuple[ModelBoundaryRecord, ...]:
     """Read strict typed attempt evidence without admitting payload-bearing fields."""
     try:
         if not path.exists() and allow_missing:
             return ()
         serialized = _read_private_regular_file(path).decode("utf-8")
-        rows = [
-            json.loads(line, object_pairs_hook=_unique_json_object)
-            for line in serialized.splitlines()
-            if line
-        ]
+        rows = [json.loads(line, object_pairs_hook=_unique_json_object) for line in serialized.splitlines() if line]
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise PreflightFailure("proxy model-boundary observer ledger is unavailable") from error
     expected_keys = set(_model_boundary_field_keys())
@@ -559,9 +747,7 @@ def read_model_boundary_observer_records(
 
 
 def _safe_status_code(value: Any) -> bool:
-    return value is None or (
-        isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599
-    )
+    return value is None or (isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599)
 
 
 def _cache_observation(value: Any) -> CacheObservation | None:
@@ -586,10 +772,7 @@ def _cache_observation(value: Any) -> CacheObservation | None:
         "new_prefill_tokens",
         "ssd_cached_tokens",
     )
-    if any(
-        not isinstance(value[key], int) or isinstance(value[key], bool) or value[key] < 0
-        for key in token_fields
-    ):
+    if any(not isinstance(value[key], int) or isinstance(value[key], bool) or value[key] < 0 for key in token_fields):
         return None
     if value["cache_source"] not in {"none", "ram", "ssd", "unknown"}:
         return None
@@ -641,13 +824,16 @@ def _safe_model_boundary_fields(fields: dict[str, Any]) -> bool:
 
 
 def _safe_policy_value(value: Any) -> bool:
-    return value is None or isinstance(value, bool | int | float) or (
-        isinstance(value, str) and value in _SAFE_POLICY_LITERALS
-    ) or (
-        isinstance(value, dict)
-        and set(value) == {"sha256"}
-        and isinstance(value.get("sha256"), str)
-        and _SHA256_HEX.fullmatch(value["sha256"]) is not None
+    return (
+        value is None
+        or isinstance(value, bool | int | float)
+        or (isinstance(value, str) and value in _SAFE_POLICY_LITERALS)
+        or (
+            isinstance(value, dict)
+            and set(value) == {"sha256"}
+            and isinstance(value.get("sha256"), str)
+            and _SHA256_HEX.fullmatch(value["sha256"]) is not None
+        )
     )
 
 
@@ -689,9 +875,7 @@ class ModelBoundaryObserverCursor:
             raise PreflightFailure("proxy model-boundary observer record count differed")
         self._cursor = len(observed)
         self._record_turns.append(records)
-        bound = bind_model_boundary_context(
-            tuple(record.fingerprint for record in records), self.scenario_order
-        )
+        bound = bind_model_boundary_context(tuple(record.fingerprint for record in records), self.scenario_order)
         self._turns.append(bound)
         return bound
 
@@ -901,10 +1085,7 @@ def _is_allowed_harness_system_delta_pair(left: SafeFingerprint, right: SafeFing
 def assert_preflight(observations: list[PreflightObservation]) -> None:
     """Fail closed unless both arms demonstrate equivalent safe phase behavior."""
     arms: tuple[Literal["direct", "proxy"], ...] = ("direct", "proxy")
-    by_path = {
-        (observation.arm, observation.tool_required): observation
-        for observation in observations
-    }
+    by_path = {(observation.arm, observation.tool_required): observation for observation in observations}
     for tool in (item for item in observations if item.tool_required):
         if tool.native_acquisition_tool_calls < 1:
             raise PreflightFailure(f"{tool.arm} emitted zero native acquisition tool calls")
@@ -944,9 +1125,7 @@ def assert_preflight(observations: list[PreflightObservation]) -> None:
         raise PreflightFailure("proxy did not record equivalent acquisition/finalization behavior")
 
 
-def _assert_harness_system_policy(
-    arm: Literal["direct", "proxy"], fingerprints: tuple[SafeFingerprint, ...]
-) -> None:
+def _assert_harness_system_policy(arm: Literal["direct", "proxy"], fingerprints: tuple[SafeFingerprint, ...]) -> None:
     """Permit only the proxy's one exact, declared system-suffix mutation."""
     expected = _expected_harness_policy_delta() if arm == "proxy" else {}
     for fingerprint in fingerprints:
@@ -999,6 +1178,9 @@ def write_preflight_ledger(
             "arm_identity_digests": _arm_identity_digests(observations, run_manifest_sha256),
             "runtime_attestation_sha256": (
                 runtime_attestation.file_sha256 if runtime_attestation is not None else None
+            ),
+            "model_identity_sha256": (
+                runtime_attestation.model_identity_sha256 if runtime_attestation is not None else None
             ),
             "runtime_contract_sha256": (
                 runtime_attestation.runtime_contract_sha256 if runtime_attestation is not None else None
@@ -1067,12 +1249,13 @@ def require_scoring_gate(
         raise SystemExit("scored mode requires a valid matching runtime attestation") from error
     if arm == "direct" and (
         summary.get("runtime_attestation_sha256") != attestation.file_sha256
+        or summary.get("model_identity_sha256") != attestation.model_identity_sha256
         or summary.get("runtime_contract_sha256") != attestation.runtime_contract_sha256
         or summary.get("runtime_instance_sha256") != attestation.runtime_instance_sha256
     ):
         raise SystemExit("scored mode runtime attestation identity does not match the paired preflight")
     if arm == "proxy":
-        if summary.get("runtime_contract_sha256") != attestation.runtime_contract_sha256:
+        if summary.get("model_identity_sha256") != attestation.model_identity_sha256:
             raise SystemExit("scored proxy runtime contract does not match the paired preflight")
         if summary.get("runtime_instance_sha256") == attestation.runtime_instance_sha256:
             raise SystemExit("scored proxy requires a fresh runtime instance")
@@ -1081,20 +1264,37 @@ def require_scoring_gate(
             raise RuntimeOutcomeFailure("runtime_outcome_invalid")
         if arm == "direct":
             assert runtime_attestation is not None
-            preflight_attestation = runtime_attestation
+            preflight_attestation_path = runtime_attestation
+            preflight_attestation = attestation
         else:
-            preflight_attestation = preflight_ledger.with_name("preflight-runtime-attestation.json")
+            preflight_attestation_path = preflight_ledger.with_name("preflight-runtime-attestation.json")
+            preflight_attestation = load_runtime_attestation(
+                preflight_attestation_path,
+                expected_stage="preflight",
+                source_commit=candidate_source_commit,
+                image_digest=candidate_image_digest,
+                run_manifest_sha256=run_manifest_sha256,
+                model=model,
+                scenario_order=scenario_order,
+            )
+        if (
+            summary.get("model_identity_sha256") != preflight_attestation.model_identity_sha256
+            or preflight_attestation.model_identity_sha256 != attestation.model_identity_sha256
+        ):
+            raise RuntimeOutcomeFailure("runtime_outcome_invalid")
         preflight_outcome = load_runtime_outcome(
             preflight_runtime_outcome,
             expected_stage="preflight",
             run_manifest_sha256=run_manifest_sha256,
-            attestation=preflight_attestation,
+            attestation=preflight_attestation_path,
+            model_evidence=_model_evidence_path(preflight_ledger, "preflight"),
+            model_identity_sha256=preflight_attestation.model_identity_sha256,
             output_ledger=preflight_ledger,
             expected_output_record_count=5,
         )
         if summary.get("runtime_attestation_sha256") != preflight_outcome.attestation_sha256:
             raise RuntimeOutcomeFailure("runtime_outcome_invalid")
-    except RuntimeOutcomeFailure as error:
+    except (RuntimeOutcomeFailure, RuntimeAttestationFailure) as error:
         raise SystemExit("scored mode requires a passed matching preflight runtime outcome") from error
     if arm == "proxy":
         try:
@@ -1104,7 +1304,9 @@ def require_scoring_gate(
                 direct_runtime_outcome,
                 expected_stage="scored-direct",
                 run_manifest_sha256=run_manifest_sha256,
-                attestation=preflight_attestation,
+                attestation=preflight_attestation_path,
+                model_evidence=_model_evidence_path(preflight_ledger, "score-direct"),
+                model_identity_sha256=preflight_attestation.model_identity_sha256,
                 output_ledger=preflight_ledger.with_name("scored-direct.jsonl"),
                 expected_output_record_count=len(scenario_order),
             )
@@ -1113,14 +1315,19 @@ def require_scoring_gate(
     require_candidate_provenance(candidate_source_commit, candidate_image_digest)
 
 
+def _model_evidence_path(preflight_ledger: Path, stage: Literal["preflight", "score-direct", "score-proxy"]) -> Path:
+    """Return the one reserved C1 evidence name adjacent to the immutable stage ledgers."""
+
+    prefix = {"preflight": "preflight", "score-direct": "scored-direct", "score-proxy": "scored-proxy"}[stage]
+    return preflight_ledger.with_name(f"{prefix}-model-cache-evidence.json")
+
+
 def validate_run_manifest_sha256(run_manifest_sha256: str) -> None:
     if not _SHA256_HEX.fullmatch(run_manifest_sha256):
         raise PreflightFailure("run manifest SHA-256 is invalid")
 
 
-def _arm_identity_digests(
-    observations: list[PreflightObservation], run_manifest_sha256: str
-) -> dict[str, str | None]:
+def _arm_identity_digests(observations: list[PreflightObservation], run_manifest_sha256: str) -> dict[str, str | None]:
     result: dict[str, str | None] = {}
     for arm in ("direct", "proxy"):
         model_hashes = {
@@ -1169,7 +1376,7 @@ def terminal_schema_valid(response: JsonObject, response_format: JsonObject | No
     """Validate the narrow strict primitive terminal schema required by the runner."""
     if response_format is None:
         return True
-    schema = ((response_format.get("json_schema") or {}).get("schema"))
+    schema = (response_format.get("json_schema") or {}).get("schema")
     if not isinstance(schema, dict):
         return False
     content = response.get("content")
@@ -1199,9 +1406,7 @@ def _ledger_summary(path: Path) -> dict[str, Any] | None:
         rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
     except (OSError, json.JSONDecodeError):
         return None
-    return next(
-        (row for row in reversed(rows) if row.get("record_type") == "paired_preflight_summary"), None
-    )
+    return next((row for row in reversed(rows) if row.get("record_type") == "paired_preflight_summary"), None)
 
 
 def write_model_boundary_attempt_ledger(
@@ -1217,10 +1422,7 @@ def write_model_boundary_attempt_ledger(
             or not _safe_model_boundary_fields(record.fields)
             or record.digest != _sha256(record.fields)
             or not _safe_status_code(record.status_code)
-            or (
-                record.cache is not None
-                and _cache_observation(record.cache.to_dict()) != record.cache
-            )
+            or (record.cache is not None and _cache_observation(record.cache.to_dict()) != record.cache)
         ):
             raise PreflightFailure("model-boundary attempt evidence is invalid")
         serialized.append(

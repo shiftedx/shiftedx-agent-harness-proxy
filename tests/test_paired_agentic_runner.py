@@ -20,10 +20,156 @@ from shiftedx_harness_proxy.projection_accounting import (
 )
 from shiftedx_harness_proxy.qualification_contract import (
     BENCHMARK_REVISION,
+    load_model_evidence,
+    load_runtime_outcome,
     read_model_boundary_observer_records,
 )
 
 _RUN_MANIFEST_SHA256 = "1" * 64
+
+
+def test_load_model_evidence_binds_a_passed_private_artifact_to_stage_manifest_and_contract(tmp_path) -> None:
+    """The scoring gate admits only the exact completed C1 artifact, never a self-assertion."""
+
+    evidence = tmp_path / "preflight-model-cache-evidence.json"
+    document = {
+        "schema_version": "1.0",
+        "record_type": "qualification_model_cache_evidence",
+        "stage": "preflight",
+        "status": "passed",
+        "failure_category": None,
+        "run_manifest_sha256": _RUN_MANIFEST_SHA256,
+        "model_identity_sha256": "a" * 64,
+        "model_contract_sha256": "a" * 64,
+        "runtime_instance_sha256": "b" * 64,
+        "live_before_sha256": "c" * 64,
+        "live_after_sha256": "d" * 64,
+        "request_window": {
+            "before": 7,
+            "after": 7,
+            "delta": 0,
+            "expected": 0,
+            "successful_measured": 0,
+        },
+        "prime": {"record_sha256": None, "count": 0, "request_digest": None},
+        "first_attempt": {
+            "record_sha256": None,
+            "status": None,
+            "measured_count": 0,
+            "successful_count": 0,
+            "prompt_tokens": None,
+            "cached_tokens": None,
+            "new_prefill_tokens": None,
+        },
+        "checks": {
+            "contract": True,
+            "live_before": True,
+            "attempts": True,
+            "request_window": True,
+            "live_after": True,
+        },
+    }
+    evidence.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    evidence.chmod(0o600)
+
+    loaded = load_model_evidence(
+        evidence,
+        expected_stage="preflight",
+        run_manifest_sha256=_RUN_MANIFEST_SHA256,
+        model_identity_sha256="a" * 64,
+        model_contract_sha256="a" * 64,
+    )
+
+    assert loaded.stage == "preflight"
+    assert loaded.model_contract_sha256 == "a" * 64
+    assert loaded.file_sha256 == hashlib.sha256(evidence.read_bytes()).hexdigest()
+
+
+def test_runtime_outcome_binds_the_exact_passed_model_evidence_bytes(tmp_path) -> None:
+    """Later scoring must not accept an outcome detached from C1 model/cache evidence."""
+
+    attestation = tmp_path / "preflight-runtime-attestation.json"
+    output = tmp_path / "preflight.jsonl"
+    evidence = tmp_path / "preflight-model-cache-evidence.json"
+    outcome = tmp_path / "preflight-runtime-outcome.json"
+    attestation.write_text('{"model_identity_sha256":"' + "a" * 64 + '"}\n', encoding="utf-8")
+    output.write_text('{"row":1}\n', encoding="utf-8")
+    evidence.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "record_type": "qualification_model_cache_evidence",
+                "stage": "preflight",
+                "status": "passed",
+                "failure_category": None,
+                "run_manifest_sha256": _RUN_MANIFEST_SHA256,
+                "model_identity_sha256": "a" * 64,
+                "model_contract_sha256": "a" * 64,
+                "runtime_instance_sha256": "b" * 64,
+                "live_before_sha256": "c" * 64,
+                "live_after_sha256": "d" * 64,
+                "request_window": {
+                    "before": 7,
+                    "after": 7,
+                    "delta": 0,
+                    "expected": 0,
+                    "successful_measured": 0,
+                },
+                "prime": {"record_sha256": None, "count": 0, "request_digest": None},
+                "first_attempt": {
+                    "record_sha256": None,
+                    "status": None,
+                    "measured_count": 0,
+                    "successful_count": 0,
+                    "prompt_tokens": None,
+                    "cached_tokens": None,
+                    "new_prefill_tokens": None,
+                },
+                "checks": {
+                    "contract": True,
+                    "live_before": True,
+                    "attempts": True,
+                    "request_window": True,
+                    "live_after": True,
+                },
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    for path in (attestation, output, evidence):
+        path.chmod(0o600)
+    document = {
+        "schema_version": "1.0",
+        "record_type": "qualification_runtime_outcome",
+        "stage": "preflight",
+        "status": "passed",
+        "action_exit_code": 0,
+        "failure_category": None,
+        "run_manifest_sha256": _RUN_MANIFEST_SHA256,
+        "attestation_sha256": hashlib.sha256(attestation.read_bytes()).hexdigest(),
+        "model_evidence_sha256": hashlib.sha256(evidence.read_bytes()).hexdigest(),
+        "output_ledger_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+        "output_record_count": 1,
+    }
+    outcome.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    outcome.chmod(0o600)
+
+    loaded = load_runtime_outcome(
+        outcome,
+        expected_stage="preflight",
+        run_manifest_sha256=_RUN_MANIFEST_SHA256,
+        attestation=attestation,
+        model_evidence=evidence,
+        model_identity_sha256="a" * 64,
+        model_contract_sha256="a" * 64,
+        output_ledger=output,
+        expected_output_record_count=1,
+    )
+
+    assert loaded.model_evidence_sha256 == hashlib.sha256(evidence.read_bytes()).hexdigest()
 
 
 def load_runner(monkeypatch):
@@ -91,9 +237,7 @@ def test_client_failure_is_recorded_without_response_body_and_run_continues(monk
     ).stdout.strip()
     image_digest = "sha256:" + "0" * 64
     preflight_attestation = _write_passing_preflight(runner, preflight, source_commit, image_digest)
-    preflight_outcome, direct_outcome = _write_passing_scored_prerequisites(
-        tmp_path, preflight, preflight_attestation
-    )
+    preflight_outcome, direct_outcome = _write_passing_scored_prerequisites(tmp_path, preflight, preflight_attestation)
     runtime_attestation = _write_runtime_attestation(
         tmp_path / "scored-proxy-runtime-attestation.json",
         stage="scored_proxy",
@@ -146,9 +290,7 @@ def test_client_failure_is_recorded_without_response_body_and_run_continues(monk
         assert row["passed"] is False
         assert row["score"] == 0.0
         assert row["error"] == "client request failed with HTTP 502"
-        assert row["response"] == {
-            "client_error": {"type": "RuntimeError", "http_status": 502}
-        }
+        assert row["response"] == {"client_error": {"type": "RuntimeError", "http_status": 502}}
         assert row["metadata"]["runner_failure_stage"] == "benchmark_client"
         assert row["scored"] is True
         assert set(row["contract_fingerprints"]) == {"downstream", "model_facing", "model_facing_turns"}
@@ -390,16 +532,12 @@ def test_preflight_ledger_retains_only_hashes_and_allowlisted_outcomes(monkeypat
     scenario = runner.scenario_set("expanded")[0]
     direct_payload = runner.request_payload(scenario, model="private-model", proxy_policy=False)
     proxy_payload = runner.request_payload(scenario, model="private-model", proxy_policy=True)
-    terminal_payload = runner._preflight_payload(
-        scenario, model="private-model", proxy_policy=False, no_tools=True
-    )
+    terminal_payload = runner._preflight_payload(scenario, model="private-model", proxy_policy=False, no_tools=True)
     direct, direct_phases = runner.request_fingerprints(direct_payload, [scenario.case_id], policy_delta={})
     proxy, proxy_phases = runner.request_fingerprints(
         proxy_payload, [scenario.case_id], policy_delta={"x-shiftedx-require-receipt": True}
     )
-    terminal, terminal_phases = runner.request_fingerprints(
-        terminal_payload, [scenario.case_id], policy_delta={}
-    )
+    terminal, terminal_phases = runner.request_fingerprints(terminal_payload, [scenario.case_id], policy_delta={})
     output = tmp_path / "preflight.jsonl"
     runner.write_preflight_ledger(
         output,
@@ -555,9 +693,7 @@ def test_direct_client_records_each_actual_attempt_in_sequence_with_safe_cache(m
             assert stream is False
             return _cache_response(content='{"status":"passed"}', bypass=True)
 
-    payload = runner._preflight_payload(
-        scenario, model="private-model", proxy_policy=False, no_tools=True
-    )
+    payload = runner._preflight_payload(scenario, model="private-model", proxy_policy=False, no_tools=True)
     payload["metadata"] = {"cache_mode": "bypass"}
     client = runner.CompatibilityClient(
         DirectModel(), arm="direct", scenario_order=[scenario.case_id], proxy_policy=False
@@ -570,9 +706,7 @@ def test_direct_client_records_each_actual_attempt_in_sequence_with_safe_cache(m
     assert all(record.status_code == 200 for record in client.attempt_records)
     assert all(record.cache is not None for record in client.attempt_records)
     assert all(record.fields["cache_mode_policy"] == "bypass" for record in client.attempt_records)
-    assert "private-model" not in json.dumps(
-        [record.to_dict() for record in client.attempt_records]
-    )
+    assert "private-model" not in json.dumps([record.to_dict() for record in client.attempt_records])
 
 
 def test_direct_client_records_null_response_before_transport_error(monkeypatch):
@@ -633,16 +767,14 @@ def test_cache_prime_payload_matches_first_scored_model_facing_digest(monkeypatc
     )
     proxy_scored["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
 
-    assert runner.model_boundary_fingerprint(
-        direct_prime, scenario_order=scenario_order
-    ).digest == runner.model_boundary_fingerprint(
-        direct_scored, scenario_order=scenario_order
-    ).digest
-    assert runner.model_boundary_fingerprint(
-        proxy_prime, scenario_order=scenario_order
-    ).digest == runner.model_boundary_fingerprint(
-        proxy_scored, scenario_order=scenario_order
-    ).digest
+    assert (
+        runner.model_boundary_fingerprint(direct_prime, scenario_order=scenario_order).digest
+        == runner.model_boundary_fingerprint(direct_scored, scenario_order=scenario_order).digest
+    )
+    assert (
+        runner.model_boundary_fingerprint(proxy_prime, scenario_order=scenario_order).digest
+        == runner.model_boundary_fingerprint(proxy_scored, scenario_order=scenario_order).digest
+    )
     assert proxy_prime["messages"][0]["content"].count(HARNESS_SYSTEM_SUFFIX) == 1
 
 
@@ -754,12 +886,8 @@ def test_scored_direct_run_writes_actual_attempt_ledger_atomically(monkeypatch, 
     source_commit = _source_commit()
     image_digest = "sha256:" + "0" * 64
     preflight = tmp_path / "preflight.jsonl"
-    preflight_attestation = _write_passing_preflight(
-        runner, preflight, source_commit, image_digest
-    )
-    preflight_outcome, _direct_outcome = _write_passing_scored_prerequisites(
-        tmp_path, preflight, preflight_attestation
-    )
+    preflight_attestation = _write_passing_preflight(runner, preflight, source_commit, image_digest)
+    preflight_outcome, _direct_outcome = _write_passing_scored_prerequisites(tmp_path, preflight, preflight_attestation)
     output = tmp_path / "direct-live.jsonl"
     attempts = tmp_path / "direct-attempts.jsonl"
 
@@ -774,9 +902,7 @@ def test_scored_direct_run_writes_actual_attempt_ledger_atomically(monkeypatch, 
             )
 
     def run_cases(*, client, model, output_path, case_id, **_kwargs):
-        scenario = next(
-            item for item in runner.scenario_set("expanded") if item.case_id == case_id
-        )
+        scenario = next(item for item in runner.scenario_set("expanded") if item.case_id == case_id)
         client.complete(runner.request_payload(scenario, model=model, proxy_policy=False))
         with output_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({"case_id": case_id, "passed": True}) + "\n")
@@ -873,9 +999,7 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
                     _append_observer_record(runner, observer, observed, sequence[0])
             if payload.get("tools") and not any(message.get("role") == "tool" for message in payload["messages"]):
                 return _cache_response(
-                    tool_calls=[
-                        {"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}
-                    ],
+                    tool_calls=[{"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}],
                     bypass=True,
                 )
             return _cache_response(content='{"status":"passed"}', bypass=True)
@@ -985,13 +1109,9 @@ def test_observed_proxy_model_boundary_drift_is_not_masked_by_matching_plan(monk
     drifted_payload["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
     drifted_payload["top_k"] = 99
     proxy_components = runner.model_boundary_fingerprint(drifted_payload)
-    terminal_payload = runner._preflight_payload(
-        scenario, model="model", proxy_policy=False, no_tools=True
-    )
+    terminal_payload = runner._preflight_payload(scenario, model="model", proxy_policy=False, no_tools=True)
     terminal = runner.model_boundary_fingerprint(terminal_payload)
-    proxy_terminal_payload = runner._preflight_payload(
-        scenario, model="model", proxy_policy=False, no_tools=True
-    )
+    proxy_terminal_payload = runner._preflight_payload(scenario, model="model", proxy_policy=False, no_tools=True)
     proxy_terminal_payload["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
     proxy_terminal = runner.model_boundary_fingerprint(proxy_terminal_payload)
     fingerprint = runner.SafeFingerprint("downstream", "same", {})
@@ -1132,9 +1252,7 @@ def test_preflight_ledger_never_overwrites_existing_evidence(monkeypatch, tmp_pa
         (" extra mutation" + HARNESS_SYSTEM_SUFFIX, "model-facing contract mismatch"),
     ],
 )
-def test_preflight_rejects_every_proxy_system_mutation_except_the_exact_suffix(
-    monkeypatch, mutation, message
-):
+def test_preflight_rejects_every_proxy_system_mutation_except_the_exact_suffix(monkeypatch, mutation, message):
     runner = load_runner(monkeypatch)
 
     with pytest.raises(runner.PreflightFailure, match=message):
@@ -1359,9 +1477,7 @@ def test_proxy_scoring_requires_a_passed_direct_runtime_outcome(monkeypatch, tmp
     assert not (tmp_path / "proxy.jsonl").exists()
 
 
-def test_proxy_scoring_rejects_coordinated_preflight_attestation_and_outcome_replacement(
-    monkeypatch, tmp_path
-):
+def test_proxy_scoring_rejects_coordinated_preflight_attestation_and_outcome_replacement(monkeypatch, tmp_path):
     runner = load_runner(monkeypatch)
     source_commit = _source_commit()
     image_digest = "sha256:" + "0" * 64
@@ -1369,9 +1485,7 @@ def test_proxy_scoring_rejects_coordinated_preflight_attestation_and_outcome_rep
     preflight_attestation = _write_passing_preflight(runner, ledger, source_commit, image_digest)
     document = json.loads(preflight_attestation.read_text(encoding="utf-8"))
     preflight_attestation.write_text(json.dumps(document, indent=2), encoding="utf-8")
-    preflight_outcome, direct_outcome = _write_passing_scored_prerequisites(
-        tmp_path, ledger, preflight_attestation
-    )
+    preflight_outcome, direct_outcome = _write_passing_scored_prerequisites(tmp_path, ledger, preflight_attestation)
     scored_attestation = _write_runtime_attestation(
         tmp_path / "scored-proxy-runtime-attestation.json",
         stage="scored_proxy",
@@ -1400,16 +1514,7 @@ def test_proxy_scoring_rejects_coordinated_preflight_attestation_and_outcome_rep
     assert not (tmp_path / "proxy.jsonl").exists()
 
 
-@pytest.mark.parametrize(
-    ("runtime_contract_sha256", "runtime_instance_sha256", "message"),
-    [
-        ("9" * 64, "5" * 64, "runtime contract"),
-        ("3" * 64, "4" * 64, "fresh runtime instance"),
-    ],
-)
-def test_proxy_scoring_requires_same_runtime_contract_and_distinct_instance(
-    monkeypatch, tmp_path, runtime_contract_sha256, runtime_instance_sha256, message
-):
+def test_proxy_scoring_requires_a_fresh_runtime_instance(monkeypatch, tmp_path):
     runner = load_runner(monkeypatch)
     source_commit = _source_commit()
     image_digest = "sha256:" + "0" * 64
@@ -1425,11 +1530,11 @@ def test_proxy_scoring_requires_same_runtime_contract_and_distinct_instance(
         stage="scored_proxy",
         source_commit=source_commit,
         image_digest=image_digest,
-        runtime_contract_sha256=runtime_contract_sha256,
-        runtime_instance_sha256=runtime_instance_sha256,
+        runtime_contract_sha256="3" * 64,
+        runtime_instance_sha256="4" * 64,
     )
 
-    with pytest.raises(SystemExit, match=message):
+    with pytest.raises(SystemExit, match="fresh runtime instance"):
         runner.require_scoring_gate(
             output=tmp_path / "proxy.jsonl",
             preflight_ledger=ledger,
@@ -1474,17 +1579,13 @@ def test_proxy_scored_fingerprints_come_from_new_observer_records_in_turn_order(
     actual = client.actual_contract_fingerprints()
 
     assert len(actual["model_facing"]) == 1
-    assert actual["model_facing_turns"] == [
-        {"turn_index": 0, "fingerprints": actual["model_facing"]}
-    ]
+    assert actual["model_facing_turns"] == [{"turn_index": 0, "fingerprints": actual["model_facing"]}]
     assert actual["model_facing"][0]["fields"]["declared_policy_deltas"]
     planned = runner.model_boundary_fingerprint(
         planner.plan(runner.request_payload(scenario, model="model", proxy_policy=True), phase="acquisition"),
         scenario_order=[scenario.case_id],
     )
-    assert actual["model_facing"][0]["fields"]["system_prompt_sha256"] != planned.fields[
-        "system_prompt_sha256"
-    ]
+    assert actual["model_facing"][0]["fields"]["system_prompt_sha256"] != planned.fields["system_prompt_sha256"]
 
 
 def test_proxy_success_without_typed_response_cache_evidence_fails_closed(monkeypatch, tmp_path):
@@ -1571,9 +1672,7 @@ def test_scored_proxy_cli_requires_a_new_observer_ledger(monkeypatch, tmp_path):
     image_digest = "sha256:" + "0" * 64
     preflight = tmp_path / "preflight.jsonl"
     preflight_attestation = _write_passing_preflight(runner, preflight, source_commit, image_digest)
-    preflight_outcome, direct_outcome = _write_passing_scored_prerequisites(
-        tmp_path, preflight, preflight_attestation
-    )
+    preflight_outcome, direct_outcome = _write_passing_scored_prerequisites(tmp_path, preflight, preflight_attestation)
     runtime_attestation = _write_runtime_attestation(
         tmp_path / "scored-proxy-runtime-attestation.json",
         stage="scored_proxy",
@@ -1626,9 +1725,7 @@ def test_scored_proxy_rows_use_actual_observer_fingerprints_and_failures_keep_sa
     observer_path = tmp_path / "scored-observer.jsonl"
     output = tmp_path / "scored.jsonl"
     preflight_attestation = _write_passing_preflight(runner, preflight, source_commit, image_digest)
-    preflight_outcome, direct_outcome = _write_passing_scored_prerequisites(
-        tmp_path, preflight, preflight_attestation
-    )
+    preflight_outcome, direct_outcome = _write_passing_scored_prerequisites(tmp_path, preflight, preflight_attestation)
     runtime_attestation = _write_runtime_attestation(
         tmp_path / "scored-proxy-runtime-attestation.json",
         stage="scored_proxy",
@@ -1711,9 +1808,7 @@ def test_scored_proxy_rows_use_actual_observer_fingerprints_and_failures_keep_sa
     assert "private prompt marker" not in serialized
 
 
-def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_records(
-    monkeypatch, tmp_path
-):
+def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_records(monkeypatch, tmp_path):
     runner = load_runner(monkeypatch)
     source_commit = _source_commit()
     image_digest = "sha256:" + "0" * 64
@@ -1721,9 +1816,7 @@ def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_re
     observer_path = tmp_path / "scored-observer.jsonl"
     output = tmp_path / "scored.jsonl"
     preflight_attestation = _write_passing_preflight(runner, preflight, source_commit, image_digest)
-    preflight_outcome, direct_outcome = _write_passing_scored_prerequisites(
-        tmp_path, preflight, preflight_attestation
-    )
+    preflight_outcome, direct_outcome = _write_passing_scored_prerequisites(tmp_path, preflight, preflight_attestation)
     runtime_attestation = _write_runtime_attestation(
         tmp_path / "scored-proxy-runtime-attestation.json",
         stage="scored_proxy",
@@ -1735,9 +1828,7 @@ def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_re
 
     def complete(self, _payload, *, stream=False):
         assert stream is False
-        return self._normalize(
-            {LOCAL_PROJECTION_EXTENSION: local_projection_accounting()}, wall_s=0.1, ttft_s=None
-        )
+        return self._normalize({LOCAL_PROJECTION_EXTENSION: local_projection_accounting()}, wall_s=0.1, ttft_s=None)
 
     def run_cases(*, client, model, output_path, case_id, **_kwargs):
         clients.append(client)
@@ -1885,9 +1976,7 @@ def test_metrics_preflight_failure_is_retained_as_categorical_unscored_evidence(
     assert summary["status"] == "failed"
     assert summary["scored"] is False
     assert summary["failure"] == "proxy_phase_metrics_unavailable"
-    assert summary["runtime_attestation_sha256"] == hashlib.sha256(
-        args.runtime_attestation.read_bytes()
-    ).hexdigest()
+    assert summary["runtime_attestation_sha256"] == hashlib.sha256(args.runtime_attestation.read_bytes()).hexdigest()
     assert summary["runtime_contract_sha256"] == "3" * 64
     assert summary["runtime_instance_sha256"] == "4" * 64
     assert "metrics.invalid" not in args.output.read_text()
@@ -2001,15 +2090,9 @@ def _suffix_pair_observations(runner, proxy_system_mutation):
     proxy_tool_payload = planner.plan(payload, phase="acquisition")
     proxy_tool_payload["messages"][0]["content"] += proxy_system_mutation
     proxy_tool_model = runner.model_boundary_fingerprint(proxy_tool_payload, scenario_order=scenario_order)
-    direct_terminal_payload = runner._preflight_payload(
-        scenario, model="model", proxy_policy=False, no_tools=True
-    )
-    direct_terminal_model = runner.model_boundary_fingerprint(
-        direct_terminal_payload, scenario_order=scenario_order
-    )
-    proxy_terminal_payload = runner._preflight_payload(
-        scenario, model="model", proxy_policy=False, no_tools=True
-    )
+    direct_terminal_payload = runner._preflight_payload(scenario, model="model", proxy_policy=False, no_tools=True)
+    direct_terminal_model = runner.model_boundary_fingerprint(direct_terminal_payload, scenario_order=scenario_order)
+    proxy_terminal_payload = runner._preflight_payload(scenario, model="model", proxy_policy=False, no_tools=True)
     proxy_terminal_payload["messages"][0]["content"] += proxy_system_mutation
     proxy_terminal_model = runner.model_boundary_fingerprint(proxy_terminal_payload, scenario_order=scenario_order)
     downstream = runner.SafeFingerprint("downstream", "same", {})
@@ -2027,12 +2110,8 @@ def _suffix_pair_observations(runner, proxy_system_mutation):
             (proxy_tool_model,),
             {"acquisition": 2, "finalization": 1},
         ),
-        runner.PreflightObservation(
-            "direct", False, 0, ("terminal",), True, downstream, (direct_terminal_model,)
-        ),
-        runner.PreflightObservation(
-            "proxy", False, 0, ("terminal",), True, downstream, (proxy_terminal_model,)
-        ),
+        runner.PreflightObservation("direct", False, 0, ("terminal",), True, downstream, (direct_terminal_model,)),
+        runner.PreflightObservation("proxy", False, 0, ("terminal",), True, downstream, (proxy_terminal_model,)),
     ]
 
 
@@ -2110,13 +2189,12 @@ def _write_runtime_attestation(
     image_digest,
     model="model",
     scenario_order=("case-1", "case-2"),
+    model_identity_sha256="6" * 64,
     runtime_contract_sha256="3" * 64,
     runtime_instance_sha256="4" * 64,
 ):
     canonical_model = json.dumps(model, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    canonical_order = json.dumps(
-        list(scenario_order), ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
+    canonical_order = json.dumps(list(scenario_order), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     document = {
         "schema_version": "1.0",
         "record_type": "qualification_runtime_attestation",
@@ -2131,6 +2209,7 @@ def _write_runtime_attestation(
             "sha256": hashlib.sha256(canonical_order.encode()).hexdigest(),
             "count": len(scenario_order),
         },
+        "model_identity_sha256": model_identity_sha256,
         "runtime_contract_sha256": runtime_contract_sha256,
         "runtime_instance_sha256": runtime_instance_sha256,
         "checks": {
@@ -2148,6 +2227,55 @@ def _write_runtime_attestation(
     return path
 
 
+def _write_model_evidence(
+    path,
+    *,
+    stage,
+    model_identity_sha256="6" * 64,
+    model_contract_sha256="6" * 64,
+):
+    document = {
+        "schema_version": "1.0",
+        "record_type": "qualification_model_cache_evidence",
+        "stage": stage,
+        "status": "passed",
+        "failure_category": None,
+        "run_manifest_sha256": _RUN_MANIFEST_SHA256,
+        "model_identity_sha256": model_identity_sha256,
+        "model_contract_sha256": model_contract_sha256,
+        "runtime_instance_sha256": "7" * 64,
+        "live_before_sha256": "8" * 64,
+        "live_after_sha256": "9" * 64,
+        "request_window": {
+            "before": 0,
+            "after": 0,
+            "delta": 0,
+            "expected": 0,
+            "successful_measured": 0,
+        },
+        "prime": {"record_sha256": None, "count": 0, "request_digest": None},
+        "first_attempt": {
+            "record_sha256": None,
+            "status": None,
+            "measured_count": 0,
+            "successful_count": 0,
+            "prompt_tokens": None,
+            "cached_tokens": None,
+            "new_prefill_tokens": None,
+        },
+        "checks": {
+            "contract": True,
+            "live_before": True,
+            "attempts": True,
+            "request_window": True,
+            "live_after": True,
+        },
+    }
+    path.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
+
 def _write_runtime_outcome(
     path,
     *,
@@ -2155,10 +2283,20 @@ def _write_runtime_outcome(
     attestation,
     output,
     output_record_count,
+    model_evidence=None,
     status="passed",
     action_exit_code=0,
     failure_category=None,
 ):
+    attestation_document = json.loads(attestation.read_text(encoding="utf-8"))
+    model_identity_sha256 = attestation_document["model_identity_sha256"]
+    if model_evidence is None:
+        model_evidence = path.with_name(f"{stage}-model-cache-evidence.json")
+        _write_model_evidence(
+            model_evidence,
+            stage={"preflight": "preflight", "scored-direct": "score-direct", "scored-proxy": "score-proxy"}[stage],
+            model_identity_sha256=model_identity_sha256,
+        )
     document = {
         "schema_version": "1.0",
         "record_type": "qualification_runtime_outcome",
@@ -2168,6 +2306,7 @@ def _write_runtime_outcome(
         "failure_category": failure_category,
         "run_manifest_sha256": _RUN_MANIFEST_SHA256,
         "attestation_sha256": hashlib.sha256(attestation.read_bytes()).hexdigest(),
+        "model_evidence_sha256": hashlib.sha256(model_evidence.read_bytes()).hexdigest(),
         "output_ledger_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
         "output_record_count": output_record_count,
     }
@@ -2213,20 +2352,12 @@ def _write_passing_preflight(runner, output, source_commit, image_digest, contra
     proxy_tool_model_payload = planner.plan(proxy_tool_payload, phase="acquisition")
     proxy_tool_model_payload["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
     proxy_tool_model = runner.model_boundary_fingerprint(proxy_tool_model_payload, scenario_order=scenario_order)
-    direct_terminal_payload = runner._preflight_payload(
-        scenario, model="model", proxy_policy=False, no_tools=True
-    )
+    direct_terminal_payload = runner._preflight_payload(scenario, model="model", proxy_policy=False, no_tools=True)
     direct_terminal, _ = runner.request_fingerprints(direct_terminal_payload, scenario_order, policy_delta={})
-    direct_terminal_model = runner.model_boundary_fingerprint(
-        direct_terminal_payload, scenario_order=scenario_order
-    )
-    proxy_terminal_payload = runner._preflight_payload(
-        scenario, model="model", proxy_policy=False, no_tools=True
-    )
+    direct_terminal_model = runner.model_boundary_fingerprint(direct_terminal_payload, scenario_order=scenario_order)
+    proxy_terminal_payload = runner._preflight_payload(scenario, model="model", proxy_policy=False, no_tools=True)
     proxy_terminal_payload["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
-    proxy_terminal_model = runner.model_boundary_fingerprint(
-        proxy_terminal_payload, scenario_order=scenario_order
-    )
+    proxy_terminal_model = runner.model_boundary_fingerprint(proxy_terminal_payload, scenario_order=scenario_order)
     observations = [
         runner.PreflightObservation(
             "direct", True, 1, ("acquisition", "finalization"), True, direct_tool, (direct_tool_model,)

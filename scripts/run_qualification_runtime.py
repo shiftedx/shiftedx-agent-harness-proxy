@@ -37,11 +37,14 @@ def paired_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
         lease.image_digest,
         "--run-manifest-sha256",
         lease.run_manifest_sha256,
+        "--cache-mode",
+        _cache_mode(lease),
     ]
     if lease.stage == "preflight":
         proxy_base_url, proxy_metrics_url, proxy_api_key_file, observer_ledger, attestation_path = _require_proxy_lease(
             lease
         )
+        direct_attempt_ledger = _require_direct_attempt_ledger(lease)
         argv = [
             *common,
             "--paired-preflight",
@@ -55,6 +58,8 @@ def paired_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
             proxy_metrics_url,
             "--proxy-observer-ledger",
             str(observer_ledger),
+            "--direct-model-attempt-ledger",
+            str(direct_attempt_ledger),
             "--proxy-api-key-file",
             str(proxy_api_key_file),
             "--runtime-attestation",
@@ -65,6 +70,7 @@ def paired_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
         return tuple(argv)
     if lease.stage == "score-direct":
         _require_attestation(lease)
+        direct_attempt_ledger = _require_direct_attempt_ledger(lease)
         argv = [
             *common,
             "--base-url",
@@ -77,6 +83,8 @@ def paired_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
             str(lease.attestation_path),
             "--preflight-runtime-outcome",
             str(lease.preflight_ledger.with_name("preflight-runtime-outcome.json")),
+            "--direct-model-attempt-ledger",
+            str(direct_attempt_ledger),
         ]
         if lease.direct_api_key_file is not None:
             argv.extend(("--api-key-file", str(lease.direct_api_key_file)))
@@ -116,8 +124,16 @@ def paired_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
 def invoke_paired_runner(lease: RuntimeLease) -> int:
     """Run the child without injecting secret values into argv or environment."""
 
+    if lease.cache_lane == "warm-prefix" and lease.stage in {"score-direct", "score-proxy"}:
+        prime = _run_child(_prime_runner_argv(lease), lease)
+        if prime != 0:
+            return prime
+    return _run_child(paired_runner_argv(lease), lease)
+
+
+def _run_child(argv: tuple[str, ...], lease: RuntimeLease) -> int:
     return subprocess.run(  # noqa: S603 - argv and environment are derived exclusively from a validated lease
-        list(paired_runner_argv(lease)),
+        list(argv),
         check=False,
         env={
             "PYTHONPATH": str(lease.benchmark_source_path),
@@ -127,8 +143,56 @@ def invoke_paired_runner(lease: RuntimeLease) -> int:
     ).returncode
 
 
+def _prime_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
+    """Return the manifest-derived warm-prefix priming child for one scored arm."""
+
+    if lease.stage not in {"score-direct", "score-proxy"}:
+        raise ValueError("cache priming is only valid for scored treatments")
+    prime_ledger = lease.prime_model_attempt_ledger
+    if prime_ledger is None:
+        raise ValueError("warm scored lease is missing its prime model-attempt ledger")
+    arm = "direct" if lease.stage == "score-direct" else "proxy"
+    runner = Path(__file__).with_name("run_paired_agentic_trial.py")
+    argv = [
+        sys.executable,
+        str(runner),
+        "--model",
+        lease.model,
+        "--agentic-set",
+        lease.agentic_set,
+        "--output",
+        str(lease.output_ledger),
+        "--run-id",
+        lease.trial_run_id,
+        "--candidate-source-commit",
+        lease.source_commit,
+        "--candidate-image-digest",
+        lease.image_digest,
+        "--run-manifest-sha256",
+        lease.run_manifest_sha256,
+        "--cache-mode",
+        "warm-prefix",
+        "--variant",
+        _variant(lease, arm),
+        "--base-url",
+        lease.direct_base_url,
+        "--cache-prime-only",
+        "--cache-prime-arm",
+        arm,
+        "--model-attempt-ledger",
+        str(prime_ledger),
+    ]
+    if lease.direct_api_key_file is not None:
+        argv.extend(("--api-key-file", str(lease.direct_api_key_file)))
+    return tuple(argv)
+
+
 def _variant(lease: RuntimeLease, treatment: str) -> str:
     return f"{lease.cache_lane}-pair{lease.pair_index}-{treatment}-{lease.agentic_set}"
+
+
+def _cache_mode(lease: RuntimeLease) -> str:
+    return "bypass" if lease.cache_lane == "cold" else "warm-prefix"
 
 
 def main(
@@ -173,6 +237,12 @@ def _require_proxy_lease(lease: RuntimeLease) -> tuple[str, str, Path, Path, Pat
 def _require_attestation(lease: RuntimeLease) -> None:
     if lease.attestation_path is None:
         raise ValueError("runtime attestation is unavailable")
+
+
+def _require_direct_attempt_ledger(lease: RuntimeLease) -> Path:
+    if lease.direct_model_attempt_ledger is None:
+        raise ValueError("lease is missing its direct model-attempt ledger")
+    return lease.direct_model_attempt_ledger
 
 
 if __name__ == "__main__":

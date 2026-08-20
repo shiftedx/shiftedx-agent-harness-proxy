@@ -23,12 +23,13 @@ import re
 import shlex
 import stat
 import subprocess
-import tempfile
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Protocol, TypeAlias, cast
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 EvidenceStage: TypeAlias = Literal["preflight", "score-direct", "score-proxy"]
 CacheLane: TypeAlias = Literal["preflight", "cold", "warm-prefix"]
@@ -60,6 +61,7 @@ _EVIDENCE_KEYS = frozenset(
         "status",
         "failure_category",
         "run_manifest_sha256",
+        "model_identity_sha256",
         "model_contract_sha256",
         "runtime_instance_sha256",
         "live_before_sha256",
@@ -147,10 +149,34 @@ _MTPLX_SETTINGS_KEYS = frozenset(
         "ram_session_cache_per_session_max_size",
     }
 )
+_MODEL_CONTROLS_SAFE_KEYS = frozenset(
+    {
+        "reasoning",
+        "thinking",
+        "enable_thinking",
+        "preserve_thinking",
+        "generation_mode",
+        "depth",
+        "temperature",
+        "top_p",
+        "top_k",
+        "tool_prompt_mode",
+        "tool_contract_active",
+        "supports_tools",
+        "supports_thinking",
+        "context_window",
+    }
+)
 _SENSITIVE_SETTING_KEY = re.compile(r"(?:^model$|path|directory|(?:^|_)dir$|error|diagnostic|hardware|serial)")
 _SENSITIVE_LAUNCH_MATERIAL = re.compile(
     r"(?:api[_-]?key|token|password|secret|credential|authorization|bearer)", re.IGNORECASE
 )
+_READ_ONLY_COMMAND_ENV = {
+    "PATH": "/usr/bin:/bin:/usr/sbin",
+    "LANG": "C",
+    "LC_ALL": "C",
+}
+_HTTP_RESPONSE_MAX_BYTES = 1 << 20
 
 
 class ModelEvidenceFailure(RuntimeError):
@@ -231,8 +257,8 @@ class SafeAttemptRecord:
                 request_session_bank_bypass=cast(bool, value["request_session_bank_bypass"]),
                 postcommit_stored=cast(bool, value["postcommit_stored"]),
             )
-        except (KeyError, TypeError) as error:
-            raise ModelEvidenceFailure("model_attempt_invalid") from error
+        except (KeyError, TypeError):
+            raise ModelEvidenceFailure("model_attempt_invalid") from None
 
     def to_safe_dict(self) -> dict[str, Any]:
         return {
@@ -282,9 +308,7 @@ class ModelEvidenceResult:
     status: Literal["passed", "failed"]
 
 
-def model_endpoint_contract_hashes(
-    health: Mapping[str, Any], settings: Mapping[str, Any]
-) -> tuple[str, str]:
+def model_endpoint_contract_hashes(health: Mapping[str, Any], settings: Mapping[str, Any]) -> tuple[str, str]:
     """Return reproducible hashes of the exact safe MTPLX endpoint projections.
 
     This narrow helper is the manifest-freezing seam: callers may pass raw
@@ -301,6 +325,7 @@ def model_endpoint_contract_hashes(
 @dataclass(frozen=True)
 class _ValidatedContract:
     contract_sha256: str
+    identity_sha256: str
     distribution_sha256: str
 
 
@@ -339,6 +364,24 @@ class ModelEvidenceSession:
         self._before = before
         self._completed = False
 
+    @property
+    def model_contract_sha256(self) -> str:
+        """Return the validated private-contract digest without exposing contract fields."""
+
+        return self._validated_contract.contract_sha256
+
+    @property
+    def model_identity_sha256(self) -> str:
+        """Return the cross-lane model identity digest without private fields."""
+
+        return self._validated_contract.identity_sha256
+
+    @property
+    def runtime_instance_sha256(self) -> str:
+        """Return the before-probe local instance digest without exposing process identity."""
+
+        return self._before.runtime_instance_sha256
+
     @classmethod
     def begin(
         cls,
@@ -367,6 +410,7 @@ class ModelEvidenceSession:
             raise ModelEvidenceFailure("model_contract_invalid")
         if evidence_path.exists() or evidence_path.is_symlink():
             raise ModelEvidenceFailure("model_evidence_exists")
+        _validate_evidence_parent(evidence_path)
         if (
             not isinstance(stage, str)
             or stage not in {"preflight", "score-direct", "score-proxy"}
@@ -449,6 +493,7 @@ class ModelEvidenceSession:
                 status="failed",
                 failure_category=failure.category,
                 manifest_sha256=self._manifest_sha256,
+                identity_sha256=self._validated_contract.identity_sha256,
                 contract_sha256=self._validated_contract.contract_sha256,
                 before=self._before,
                 after=after,
@@ -466,6 +511,7 @@ class ModelEvidenceSession:
             status="passed",
             failure_category=None,
             manifest_sha256=self._manifest_sha256,
+            identity_sha256=self._validated_contract.identity_sha256,
             contract_sha256=self._validated_contract.contract_sha256,
             before=self._before,
             after=after,
@@ -485,7 +531,7 @@ class ModelEvidenceSession:
 class ModelEvidenceCommandRunner(Protocol):
     """Read-only command seam for listener/process inspection."""
 
-    def __call__(self, argv: tuple[str, ...]) -> tuple[int, str]: ...
+    def __call__(self, argv: tuple[str, ...], *, env: Mapping[str, str]) -> tuple[int, str]: ...
 
 
 class SystemModelEvidenceProbe:
@@ -521,18 +567,17 @@ class SystemModelEvidenceProbe:
             owners = self._listener_owners(host, port, contract)
         except ModelEvidenceFailure:
             raise
-        except Exception as error:
-            raise ModelEvidenceFailure("model_probe_failed") from error
+        except Exception:
+            raise ModelEvidenceFailure("model_probe_failed") from None
         return ProbeSnapshot(health=health, models=models, settings=settings, listener_owners=owners)
 
-    def _listener_owners(
-        self, host: str, port: int, contract: ModelEvidenceContract
-    ) -> tuple[Mapping[str, Any], ...]:
+    def _listener_owners(self, host: str, port: int, contract: ModelEvidenceContract) -> tuple[Mapping[str, Any], ...]:
         # lsof reports PIDs only; health.startup_pid is joined to the sole PID
         # later by _validate_live_snapshot.  This prevents an unrelated ready
         # listener from being mistaken for the qualified model.
         status, listed = self._command_runner(
-            ("lsof", "-nP", f"-iTCP@{host}:{port}", "-sTCP:LISTEN", "-Fp")
+            ("/usr/sbin/lsof", "-nP", f"-iTCP@{host}:{port}", "-sTCP:LISTEN", "-Fp"),
+            env=_READ_ONLY_COMMAND_ENV,
         )
         if status != 0:
             raise ModelEvidenceFailure("model_listener_invalid")
@@ -540,9 +585,9 @@ class SystemModelEvidenceProbe:
         if len(pids) != 1:
             raise ModelEvidenceFailure("model_listener_invalid")
         pid = pids[0]
-        command = _command_output(self._command_runner, ("ps", "-ww", "-p", str(pid), "-o", "command="))
-        executable = _command_output(self._command_runner, ("ps", "-p", str(pid), "-o", "comm="))
-        start_time = _command_output(self._command_runner, ("ps", "-p", str(pid), "-o", "lstart="))
+        command = _command_output(self._command_runner, ("/bin/ps", "-ww", "-p", str(pid), "-o", "command="))
+        executable = _command_output(self._command_runner, ("/bin/ps", "-p", str(pid), "-o", "comm="))
+        start_time = _command_output(self._command_runner, ("/bin/ps", "-p", str(pid), "-o", "lstart="))
         try:
             argv = tuple(shlex.split(command))
             if not argv:
@@ -550,8 +595,8 @@ class SystemModelEvidenceProbe:
             executable_path = Path(executable).resolve(strict=True)
             executable_sha256 = _file_sha256(executable_path)
             expected_executable = contract.runtime_executable.resolve(strict=True)
-        except (OSError, ValueError) as error:
-            raise ModelEvidenceFailure("model_listener_invalid") from error
+        except (OSError, ValueError):
+            raise ModelEvidenceFailure("model_listener_invalid") from None
         if executable_path != expected_executable:
             raise ModelEvidenceFailure("model_listener_invalid")
         distribution_sha256 = _distribution_aggregate(contract)
@@ -604,8 +649,8 @@ def _project_mtplx_health(value: Mapping[str, Any]) -> dict[str, Any]:
         }
     except ModelEvidenceFailure:
         raise
-    except (TypeError, ValueError) as error:
-        raise ModelEvidenceFailure("model_live_invalid") from error
+    except (TypeError, ValueError):
+        raise ModelEvidenceFailure("model_live_invalid") from None
 
 
 def _normalize_started_at(value: Any) -> str:
@@ -618,8 +663,8 @@ def _normalize_started_at(value: Any) -> str:
     if isinstance(value, int | float):
         try:
             return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-        except (TypeError, ValueError) as error:
-            raise ModelEvidenceFailure("model_live_invalid") from error
+        except (TypeError, ValueError):
+            raise ModelEvidenceFailure("model_live_invalid") from None
     raise ModelEvidenceFailure("model_live_invalid")
 
 
@@ -634,17 +679,15 @@ def _project_mtplx_models(value: Mapping[str, Any], public_model_id: str) -> dic
         matches = [
             item
             for item in data
-            if isinstance(item, Mapping)
-            and item.get("object") == "model"
-            and item.get("id") == public_model_id
+            if isinstance(item, Mapping) and item.get("object") == "model" and item.get("id") == public_model_id
         ]
         if len(matches) != 1:
             raise ModelEvidenceFailure("model_live_invalid")
         return {"data": [{"id": public_model_id}]}
     except ModelEvidenceFailure:
         raise
-    except (TypeError, ValueError) as error:
-        raise ModelEvidenceFailure("model_live_invalid") from error
+    except (TypeError, ValueError):
+        raise ModelEvidenceFailure("model_live_invalid") from None
 
 
 def _project_mtplx_settings(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -655,13 +698,25 @@ def _project_mtplx_settings(value: Mapping[str, Any]) -> dict[str, Any]:
         if settings.get("ok") is not True or not _MTPLX_SETTINGS_KEYS.issubset(settings):
             raise ModelEvidenceFailure("model_live_invalid")
         projected = {key: settings[key] for key in sorted(_MTPLX_SETTINGS_KEYS)}
+        projected["model_controls"] = _project_model_controls(settings["model_controls"])
         if not _safe_mtplx_settings_value(projected):
             raise ModelEvidenceFailure("model_live_invalid")
         return projected
     except ModelEvidenceFailure:
         raise
-    except (TypeError, ValueError) as error:
-        raise ModelEvidenceFailure("model_live_invalid") from error
+    except (TypeError, ValueError):
+        raise ModelEvidenceFailure("model_live_invalid") from None
+
+
+def _project_model_controls(value: Any) -> dict[str, Any]:
+    """Keep only reviewed non-path controls from MTPLX's mixed control object."""
+
+    if not isinstance(value, Mapping):
+        raise ModelEvidenceFailure("model_live_invalid")
+    projected = {key: value[key] for key in sorted(_MODEL_CONTROLS_SAFE_KEYS & set(value))}
+    if not _safe_mtplx_settings_value(projected):
+        raise ModelEvidenceFailure("model_live_invalid")
+    return projected
 
 
 def _safe_mtplx_settings_value(value: Any, *, depth: int = 0) -> bool:
@@ -672,10 +727,7 @@ def _safe_mtplx_settings_value(value: Any, *, depth: int = 0) -> bool:
     if isinstance(value, float):
         return value == value and value not in {float("inf"), float("-inf")}
     if isinstance(value, str):
-        return (
-            _SAFE_TEXT.fullmatch(value) is not None
-            and not value.startswith(("/", "~/", "file://"))
-        )
+        return _SAFE_TEXT.fullmatch(value) is not None and not value.startswith(("/", "~/", "file://"))
     if isinstance(value, list):
         return len(value) <= 128 and all(_safe_mtplx_settings_value(item, depth=depth + 1) for item in value)
     if isinstance(value, dict):
@@ -716,7 +768,7 @@ def _validate_contract(contract: ModelEvidenceContract) -> _ValidatedContract:
         _validate_runtime_executable(contract.runtime_executable, contract.runtime_executable_sha256)
         _validate_launch_semantics(contract)
         distribution_sha256 = _distribution_aggregate(contract)
-        safe_contract = {
+        safe_identity = {
             "public_model_id_sha256": _canonical_sha256(contract.public_model_id),
             "stage_path_sha256": _canonical_sha256(str(contract.stage_path)),
             "stage_revision": contract.stage_revision,
@@ -731,13 +783,17 @@ def _validate_contract(contract: ModelEvidenceContract) -> _ValidatedContract:
             "port": contract.port,
             "health_contract_sha256": contract.health_contract_sha256,
             "settings_contract_sha256": contract.settings_contract_sha256,
-            "cache_lane": contract.cache_lane,
         }
-        return _ValidatedContract(_canonical_sha256(safe_contract), distribution_sha256)
+        safe_contract = {**safe_identity, "cache_lane": contract.cache_lane}
+        return _ValidatedContract(
+            contract_sha256=_canonical_sha256(safe_contract),
+            identity_sha256=_canonical_sha256(safe_identity),
+            distribution_sha256=distribution_sha256,
+        )
     except ModelEvidenceFailure:
         raise
-    except (AttributeError, OSError, TypeError, ValueError) as error:
-        raise ModelEvidenceFailure("model_contract_invalid") from error
+    except (AttributeError, OSError, TypeError, ValueError):
+        raise ModelEvidenceFailure("model_contract_invalid") from None
 
 
 def _absolute_directory(path: Path) -> bool:
@@ -762,18 +818,20 @@ def _validate_runtime_executable(path: Path, expected_sha256: str) -> None:
             raise ModelEvidenceFailure("model_contract_invalid")
     except ModelEvidenceFailure:
         raise
-    except OSError as error:
-        raise ModelEvidenceFailure("model_contract_invalid") from error
+    except OSError:
+        raise ModelEvidenceFailure("model_contract_invalid") from None
 
 
 def _validate_launch_semantics(contract: ModelEvidenceContract) -> None:
     flags = contract.required_launch_flags
-    if not isinstance(flags, tuple) or not flags or len(set(flags)) != len(flags) or any(
-        not isinstance(value, str)
-        or not value.startswith("--")
-        or "\x00" in value
-        or _unsafe_launch_flag(value)
-        for value in flags
+    if (
+        not isinstance(flags, tuple)
+        or not flags
+        or len(set(flags)) != len(flags)
+        or any(
+            not isinstance(value, str) or not value.startswith("--") or "\x00" in value or _unsafe_launch_flag(value)
+            for value in flags
+        )
     ):
         raise ModelEvidenceFailure("model_contract_invalid")
     expected = {f"--host={contract.host}", f"--port={contract.port}"}
@@ -785,80 +843,162 @@ def _unsafe_launch_flag(value: str) -> bool:
     key, separator, flag_value = value.partition("=")
     if key == "--no-auth" and not separator:
         return False
-    return key.startswith("--auth") or _SENSITIVE_LAUNCH_MATERIAL.search(key) is not None or (
-        bool(flag_value) and _SENSITIVE_LAUNCH_MATERIAL.search(flag_value) is not None
+    return (
+        key.startswith("--auth")
+        or _SENSITIVE_LAUNCH_MATERIAL.search(key) is not None
+        or (bool(flag_value) and _SENSITIVE_LAUNCH_MATERIAL.search(flag_value) is not None)
     )
 
 
 def _distribution_aggregate(contract: ModelEvidenceContract) -> str:
     root = contract.mtplx_distribution_root
     record = contract.mtplx_record
+    root_descriptor: int | None = None
     try:
-        root_status = root.lstat()
-        record_status = record.lstat()
-        if (
-            not root.is_absolute()
-            or root.is_symlink()
-            or not stat.S_ISDIR(root_status.st_mode)
-            or record.is_symlink()
-            or not stat.S_ISREG(record_status.st_mode)
-            or not record.is_relative_to(root)
-        ):
+        if not root.is_absolute() or not record.is_relative_to(root):
             raise ModelEvidenceFailure("model_package_invalid")
-        record_relative = record.relative_to(root).as_posix()
-        parsed_rows = list(csv.reader(_read_regular_file(record, "model_package_invalid").decode("utf-8").splitlines()))
+        record_parts = _record_path_parts(record.relative_to(root).as_posix())
+        root_descriptor = _open_directory_nofollow(root, "model_package_invalid")
+        record_bytes = _read_distribution_file(root_descriptor, record_parts)
+        parsed_rows = list(csv.reader(record_bytes.decode("utf-8").splitlines()))
     except ModelEvidenceFailure:
         raise
-    except (OSError, UnicodeDecodeError, csv.Error, ValueError) as error:
-        raise ModelEvidenceFailure("model_package_invalid") from error
-    if not parsed_rows:
-        raise ModelEvidenceFailure("model_package_invalid")
-    verified: list[tuple[str, str]] = []
-    metadata: list[Path] = []
-    seen: set[str] = set()
-    for row in parsed_rows:
-        if len(row) != 3:
+    except (OSError, UnicodeDecodeError, csv.Error, ValueError):
+        raise ModelEvidenceFailure("model_package_invalid") from None
+    try:
+        if not parsed_rows:
             raise ModelEvidenceFailure("model_package_invalid")
-        relative, encoded_digest, byte_count = row
-        if (
-            not relative
-            or relative in seen
-            or Path(relative).is_absolute()
-            or "\\" in relative
-            or any(part in {"", ".", ".."} for part in Path(relative).parts)
-        ):
-            raise ModelEvidenceFailure("model_package_invalid")
-        seen.add(relative)
-        if "__pycache__" in Path(relative).parts:
-            # Bytecode is intentionally not part of a pinned source aggregate.
-            continue
-        candidate = root / relative
-        try:
+        verified: list[tuple[str, str]] = []
+        ignored_external: list[tuple[str, str, str]] = []
+        metadata: list[bytes] = []
+        seen: set[str] = set()
+        record_relative = PurePosixPath(*record_parts).as_posix()
+        for row in parsed_rows:
+            if len(row) != 3:
+                raise ModelEvidenceFailure("model_package_invalid")
+            relative, encoded_digest, byte_count = row
+            if not relative or relative in seen:
+                raise ModelEvidenceFailure("model_package_invalid")
+            seen.add(relative)
+            parts = _record_path_parts(relative, allow_console_script=True)
+            if _is_console_script_record(parts):
+                _validate_record_digest(encoded_digest, byte_count)
+                # Standard installed distributions list their console script as
+                # ../../../bin/<name>.  It is outside the pinned root: bind its
+                # RECORD declaration, but never open it.
+                ignored_external.append((relative, encoded_digest, byte_count))
+                continue
+            if "__pycache__" in parts:
+                # Bytecode is intentionally not part of a pinned source aggregate.
+                continue
             if relative == record_relative and not encoded_digest and not byte_count:
                 continue
-            if not encoded_digest.startswith("sha256=") or not byte_count.isdigit():
-                raise ModelEvidenceFailure("model_package_invalid")
+            _validate_record_digest(encoded_digest, byte_count)
             expected = _urlsafe_digest(encoded_digest.removeprefix("sha256="))
-            actual_bytes = _read_regular_file(candidate, "model_package_invalid")
+            actual_bytes = _read_distribution_file(root_descriptor, parts)
             if hashlib.sha256(actual_bytes).digest() != expected or len(actual_bytes) != int(byte_count):
                 raise ModelEvidenceFailure("model_package_invalid")
-        except ModelEvidenceFailure:
-            raise
-        except (OSError, ValueError) as error:
-            raise ModelEvidenceFailure("model_package_invalid") from error
-        digest = hashlib.sha256(actual_bytes).hexdigest()
-        verified.append((relative, digest))
-        if relative.endswith(".dist-info/METADATA"):
-            metadata.append(candidate)
-    if len(metadata) != 1 or not verified:
+            digest = hashlib.sha256(actual_bytes).hexdigest()
+            verified.append((relative, digest))
+            if relative.endswith(".dist-info/METADATA"):
+                metadata.append(actual_bytes)
+        if len(metadata) != 1 or not verified:
+            raise ModelEvidenceFailure("model_package_invalid")
+        metadata_fields = _metadata_fields(metadata[0].decode("utf-8"))
+        if metadata_fields.get("Name") != "mtplx" or metadata_fields.get("Version") != "2.7.1":
+            raise ModelEvidenceFailure("model_package_invalid")
+        return _canonical_sha256(
+            {
+                "name": "mtplx",
+                "version": "2.7.1",
+                "files": sorted(verified),
+                "ignored_record_entries": sorted(ignored_external),
+            }
+        )
+    except ModelEvidenceFailure:
+        raise
+    except (OSError, UnicodeDecodeError, ValueError):
+        raise ModelEvidenceFailure("model_package_invalid") from None
+    finally:
+        if root_descriptor is not None:
+            os.close(root_descriptor)
+
+
+def _record_path_parts(relative: str, *, allow_console_script: bool = False) -> tuple[str, ...]:
+    if not isinstance(relative, str) or not relative or "\\" in relative:
         raise ModelEvidenceFailure("model_package_invalid")
+    path = PurePosixPath(relative)
+    parts = path.parts
+    if path.is_absolute() or not parts:
+        raise ModelEvidenceFailure("model_package_invalid")
+    if _is_console_script_record(parts):
+        if allow_console_script:
+            return parts
+        raise ModelEvidenceFailure("model_package_invalid")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ModelEvidenceFailure("model_package_invalid")
+    return parts
+
+
+def _is_console_script_record(parts: tuple[str, ...]) -> bool:
+    return len(parts) == 5 and parts[:4] == ("..", "..", "..", "bin") and parts[4] not in {"", ".", ".."}
+
+
+def _validate_record_digest(encoded_digest: str, byte_count: str) -> None:
+    if not encoded_digest.startswith("sha256=") or not byte_count.isdigit():
+        raise ModelEvidenceFailure("model_package_invalid")
+    _urlsafe_digest(encoded_digest.removeprefix("sha256="))
+
+
+def _open_directory_nofollow(path: Path, category: str) -> int:
+    descriptor: int | None = None
     try:
-        metadata_fields = _metadata_fields(_read_regular_file(metadata[0], "model_package_invalid").decode("utf-8"))
-    except (OSError, UnicodeDecodeError) as error:
-        raise ModelEvidenceFailure("model_package_invalid") from error
-    if metadata_fields.get("Name") != "mtplx" or metadata_fields.get("Version") != "2.7.1":
-        raise ModelEvidenceFailure("model_package_invalid")
-    return _canonical_sha256({"name": "mtplx", "version": "2.7.1", "files": sorted(verified)})
+        status = path.lstat()
+        if path.is_symlink() or not stat.S_ISDIR(status.st_mode):
+            raise ModelEvidenceFailure(category)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened.st_mode) or (opened.st_dev, opened.st_ino) != (status.st_dev, status.st_ino):
+            raise ModelEvidenceFailure(category)
+        result = descriptor
+        descriptor = None
+        return result
+    except ModelEvidenceFailure:
+        raise
+    except OSError:
+        raise ModelEvidenceFailure(category) from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _read_distribution_file(root_descriptor: int, parts: tuple[str, ...]) -> bytes:
+    current = os.dup(root_descriptor)
+    try:
+        for index, part in enumerate(parts):
+            is_last = index == len(parts) - 1
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            if not is_last:
+                flags |= getattr(os, "O_DIRECTORY", 0)
+            following = os.open(part, flags, dir_fd=current)
+            os.close(current)
+            current = following
+            opened = os.fstat(current)
+            if (not is_last and not stat.S_ISDIR(opened.st_mode)) or (is_last and not stat.S_ISREG(opened.st_mode)):
+                raise ModelEvidenceFailure("model_package_invalid")
+        chunks: list[bytes] = []
+        while chunk := os.read(current, 65536):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    except ModelEvidenceFailure:
+        raise
+    except OSError:
+        raise ModelEvidenceFailure("model_package_invalid") from None
+    finally:
+        os.close(current)
 
 
 def _urlsafe_digest(value: str) -> bytes:
@@ -866,8 +1006,8 @@ def _urlsafe_digest(value: str) -> bytes:
         raise ModelEvidenceFailure("model_package_invalid")
     try:
         return base64.urlsafe_b64decode(value + "=")
-    except ValueError as error:
-        raise ModelEvidenceFailure("model_package_invalid") from error
+    except ValueError:
+        raise ModelEvidenceFailure("model_package_invalid") from None
 
 
 def _metadata_fields(value: str) -> dict[str, str]:
@@ -895,8 +1035,8 @@ def _probe_live(
         return _validate_live_snapshot(contract, snapshot, validated.distribution_sha256)
     except ModelEvidenceFailure:
         raise
-    except Exception as error:
-        raise ModelEvidenceFailure("model_probe_failed") from error
+    except Exception:
+        raise ModelEvidenceFailure("model_probe_failed") from None
 
 
 def _validate_live_snapshot(
@@ -946,18 +1086,20 @@ def _validate_live_snapshot(
         owner["pid"] != health["startup_pid"]
         or not _positive_int(owner["pid"])
         or not _safe_identity_text(owner["start_time"])
-        or not all(isinstance(owner[name], str) and _SHA256.fullmatch(owner[name]) for name in (
-            "executable_sha256",
-            "command_sha256",
-            "mtplx_distribution_sha256",
-        ))
+        or not all(
+            isinstance(owner[name], str) and _SHA256.fullmatch(owner[name])
+            for name in (
+                "executable_sha256",
+                "command_sha256",
+                "mtplx_distribution_sha256",
+            )
+        )
         or owner["executable_sha256"] != contract.runtime_executable_sha256
         or owner["command_sha256"] != contract.launch_command_sha256
         or owner["mtplx_distribution_sha256"] != expected_distribution_sha256
         or not isinstance(owner["command_flags"], tuple)
         or not all(
-            isinstance(flag, str) and flag.startswith("--") and "\x00" not in flag
-            for flag in owner["command_flags"]
+            isinstance(flag, str) and flag.startswith("--") and "\x00" not in flag for flag in owner["command_flags"]
         )
         or owner["command_flags"] != contract.required_launch_flags
     ):
@@ -994,8 +1136,8 @@ def _coerce_attempts(value: Sequence[SafeAttemptRecord | Mapping[str, Any]]) -> 
         return records
     except ModelEvidenceFailure:
         raise
-    except (TypeError, ValueError) as error:
-        raise ModelEvidenceFailure("model_attempt_invalid") from error
+    except (TypeError, ValueError):
+        raise ModelEvidenceFailure("model_attempt_invalid") from None
 
 
 def _coerce_optional_attempt(
@@ -1024,12 +1166,15 @@ def _validate_attempt(record: SafeAttemptRecord) -> None:
         or record.status not in {"succeeded", "failed"}
         or not isinstance(record.cache_source, str)
         or record.cache_source not in {"none", "ram", "ssd"}
-        or any(not _nonnegative_int(value) for value in (
-            record.prompt_tokens,
-            record.cached_tokens,
-            record.new_prefill_tokens,
-            record.ssd_cached_tokens,
-        ))
+        or any(
+            not _nonnegative_int(value)
+            for value in (
+                record.prompt_tokens,
+                record.cached_tokens,
+                record.new_prefill_tokens,
+                record.ssd_cached_tokens,
+            )
+        )
         or any(
             not isinstance(value, bool)
             for value in (
@@ -1083,7 +1228,6 @@ def _validate_cache_invariants(
         first = attempts[0]
         if (
             prime.request_session_bank_bypass is not False
-            or prime.postcommit_stored is not True
             or prime.cache_source != "none"
             or prime.cached_tokens != 0
             or prime.new_prefill_tokens != prime.prompt_tokens
@@ -1093,6 +1237,7 @@ def _validate_cache_invariants(
             or prime.request_digest != first.request_digest
             or first.cached_tokens <= 0
             or first.cache_source not in {"ram", "ssd"}
+            or first.request_session_bank_bypass is not False
             or not (first.session_cache_hit or first.ssd_cache_hit)
         ):
             raise ModelEvidenceFailure("model_cache_warm_invalid")
@@ -1106,6 +1251,7 @@ def _evidence_record(
     status: Literal["passed", "failed"],
     failure_category: str | None,
     manifest_sha256: str,
+    identity_sha256: str,
     contract_sha256: str,
     before: _LiveIdentity,
     after: _LiveIdentity | None,
@@ -1124,6 +1270,7 @@ def _evidence_record(
         "status": status,
         "failure_category": failure_category,
         "run_manifest_sha256": manifest_sha256,
+        "model_identity_sha256": identity_sha256,
         "model_contract_sha256": contract_sha256,
         "runtime_instance_sha256": before.runtime_instance_sha256,
         "live_before_sha256": before.live_sha256,
@@ -1179,8 +1326,8 @@ def _read_credential(path: Path) -> str:
         return decoded
     except ModelEvidenceFailure:
         raise
-    except (OSError, UnicodeDecodeError) as error:
-        raise ModelEvidenceFailure("model_credential_invalid") from error
+    except (OSError, UnicodeDecodeError):
+        raise ModelEvidenceFailure("model_credential_invalid") from None
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -1222,70 +1369,164 @@ def _read_regular_file(
         return b"".join(chunks)
     except ModelEvidenceFailure:
         raise
-    except OSError as error:
-        raise ModelEvidenceFailure(category) from error
+    except OSError:
+        raise ModelEvidenceFailure(category) from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _validate_evidence_parent(path: Path) -> None:
+    if not path.is_absolute():
+        raise ModelEvidenceFailure("model_evidence_parent_invalid")
+    descriptor: int | None = None
+    try:
+        parent = path.parent
+        status = parent.lstat()
+        if parent.is_symlink() or not stat.S_ISDIR(status.st_mode) or stat.S_IMODE(status.st_mode) != 0o700:
+            raise ModelEvidenceFailure("model_evidence_parent_invalid")
+        descriptor = os.open(
+            parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or stat.S_IMODE(opened.st_mode) != 0o700
+            or (opened.st_dev, opened.st_ino) != (status.st_dev, status.st_ino)
+        ):
+            raise ModelEvidenceFailure("model_evidence_parent_invalid")
+    except ModelEvidenceFailure:
+        raise
+    except OSError:
+        raise ModelEvidenceFailure("model_evidence_parent_invalid") from None
     finally:
         if descriptor is not None:
             os.close(descriptor)
 
 
 def _atomic_write_no_clobber(path: Path, record: Mapping[str, Any]) -> None:
+    _validate_evidence_parent(path)
     if path.exists() or path.is_symlink():
         raise ModelEvidenceFailure("model_evidence_exists")
     payload = (json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
-    temporary: Path | None = None
-    descriptor: int | None = None
+    directory: int | None = None
+    temporary: int | None = None
+    target: int | None = None
+    temporary_name: str | None = None
     try:
-        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-        temporary = Path(temporary_name)
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb", closefd=False) as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.close(descriptor)
-        descriptor = None
-        os.link(temporary, path)
-        temporary.unlink()
-        temporary = None
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    except FileExistsError as error:
-        raise ModelEvidenceFailure("model_evidence_exists") from error
+        directory = _open_directory_nofollow(path.parent, "model_evidence_parent_invalid")
+        # Keep the temporary descriptor open through link+verification.  All
+        # names are resolved by the trusted directory fd, never a mutable path.
+        for nonce in range(128):
+            name = f".{path.name}.{os.getpid()}.{nonce}"
+            try:
+                temporary = os.open(
+                    name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                    dir_fd=directory,
+                )
+                temporary_name = name
+                break
+            except FileExistsError:
+                continue
+        if temporary is None or temporary_name is None:
+            raise ModelEvidenceFailure("model_evidence_write_failed")
+        os.fchmod(temporary, 0o600)
+        os.write(temporary, payload)
+        os.fsync(temporary)
+        temporary_status = os.fstat(temporary)
+        os.link(temporary_name, path.name, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
+        target = os.open(path.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory)
+        target_status = os.fstat(target)
+        if (
+            not stat.S_ISREG(target_status.st_mode)
+            or stat.S_IMODE(target_status.st_mode) != 0o600
+            or (target_status.st_dev, target_status.st_ino) != (temporary_status.st_dev, temporary_status.st_ino)
+        ):
+            raise ModelEvidenceFailure("model_evidence_write_failed")
+        target_payload = _read_descriptor(target)
+        if hashlib.sha256(target_payload).digest() != hashlib.sha256(payload).digest():
+            raise ModelEvidenceFailure("model_evidence_write_failed")
+        os.unlink(temporary_name, dir_fd=directory)
+        temporary_name = None
+        os.fsync(directory)
+    except FileExistsError:
+        raise ModelEvidenceFailure("model_evidence_exists") from None
     except ModelEvidenceFailure:
         raise
-    except OSError as error:
-        raise ModelEvidenceFailure("model_evidence_write_failed") from error
+    except OSError:
+        raise ModelEvidenceFailure("model_evidence_write_failed") from None
     finally:
-        if descriptor is not None:
-            os.close(descriptor)
+        if target is not None:
+            os.close(target)
         if temporary is not None:
-            temporary.unlink(missing_ok=True)
+            os.close(temporary)
+        if directory is not None:
+            if temporary_name is not None:
+                _best_effort_unlink(temporary_name, directory)
+            os.close(directory)
+
+
+def _read_descriptor(descriptor: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    while chunk := os.read(descriptor, 65536):
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _best_effort_unlink(name: str, directory: int) -> None:
+    with suppress(OSError):
+        os.unlink(name, dir_fd=directory)
+
+
+class _RejectRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        return None
 
 
 def _http_get_json(url: str, headers: Mapping[str, str]) -> Mapping[str, Any]:
-    request = Request(url, headers=dict(headers))  # noqa: S310 - validated loopback only
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme != "http"
+        or not _is_loopback_host(parsed.hostname)
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ModelEvidenceFailure("model_probe_failed")
+    request = Request(url, headers=dict(headers), method="GET")  # noqa: S310 - validated loopback only
+    opener = build_opener(ProxyHandler({}), _RejectRedirect())
     try:
-        with urlopen(request, timeout=5.0) as response:  # noqa: S310 - validated loopback only
-            if response.status != 200:
+        with opener.open(request, timeout=5.0) as response:  # noqa: S310 - fixed local read paths only
+            if response.status != 200 or response.geturl() != url:
                 raise ModelEvidenceFailure("model_probe_failed")
-            document = json.loads(response.read().decode("utf-8"), object_pairs_hook=_unique_json_object)
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None and (
+                not content_length.isdigit() or int(content_length) > _HTTP_RESPONSE_MAX_BYTES
+            ):
+                raise ModelEvidenceFailure("model_probe_failed")
+            body = response.read(_HTTP_RESPONSE_MAX_BYTES + 1)
+            if len(body) > _HTTP_RESPONSE_MAX_BYTES:
+                raise ModelEvidenceFailure("model_probe_failed")
+            document = json.loads(body.decode("utf-8"), object_pairs_hook=_unique_json_object)
     except ModelEvidenceFailure:
         raise
-    except Exception as error:
-        raise ModelEvidenceFailure("model_probe_failed") from error
+    except Exception:
+        raise ModelEvidenceFailure("model_probe_failed") from None
     if not isinstance(document, dict):
         raise ModelEvidenceFailure("model_probe_failed")
     return document
 
 
-def _run_read_only_command(argv: tuple[str, ...]) -> tuple[int, str]:
+def _run_read_only_command(argv: tuple[str, ...], *, env: Mapping[str, str]) -> tuple[int, str]:
     try:
         completed = subprocess.run(  # noqa: S603 - fixed probe vectors only
-            list(argv), capture_output=True, text=True, check=False, timeout=5.0
+            list(argv), capture_output=True, text=True, check=False, timeout=5.0, env=dict(env)
         )
     except (OSError, subprocess.TimeoutExpired):
         return 125, ""
@@ -1293,7 +1534,7 @@ def _run_read_only_command(argv: tuple[str, ...]) -> tuple[int, str]:
 
 
 def _command_output(runner: ModelEvidenceCommandRunner, argv: tuple[str, ...]) -> str:
-    status, output = runner(argv)
+    status, output = runner(argv, env=_READ_ONLY_COMMAND_ENV)
     result = output.strip()
     if status != 0 or not result:
         raise ModelEvidenceFailure("model_listener_invalid")

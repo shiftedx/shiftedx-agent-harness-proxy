@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import stat
+import traceback
 from base64 import urlsafe_b64encode
 from copy import deepcopy
 from dataclasses import replace
@@ -10,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import shiftedx_harness_proxy.qualification_model_evidence as model_evidence
 from shiftedx_harness_proxy.qualification_model_evidence import (
     ModelEvidenceContract,
     ModelEvidenceFailure,
@@ -37,9 +39,7 @@ class _Probe:
         self.after_error: Exception | None = None
         self.expected_api_key: str | None = "model-api-token"
 
-    def snapshot(
-        self, *, host: str, port: int, api_key: str | None, contract: ModelEvidenceContract
-    ) -> ProbeSnapshot:
+    def snapshot(self, *, host: str, port: int, api_key: str | None, contract: ModelEvidenceContract) -> ProbeSnapshot:
         del contract
         assert host == "127.0.0.1"
         assert port == 8999
@@ -232,6 +232,7 @@ def _private(path: Path, value: bytes) -> Path:
 
 def _contract(tmp_path: Path, *, lane: str = "cold") -> ModelEvidenceContract:
     tmp_path.mkdir(parents=True, exist_ok=True)
+    tmp_path.chmod(0o700)
     stage = tmp_path / "private-stage"
     stage.mkdir()
     identity = _private(tmp_path / "identity.json", b'{"identity":"safe"}\n')
@@ -294,16 +295,25 @@ def _record_row(root: Path, path: Path) -> str:
 def _distribution_digest(contract: ModelEvidenceContract) -> str:
     root = contract.mtplx_distribution_root
     rows: list[tuple[str, str]] = []
+    ignored: list[tuple[str, str, str]] = []
     for line in contract.mtplx_record.read_text(encoding="utf-8").splitlines():
-        relative, encoded, _size = line.split(",")
+        relative, encoded, size = line.split(",")
+        if relative.startswith("../../../bin/"):
+            ignored.append((relative, encoded, size))
+            continue
         if encoded:
             rows.append((relative, _file_digest(root / relative)))
-    return _sha256({"name": "mtplx", "version": "2.7.1", "files": sorted(rows)})
+    return _sha256(
+        {
+            "name": "mtplx",
+            "version": "2.7.1",
+            "files": sorted(rows),
+            "ignored_record_entries": sorted(ignored),
+        }
+    )
 
 
-def _probe_for(
-    contract: ModelEvidenceContract, *, before_requests: int = 7, after_requests: int = 8
-) -> _Probe:
+def _probe_for(contract: ModelEvidenceContract, *, before_requests: int = 7, after_requests: int = 8) -> _Probe:
     probe = _Probe()
     probe.before = _snapshot(
         requests_completed=before_requests,
@@ -403,6 +413,7 @@ def test_cold_session_writes_only_safe_hash_evidence(tmp_path: Path) -> None:
         "status",
         "failure_category",
         "run_manifest_sha256",
+        "model_identity_sha256",
         "model_contract_sha256",
         "runtime_instance_sha256",
         "live_before_sha256",
@@ -416,6 +427,63 @@ def test_cold_session_writes_only_safe_hash_evidence(tmp_path: Path) -> None:
     assert "model-api-token" not in output.read_text(encoding="utf-8")
     assert str(contract.stage_path) not in output.read_text(encoding="utf-8")
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
+
+
+def test_model_identity_excludes_only_cache_lane(tmp_path: Path) -> None:
+    """Cross-stage identity stays stable while lane-specific proof stays bound."""
+
+    cold_contract = _contract(tmp_path / "cold", lane="cold")
+    warm_contract = _contract(tmp_path / "warm", lane="warm-prefix")
+    cold_probe = _probe_for(cold_contract, after_requests=7)
+    warm_probe = _probe_for(warm_contract, after_requests=7)
+    cold_probe.expected_api_key = None
+    warm_probe.expected_api_key = None
+
+    cold = ModelEvidenceSession.begin(
+        cold_contract,
+        stage="score-direct",
+        run_manifest_sha256="f" * 64,
+        evidence_path=tmp_path / "cold-evidence.json",
+        credential_file=None,
+        probe=cold_probe,
+    )
+    warm = ModelEvidenceSession.begin(
+        warm_contract,
+        stage="score-direct",
+        run_manifest_sha256="f" * 64,
+        evidence_path=tmp_path / "warm-evidence.json",
+        credential_file=None,
+        probe=warm_probe,
+    )
+
+    # The independent contracts differ only in their private fixture roots and
+    # lane.  A same-root lane comparison below isolates the intended distinction.
+    base = _contract(tmp_path / "same", lane="cold")
+    same_warm = replace(base, cache_lane="warm-prefix")
+    base_probe = _probe_for(base, after_requests=7)
+    warm_base_probe = _probe_for(same_warm, after_requests=7)
+    base_probe.expected_api_key = None
+    warm_base_probe.expected_api_key = None
+    cold_same = ModelEvidenceSession.begin(
+        base,
+        stage="score-direct",
+        run_manifest_sha256="f" * 64,
+        evidence_path=tmp_path / "same-cold.json",
+        credential_file=None,
+        probe=base_probe,
+    )
+    warm_same = ModelEvidenceSession.begin(
+        same_warm,
+        stage="score-direct",
+        run_manifest_sha256="f" * 64,
+        evidence_path=tmp_path / "same-warm.json",
+        credential_file=None,
+        probe=warm_base_probe,
+    )
+
+    assert cold.model_identity_sha256 != warm.model_identity_sha256
+    assert cold_same.model_identity_sha256 == warm_same.model_identity_sha256
+    assert cold_same.model_contract_sha256 != warm_same.model_contract_sha256
 
 
 @pytest.mark.parametrize(
@@ -540,6 +608,35 @@ def test_record_aggregate_ignores_pycache_but_rejects_metadata_version_drift(tmp
         )
 
 
+def test_record_aggregate_binds_but_does_not_read_standard_console_script_rows(tmp_path: Path) -> None:
+    """A real site-packages RECORD names its console script outside that root."""
+
+    contract = _contract(tmp_path)
+    record = contract.mtplx_record
+    script_bytes = b"private console script is intentionally not read"
+    script_digest = urlsafe_b64encode(hashlib.sha256(script_bytes).digest()).decode("ascii").rstrip("=")
+    record.write_text(
+        record.read_text(encoding="utf-8").replace(
+            "mtplx-2.7.1.dist-info/RECORD,,\n",
+            f"mtplx-2.7.1.dist-info/RECORD,,\n../../../bin/mtplx,sha256={script_digest},{len(script_bytes)}\n",
+        ),
+        encoding="utf-8",
+    )
+    credential = _private(tmp_path / "credential", b"model-api-token")
+    probe = _probe_for(contract, after_requests=7)
+
+    session = ModelEvidenceSession.begin(
+        contract,
+        stage="preflight",
+        run_manifest_sha256="f" * 64,
+        evidence_path=tmp_path / "external-row.json",
+        credential_file=credential,
+        probe=probe,
+    )
+
+    assert session.complete([]).status == "passed"
+
+
 @pytest.mark.parametrize("kind", ["health", "settings", "model", "runtime", "pid", "argv", "listener"])
 def test_begin_rejects_wrong_live_identity(tmp_path: Path, kind: str) -> None:
     contract = _contract(tmp_path)
@@ -635,9 +732,7 @@ def test_complete_detects_intervening_request_count(tmp_path: Path) -> None:
         _attempt(status="local_projection"),
     ],
 )
-def test_cold_cache_invariants_reject_hits_and_rawish_categories(
-    tmp_path: Path, invalid: SafeAttemptRecord
-) -> None:
+def test_cold_cache_invariants_reject_hits_and_rawish_categories(tmp_path: Path, invalid: SafeAttemptRecord) -> None:
     session, _contract_value, _probe_value, output, _credential = _begin(tmp_path)
 
     with pytest.raises(ModelEvidenceFailure, match="model_(cache_cold|attempt)_invalid"):
@@ -774,6 +869,93 @@ def test_no_clobber_preserves_existing_evidence_before_probe(tmp_path: Path) -> 
     assert probe.calls == []
 
 
+def test_begin_rejects_an_untrusted_evidence_parent_before_any_model_probe(tmp_path: Path) -> None:
+    contract = _contract(tmp_path)
+    parent = tmp_path / "untrusted-output"
+    parent.mkdir(mode=0o755)
+    parent.chmod(0o755)
+    credential = _private(tmp_path / "credential", b"model-api-token")
+    probe = _probe_for(contract)
+
+    with pytest.raises(ModelEvidenceFailure, match="model_evidence_parent_invalid"):
+        ModelEvidenceSession.begin(
+            contract,
+            stage="score-direct",
+            run_manifest_sha256="f" * 64,
+            evidence_path=parent / "evidence.json",
+            credential_file=credential,
+            probe=probe,
+        )
+
+    assert probe.calls == []
+
+
+def test_default_http_reader_disables_proxies_and_rejects_redirects_without_leaking_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default transport must not forward Authorization across a redirect."""
+
+    captured_handlers: list[object] = []
+
+    class _Response:
+        status = 200
+        headers: dict[str, str] = {}
+
+        def __enter__(self) -> _Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def geturl(self) -> str:
+            return "http://127.0.0.1:8999/redirected"
+
+        def read(self, _limit: int = -1) -> bytes:
+            return b'{"ok":true}'
+
+    class _Opener:
+        def open(self, request: object, *, timeout: float) -> _Response:
+            assert timeout == 5.0
+            assert request.get_header("Authorization") == "Bearer private-token"  # type: ignore[attr-defined]
+            return _Response()
+
+    def build(*handlers: object) -> _Opener:
+        captured_handlers.extend(handlers)
+        return _Opener()
+
+    monkeypatch.setattr(model_evidence, "build_opener", build)
+    headers = {"Authorization": f"Bearer {'private-token'}"}
+    with pytest.raises(ModelEvidenceFailure, match="model_probe_failed") as raised:
+        model_evidence._http_get_json("http://127.0.0.1:8999/health", headers)
+
+    rendered = "".join(traceback.format_exception(raised.value))
+    assert "private-token" not in rendered
+    proxy = next(handler for handler in captured_handlers if handler.__class__.__name__ == "ProxyHandler")
+    assert proxy.proxies == {}  # type: ignore[attr-defined]
+    assert any(handler.__class__.__name__ == "_RejectRedirect" for handler in captured_handlers)
+
+
+def test_distribution_rejects_an_intermediate_symlink_escape(tmp_path: Path) -> None:
+    contract = _contract(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "module.py").write_bytes(b"untrusted")
+    module = contract.mtplx_distribution_root / "mtplx.py"
+    module.unlink()
+    module.symlink_to(outside / "module.py")
+    credential = _private(tmp_path / "credential", b"model-api-token")
+
+    with pytest.raises(ModelEvidenceFailure, match="model_package_invalid"):
+        ModelEvidenceSession.begin(
+            contract,
+            stage="preflight",
+            run_manifest_sha256="f" * 64,
+            evidence_path=tmp_path / "symlink-escape.json",
+            credential_file=credential,
+            probe=_probe_for(contract),
+        )
+
+
 def test_post_probe_failure_writes_categorical_artifact_without_exception_text(tmp_path: Path) -> None:
     session, _contract_value, probe, output, _credential = _begin(tmp_path)
     probe.after_error = RuntimeError("private endpoint /admin/sessions and token are unavailable")
@@ -831,8 +1013,9 @@ def test_system_probe_hits_only_the_approved_read_paths(tmp_path: Path) -> None:
             return _raw_real_mtplx_settings()
         raise AssertionError("unsafe endpoint")
 
-    def run(argv: tuple[str, ...]) -> tuple[int, str]:
-        if argv[0] == "lsof":
+    def run(argv: tuple[str, ...], *, env: dict[str, str]) -> tuple[int, str]:
+        assert env == {"PATH": "/usr/bin:/bin:/usr/sbin", "LANG": "C", "LC_ALL": "C"}
+        if argv[0] == "/usr/sbin/lsof":
             return 0, "p444\n"
         if argv[-1] == "command=":
             return 0, " ".join(command) + "\n"
@@ -883,8 +1066,9 @@ def test_system_probe_projects_literal_mtplx_271_shapes_without_retaining_privat
             return raw_settings
         raise AssertionError("unsafe endpoint")
 
-    def run(argv: tuple[str, ...]) -> tuple[int, str]:
-        if argv[0] == "lsof":
+    def run(argv: tuple[str, ...], *, env: dict[str, str]) -> tuple[int, str]:
+        assert env == {"PATH": "/usr/bin:/bin:/usr/sbin", "LANG": "C", "LC_ALL": "C"}
+        if argv[0] == "/usr/sbin/lsof":
             return 0, "p444\n"
         if argv[-1] == "command=":
             return 0, " ".join(command) + "\n"
@@ -937,8 +1121,9 @@ def test_real_schema_volatile_fields_do_not_change_projected_contract_hashes(tmp
     command = _real_command(contract)
     contract = replace(contract, launch_command_sha256=_sha256(list(command)))
 
-    def run(argv: tuple[str, ...]) -> tuple[int, str]:
-        if argv[0] == "lsof":
+    def run(argv: tuple[str, ...], *, env: dict[str, str]) -> tuple[int, str]:
+        assert env == {"PATH": "/usr/bin:/bin:/usr/sbin", "LANG": "C", "LC_ALL": "C"}
+        if argv[0] == "/usr/sbin/lsof":
             return 0, "p444\n"
         if argv[-1] == "command=":
             return 0, " ".join(command) + "\n"
@@ -971,6 +1156,21 @@ def test_real_schema_volatile_fields_do_not_change_projected_contract_hashes(tmp
     assert first.models == second.models == {"data": [{"id": "public-qualified-model"}]}
 
 
+def test_settings_projection_drops_private_model_controls_reference(tmp_path: Path) -> None:
+    """The live 2.7.1 control object can name a private model reference."""
+
+    raw_settings = _raw_real_mtplx_settings()
+    raw_controls = raw_settings["model_controls"]
+    assert isinstance(raw_controls, dict)
+    raw_controls["model_ref"] = "/private/model/source"
+    expected = _real_mtplx_settings()
+
+    assert model_endpoint_contract_hashes(_raw_real_mtplx_health(), raw_settings) == (
+        _sha256({"status": "ok"}),
+        _sha256(expected),
+    )
+
+
 def test_system_probe_allows_null_launch_id_but_rejects_missing_startup_identity(tmp_path: Path) -> None:
     contract = _contract(tmp_path)
     command = _real_command(contract)
@@ -991,8 +1191,9 @@ def test_system_probe_allows_null_launch_id_but_rejects_missing_startup_identity
             return raw_models
         return raw_settings
 
-    def run(argv: tuple[str, ...]) -> tuple[int, str]:
-        if argv[0] == "lsof":
+    def run(argv: tuple[str, ...], *, env: dict[str, str]) -> tuple[int, str]:
+        assert env == {"PATH": "/usr/bin:/bin:/usr/sbin", "LANG": "C", "LC_ALL": "C"}
+        if argv[0] == "/usr/sbin/lsof":
             return 0, "p444\n"
         if argv[-1] == "command=":
             return 0, " ".join(command) + "\n"
@@ -1095,7 +1296,7 @@ def test_launch_semantics_rejects_other_sensitive_flag_names_and_values(tmp_path
         )
 
 
-def test_warm_prefix_requires_a_nonbypass_storing_prime(tmp_path: Path) -> None:
+def test_warm_prefix_allows_a_pending_nonbypass_prime_when_the_next_request_hits(tmp_path: Path) -> None:
     contract = _contract(tmp_path, lane="warm-prefix")
     probe = _probe_for(contract, after_requests=9)
     session, _contract_value, _probe_value, output, _credential = _begin(tmp_path, contract=contract, probe=probe)
@@ -1108,7 +1309,10 @@ def test_warm_prefix_requires_a_nonbypass_storing_prime(tmp_path: Path) -> None:
         request_session_bank_bypass=False,
     )
 
-    with pytest.raises(ModelEvidenceFailure, match="model_cache_warm_invalid"):
-        session.complete([warmed], prime_record=_attempt(digest="a" * 64))
-
-    assert _failed_record(output)["failure_category"] == "model_cache_warm_invalid"
+    assert (
+        session.complete(
+            [warmed],
+            prime_record=_attempt(digest="a" * 64, request_session_bank_bypass=False),
+        ).status
+        == "passed"
+    )

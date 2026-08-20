@@ -9,12 +9,22 @@ import socket
 import stat
 import subprocess
 import sys
+from base64 import urlsafe_b64encode
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from shiftedx_harness_proxy.qualification_contract import BENCHMARK_REVISION
+import shiftedx_harness_proxy.qualification_runtime as runtime_module
+from shiftedx_harness_proxy.qualification_contract import (
+    BENCHMARK_REVISION,
+    CacheObservation,
+    ModelBoundaryRecord,
+    model_boundary_fingerprint,
+    write_model_boundary_attempt_ledger,
+)
+from shiftedx_harness_proxy.qualification_model_evidence import model_endpoint_contract_hashes
 from shiftedx_harness_proxy.qualification_runtime import Outcome, RuntimeLease, supervise_qualification_runtime
 
 
@@ -22,6 +32,152 @@ def _canonical_sha256(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def _private_file(path: Path, value: bytes) -> Path:
+    path.write_bytes(value)
+    path.chmod(0o600)
+    return path
+
+
+def _record_row(root: Path, path: Path) -> str:
+    digest = urlsafe_b64encode(hashlib.sha256(path.read_bytes()).digest()).decode("ascii").rstrip("=")
+    return f"{path.relative_to(root).as_posix()},sha256={digest},{path.stat().st_size}"
+
+
+def _mtplx_settings() -> dict[str, object]:
+    """Literal safe MTPLX 2.7.1 projection used by the fake read-only endpoint."""
+
+    return {
+        "ok": True,
+        "reasoning": "auto",
+        "enable_thinking": True,
+        "preserve_thinking": "auto",
+        "preserve_thinking_effective": True,
+        "reasoning_history_mode": "preserve",
+        "reasoning_parser": "qwen3",
+        "reasoning_effort": "medium",
+        "generation_mode": "mtp",
+        "depth": 3,
+        "depth_max": 8,
+        "backend_id": "qwen3",
+        "architecture_id": "qwen3",
+        "model_family": "qwen",
+        "support_level": "supported",
+        "model_controls": {"reasoning": "native", "model_ref": "/private/model"},
+        "reasoning_policy": {"enabled": True},
+        "kv_quant_policy": {"mode": "none"},
+        "tune_policy": {"enabled": False},
+        "context_window_policy": {"maximum": 32768},
+        "sampling_defaults": {"temperature": 0.0},
+        "temperature": 0.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "max_response_tokens": 1024,
+        "stream_interval": 1,
+        "draft_control": {"enabled": True},
+        "draft_temperature": 0.0,
+        "draft_top_p": 0.95,
+        "draft_top_k": 20,
+        "prefill_chunk_tokens": 2048,
+        "api_key_required": True,
+        "api_key_source": "file",
+        "tool_prompt_mode": "native",
+        "tool_contract_active": True,
+        "tool_contract_policy_version": "v1",
+        "chat_template_profile": "default",
+        "chat_template_hash": "a" * 64,
+        "metal_memory_caps": {"applied": False},
+        "ssd_session_cache": "off",
+        "ssd_session_cache_max_size": "100GB",
+        "ssd_session_cache_min_prefix_tokens": 512,
+        "paged_kv_quantization": "none",
+        "restart_required_settings": ["model"],
+        "ram_session_cache_policy": "minimal",
+        "ram_session_block_prefix_restore": False,
+        "ram_session_cache_max_entries": 1,
+        "ram_session_cache_max_size": "1G",
+        "ram_session_cache_per_session_max_size": "1G",
+    }
+
+
+def _model_manifest_fields(tmp_path: Path) -> dict[str, object]:
+    stage = tmp_path / "mtplx-stage"
+    stage.mkdir()
+    identity = _private_file(tmp_path / "mtplx-identity.json", b'{"identity":"safe"}\n')
+    inspect = _private_file(tmp_path / "mtplx-inspect.json", b'{"inspect":"safe"}\n')
+    distribution = tmp_path / "mtplx-site-packages"
+    distribution.mkdir()
+    dist_info = distribution / "mtplx-2.7.1.dist-info"
+    dist_info.mkdir()
+    metadata = dist_info / "METADATA"
+    metadata.write_text("Name: mtplx\nVersion: 2.7.1\n\n", encoding="utf-8")
+    module = distribution / "mtplx.py"
+    module.write_text("__version__ = '2.7.1'\n", encoding="utf-8")
+    record = dist_info / "RECORD"
+    record.write_text(
+        "\n".join(
+            (
+                _record_row(distribution, module),
+                _record_row(distribution, metadata),
+                "mtplx-2.7.1.dist-info/RECORD,,",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    runtime_executable = Path(sys.executable).resolve(strict=True)
+    command = (
+        str(runtime_executable),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "19999",
+        "--no-auth",
+        "--generation-mode",
+        "mtp",
+        "--depth",
+        "3",
+        "--temperature",
+        "0",
+    )
+    health = {
+        "ok": True,
+        "active_requests": 0,
+        "foreground_active": 0,
+        "requests_completed": 0,
+        "startup": {"pid": 444, "started_at": 1712345678.25, "launch_id": None},
+    }
+    health_hash, settings_hash = model_endpoint_contract_hashes(health, _mtplx_settings())
+    return {
+        "public_id": "private-model-id",
+        "upstream_url": "http://127.0.0.1:19999/v1",
+        "upstream_authenticated": True,
+        "stage_path": str(stage),
+        "stage_revision": "d" * 40,
+        "identity_ledger": str(identity),
+        "identity_ledger_sha256": hashlib.sha256(identity.read_bytes()).hexdigest(),
+        "inspect_artifact": str(inspect),
+        "inspect_artifact_sha256": hashlib.sha256(inspect.read_bytes()).hexdigest(),
+        "runtime_executable": str(runtime_executable),
+        "runtime_executable_sha256": hashlib.sha256(runtime_executable.read_bytes()).hexdigest(),
+        "mtplx_distribution_root": str(distribution),
+        "mtplx_record": str(record),
+        "mtplx_version": "2.7.1",
+        "launch_command_sha256": _canonical_sha256(list(command)),
+        "required_launch_flags": [
+            "--host=127.0.0.1",
+            "--port=19999",
+            "--no-auth",
+            "--generation-mode=mtp",
+            "--depth=3",
+            "--temperature=0",
+        ],
+        "health_contract_sha256": health_hash,
+        "settings_contract_sha256": settings_hash,
+    }
 
 
 def _manifest(tmp_path: Path) -> Path:
@@ -51,11 +207,7 @@ def _manifest(tmp_path: Path) -> Path:
                 "uid": 10001,
                 "gid": 10001,
             },
-            "model": {
-                "public_id": "private-model-id",
-                "upstream_url": "http://private-model.invalid/v1",
-                "upstream_authenticated": True,
-            },
+            "model": _model_manifest_fields(tmp_path),
             "benchmark": {
                 "revision": benchmark["revision"],
                 "tree": benchmark["tree"],
@@ -71,7 +223,6 @@ def _manifest(tmp_path: Path) -> Path:
                 "cache_lane": "cold",
                 "pair_index": 1,
                 "treatment_order": ["direct", "proxy"],
-                "cache_proof_sha256": "d" * 64,
             },
             "observer": {
                 "host": "127.0.0.1",
@@ -239,6 +390,11 @@ class _FakeRuntimeRunner:
         self.failure = failure
         self.drift = drift
         self.container_running = True
+        self.model_contract = None
+        self.model_requests_completed = 0
+
+    def prepare_model_evidence_contract(self, contract) -> None:
+        self.model_contract = contract
 
     def _labels(self, argv: tuple[str, ...]) -> dict[str, str]:
         labels: dict[str, str] = {}
@@ -258,6 +414,36 @@ class _FakeRuntimeRunner:
     ) -> SimpleNamespace:
         del timeout
         self.calls.append(("run", argv, env))
+        if argv[0] == "/usr/sbin/lsof":
+            return SimpleNamespace(returncode=0, stdout="p444\n", stderr="")
+        if argv[0] == "/bin/ps":
+            assert self.model_contract is not None
+            if argv[-1] == "command=":
+                command = " ".join(
+                    (
+                        str(self.model_contract.runtime_executable),
+                        "--host",
+                        "127.0.0.1",
+                        "--port",
+                        "19999",
+                        "--no-auth",
+                        "--generation-mode",
+                        "mtp",
+                        "--depth",
+                        "3",
+                        "--temperature",
+                        "0",
+                    )
+                )
+                return SimpleNamespace(returncode=0, stdout=command + "\n", stderr="")
+            if argv[-1] == "comm=":
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=str(self.model_contract.runtime_executable) + "\n",
+                    stderr="",
+                )
+            if argv[-1] == "lstart=":
+                return SimpleNamespace(returncode=0, stdout="12345\n", stderr="")
         if argv[:4] == ("git", "-C", argv[2], "rev-parse"):
             if argv[-1] == "HEAD":
                 target = "e" * 40 if self.failure == "benchmark_head" else "335e6694e4aec13e9370af8a993d8c8f14d7ffb5"
@@ -352,9 +538,7 @@ class _FakeRuntimeRunner:
             if self.drift == "resources":
                 document["HostConfig"]["ReadonlyRootfs"] = False
             elif self.drift == "bind":
-                document["HostConfig"]["PortBindings"] = {
-                    "8090/tcp": [{"HostIp": "0.0." + "0.0", "HostPort": "19090"}]
-                }
+                document["HostConfig"]["PortBindings"] = {"8090/tcp": [{"HostIp": "0.0." + "0.0", "HostPort": "19090"}]}
             elif self.drift == "settings":
                 document["Config"]["Env"] = ["DEPLOYMENT_PROFILE=development"]
             elif self.drift == "image":
@@ -431,6 +615,24 @@ class _FakeRuntimeRunner:
     ) -> tuple[int, dict[str, object] | None]:
         del headers, timeout
         self.calls.append(("http_json", (url,), None))
+        if url.startswith("http://127.0.0.1:19999/"):
+            assert self.model_contract is not None
+            if url.endswith("/health"):
+                return 200, {
+                    "ok": True,
+                    "active_requests": 0,
+                    "foreground_active": 0,
+                    "requests_completed": self.model_requests_completed,
+                    "startup": {"pid": 444, "started_at": 1712345678.25, "launch_id": None},
+                }
+            if url.endswith("/v1/models"):
+                return 200, {
+                    "object": "list",
+                    "data": [{"id": self.model_contract.public_model_id, "object": "model"}],
+                }
+            if url.endswith("/v1/mtplx/settings"):
+                return 200, _mtplx_settings()
+            raise AssertionError(url)
         if self.failure == "observer_ready":
             return 200, {"status": "live", "instance_sha256": "unrelated-ready-process"}
         observer_environment = next(call[2] for call in self.calls if call[0] == "spawn")
@@ -604,11 +806,97 @@ def _write_complete_ledger(lease: RuntimeLease) -> int:
         encoding="utf-8",
     )
     lease.output_ledger.chmod(0o600)
+    if lease.direct_model_attempt_ledger is not None:
+        lease.direct_model_attempt_ledger.write_text("", encoding="utf-8")
+        lease.direct_model_attempt_ledger.chmod(0o600)
     return 0
+
+
+def _write_scored_output(lease: RuntimeLease) -> None:
+    lease.output_ledger.write_text(
+        "".join(json.dumps({"record": index}, separators=(",", ":")) + "\n" for index in range(lease.scenario_count)),
+        encoding="utf-8",
+    )
+    lease.output_ledger.chmod(0o600)
+
+
+def _model_attempt(
+    sequence: int,
+    cache: CacheObservation | None,
+    *,
+    status_code: int | None = 200,
+) -> ModelBoundaryRecord:
+    fingerprint = model_boundary_fingerprint(
+        {"model": "private-model-id", "messages": [{"role": "user", "content": "private"}]}
+    )
+    return ModelBoundaryRecord(sequence, fingerprint.digest, fingerprint.fields, status_code, cache)
+
+
+def _cold_cache() -> CacheObservation:
+    return CacheObservation(
+        prompt_tokens=10,
+        cached_tokens=0,
+        new_prefill_tokens=10,
+        cache_source="none",
+        ssd_cache_hit=False,
+        ssd_cached_tokens=0,
+        session_cache_hit=False,
+        request_session_bank_bypass=True,
+        postcommit_stored=False,
+    )
+
+
+def _warm_prime_cache() -> CacheObservation:
+    return CacheObservation(
+        prompt_tokens=10,
+        cached_tokens=0,
+        new_prefill_tokens=10,
+        cache_source="none",
+        ssd_cache_hit=False,
+        ssd_cached_tokens=0,
+        session_cache_hit=False,
+        request_session_bank_bypass=False,
+        postcommit_stored=False,
+    )
+
+
+def _warm_hit_cache() -> CacheObservation:
+    return CacheObservation(
+        prompt_tokens=10,
+        cached_tokens=5,
+        new_prefill_tokens=5,
+        cache_source="ram",
+        ssd_cache_hit=False,
+        ssd_cached_tokens=0,
+        session_cache_hit=True,
+        request_session_bank_bypass=False,
+        postcommit_stored=True,
+    )
 
 
 def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_production_model_probe_uses_c1_hardened_transport_not_runtime_urlopen(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class Probe:
+        def snapshot(self, **kwargs):
+            calls.append(kwargs)
+            return "safe-snapshot"
+
+    monkeypatch.setattr(runtime_module, "SystemModelEvidenceProbe", Probe)
+    contract = object()
+    result = runtime_module._RuntimeModelEvidenceProbe(runtime_module.SubprocessRuntimeCommandRunner()).snapshot(
+        host="127.0.0.1",
+        port=19999,
+        api_key=None,
+        contract=contract,
+    )
+
+    assert result == "safe-snapshot"
+    assert calls == [{"host": "127.0.0.1", "port": 19999, "api_key": None, "contract": contract}]
 
 
 def test_post_cleanup_outcome_is_exact_hash_only_and_binds_complete_preflight_ledger(tmp_path) -> None:
@@ -634,6 +922,7 @@ def test_post_cleanup_outcome_is_exact_hash_only_and_binds_complete_preflight_le
         "failure_category",
         "run_manifest_sha256",
         "attestation_sha256",
+        "model_evidence_sha256",
         "output_ledger_sha256",
         "output_record_count",
     }
@@ -643,6 +932,7 @@ def test_post_cleanup_outcome_is_exact_hash_only_and_binds_complete_preflight_le
     assert record["failure_category"] is None
     assert record["run_manifest_sha256"] == _sha256_file(manifest)
     assert record["attestation_sha256"] == _sha256_file(private_run_dir / "preflight-runtime-attestation.json")
+    assert record["model_evidence_sha256"] == _sha256_file(private_run_dir / "preflight-model-cache-evidence.json")
     assert record["output_ledger_sha256"] == _sha256_file(private_run_dir / "preflight.jsonl")
     assert record["output_record_count"] == 5
     assert stat.S_IMODE(outcome.outcome_path.stat().st_mode) == 0o600
@@ -682,6 +972,7 @@ def test_scoring_gate_rejects_failed_incomplete_or_hash_drifted_preflight_eviden
     manifest = _manifest(tmp_path)
     private_run_dir = _private_run(tmp_path)
     if preflight_result == "failed":
+
         def action(_lease) -> int:
             return 9
     elif preflight_result == "incomplete":
@@ -735,6 +1026,9 @@ def test_scored_treatment_needs_every_manifest_scenario_before_its_outcome_can_p
     def incomplete_action(lease: RuntimeLease) -> int:
         lease.output_ledger.write_text('{"record":0}\n', encoding="utf-8")
         lease.output_ledger.chmod(0o600)
+        assert lease.direct_model_attempt_ledger is not None
+        lease.direct_model_attempt_ledger.write_text("", encoding="utf-8")
+        lease.direct_model_attempt_ledger.chmod(0o600)
         return 0
 
     direct = supervise_qualification_runtime(
@@ -751,6 +1045,190 @@ def test_scored_treatment_needs_every_manifest_scenario_before_its_outcome_can_p
     outcome = json.loads(direct.outcome_path.read_text(encoding="utf-8"))
     assert outcome["status"] == "failed"
     assert outcome["output_record_count"] == 1
+
+
+def test_model_evidence_begin_failure_blocks_action_before_proxy_setup(tmp_path) -> None:
+    manifest = _manifest(tmp_path)
+    document = _manifest_document(manifest)
+    runtime = document["qualification_runtime"]
+    assert isinstance(runtime, dict)
+    model = runtime["model"]
+    assert isinstance(model, dict)
+    model["identity_ledger_sha256"] = "0" * 64
+    _store_manifest(manifest, document)
+    private_run_dir = _private_run(tmp_path)
+    runner = _FakeRuntimeRunner()
+
+    outcome = supervise_qualification_runtime(
+        manifest=manifest,
+        stage="preflight",
+        private_run_dir=private_run_dir,
+        action=lambda _lease: pytest.fail("model evidence must begin before Docker or action"),
+        command_runner=runner,
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.failure_category == "model_contract_invalid"
+    assert _docker_commands(runner) == []
+    assert not (private_run_dir / "preflight-model-cache-evidence.json").exists()
+    assert outcome.outcome_path is not None
+    record = json.loads(outcome.outcome_path.read_text(encoding="utf-8"))
+    assert record["model_evidence_sha256"] is None
+
+
+def test_cold_direct_stage_adapts_actual_attempt_ledger_into_passed_model_evidence(tmp_path) -> None:
+    manifest = _manifest(tmp_path)
+    private_run_dir = _private_run(tmp_path)
+    preflight = supervise_qualification_runtime(
+        manifest=manifest,
+        stage="preflight",
+        private_run_dir=private_run_dir,
+        action=_write_complete_ledger,
+        command_runner=_FakeRuntimeRunner(),
+    )
+    assert preflight.status == "passed"
+    runner = _FakeRuntimeRunner()
+
+    def action(lease: RuntimeLease) -> int:
+        _write_scored_output(lease)
+        assert lease.direct_model_attempt_ledger is not None
+        write_model_boundary_attempt_ledger(lease.direct_model_attempt_ledger, [_model_attempt(1, _cold_cache())])
+        runner.model_requests_completed += 1
+        return 0
+
+    direct = supervise_qualification_runtime(
+        manifest=manifest,
+        stage="score-direct",
+        private_run_dir=private_run_dir,
+        action=action,
+        command_runner=runner,
+    )
+
+    assert direct.status == "passed"
+    evidence = json.loads((private_run_dir / "scored-direct-model-cache-evidence.json").read_text())
+    assert evidence["status"] == "passed"
+    assert evidence["request_window"]["expected"] == 1
+    assert evidence["first_attempt"]["successful_count"] == 1
+
+
+def test_warm_direct_stage_requires_and_binds_one_prime_before_its_first_hit(tmp_path) -> None:
+    manifest = _manifest(tmp_path)
+    document = _manifest_document(manifest)
+    runtime = document["qualification_runtime"]
+    assert isinstance(runtime, dict)
+    trial = runtime["trial"]
+    assert isinstance(trial, dict)
+    trial["cache_lane"] = "warm-prefix"
+    _store_manifest(manifest, document)
+    private_run_dir = _private_run(tmp_path)
+    preflight = supervise_qualification_runtime(
+        manifest=manifest,
+        stage="preflight",
+        private_run_dir=private_run_dir,
+        action=_write_complete_ledger,
+        command_runner=_FakeRuntimeRunner(),
+    )
+    assert preflight.status == "passed"
+    runner = _FakeRuntimeRunner()
+
+    def action(lease: RuntimeLease) -> int:
+        _write_scored_output(lease)
+        assert lease.direct_model_attempt_ledger is not None
+        assert lease.prime_model_attempt_ledger is not None
+        write_model_boundary_attempt_ledger(lease.prime_model_attempt_ledger, [_model_attempt(1, _warm_prime_cache())])
+        write_model_boundary_attempt_ledger(lease.direct_model_attempt_ledger, [_model_attempt(1, _warm_hit_cache())])
+        runner.model_requests_completed += 2
+        return 0
+
+    direct = supervise_qualification_runtime(
+        manifest=manifest,
+        stage="score-direct",
+        private_run_dir=private_run_dir,
+        action=action,
+        command_runner=runner,
+    )
+
+    assert direct.status == "passed"
+    evidence = json.loads((private_run_dir / "scored-direct-model-cache-evidence.json").read_text())
+    assert evidence["prime"]["count"] == 1
+    assert evidence["request_window"]["expected"] == 2
+
+
+def test_successful_model_attempt_without_cache_evidence_blocks_outcome(tmp_path) -> None:
+    manifest = _manifest(tmp_path)
+    private_run_dir = _private_run(tmp_path)
+    preflight = supervise_qualification_runtime(
+        manifest=manifest,
+        stage="preflight",
+        private_run_dir=private_run_dir,
+        action=_write_complete_ledger,
+        command_runner=_FakeRuntimeRunner(),
+    )
+    assert preflight.status == "passed"
+    runner = _FakeRuntimeRunner()
+
+    def action(lease: RuntimeLease) -> int:
+        _write_scored_output(lease)
+        assert lease.direct_model_attempt_ledger is not None
+        write_model_boundary_attempt_ledger(lease.direct_model_attempt_ledger, [_model_attempt(1, None)])
+        return 0
+
+    direct = supervise_qualification_runtime(
+        manifest=manifest,
+        stage="score-direct",
+        private_run_dir=private_run_dir,
+        action=action,
+        command_runner=runner,
+    )
+
+    assert direct.status == "failed"
+    assert direct.failure_category == "model_attempt_invalid"
+    evidence = json.loads((private_run_dir / "scored-direct-model-cache-evidence.json").read_text())
+    assert evidence["status"] == "failed"
+
+
+def test_proxy_stage_adapts_only_its_fresh_observer_attempts(tmp_path) -> None:
+    manifest = _manifest(tmp_path)
+    private_run_dir = _private_run(tmp_path)
+    preflight = supervise_qualification_runtime(
+        manifest=manifest,
+        stage="preflight",
+        private_run_dir=private_run_dir,
+        action=_write_complete_ledger,
+        command_runner=_FakeRuntimeRunner(),
+    )
+    assert preflight.status == "passed"
+    direct = supervise_qualification_runtime(
+        manifest=manifest,
+        stage="score-direct",
+        private_run_dir=private_run_dir,
+        action=_write_complete_ledger,
+        command_runner=_FakeRuntimeRunner(),
+    )
+    assert direct.status == "passed"
+    runner = _FakeRuntimeRunner()
+
+    def action(lease: RuntimeLease) -> int:
+        _write_scored_output(lease)
+        assert lease.observer_ledger is not None
+        record = _model_attempt(1, _cold_cache()).to_dict()
+        lease.observer_ledger.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+        lease.observer_ledger.chmod(0o600)
+        runner.model_requests_completed += 1
+        return 0
+
+    proxy = supervise_qualification_runtime(
+        manifest=manifest,
+        stage="score-proxy",
+        private_run_dir=private_run_dir,
+        action=action,
+        command_runner=runner,
+    )
+
+    assert proxy.status == "passed"
+    evidence = json.loads((private_run_dir / "scored-proxy-model-cache-evidence.json").read_text())
+    assert evidence["status"] == "passed"
+    assert evidence["request_window"]["successful_measured"] == 1
 
 
 def test_score_proxy_requires_a_completed_direct_treatment_before_resources(tmp_path) -> None:
@@ -909,7 +1387,7 @@ def test_duplicate_json_manifest_keys_are_rejected_before_runtime_side_effects(l
     if location == "root":
         encoded = json.dumps(runtime, sort_keys=True, separators=(",", ":"))
         manifest.write_text(
-            '{"qualification_runtime":' + encoded + ',"qualification_runtime":' + encoded + '}',
+            '{"qualification_runtime":' + encoded + ',"qualification_runtime":' + encoded + "}",
             encoding="utf-8",
         )
     else:
@@ -1392,17 +1870,9 @@ def test_interrupted_detached_resources_are_removed_by_predeclared_owned_names(
     )
 
     assert outcome.status == "interrupted"
-    detached = [
-        command
-        for command in _docker_commands(runner)
-        if command[:3] == ("docker", "run", "--detach")
-    ]
+    detached = [command for command in _docker_commands(runner) if command[:3] == ("docker", "run", "--detach")]
     assert detached
-    resource = next(
-        command
-        for command in detached
-        if name_fragment in command[command.index("--name") + 1]
-    )
+    resource = next(command for command in detached if name_fragment in command[command.index("--name") + 1])
     name = resource[resource.index("--name") + 1]
     assert name_fragment in name
     assert f"io.shiftedx.qualification.manifest={manifest_sha256}" in resource
@@ -1637,6 +2107,23 @@ def _lease(stage: str) -> RuntimeLease:
         proxy_metrics_url="http://127.0.0.1:19090/metrics" if stage != "score-direct" else None,
         proxy_api_key_file=Path("/private/qualification-policy-key") if stage != "score-direct" else None,
         observer_ledger=Path("/private/observer.jsonl") if stage != "score-direct" else None,
+        direct_model_attempt_ledger=(
+            Path("/private/preflight-direct-model-boundary.jsonl")
+            if stage == "preflight"
+            else Path("/private/scored-direct-model-boundary.jsonl")
+            if stage == "score-direct"
+            else None
+        ),
+        prime_model_attempt_ledger=(
+            Path("/private/scored-direct-prime-model-boundary.jsonl")
+            if stage == "score-direct"
+            else Path("/private/scored-proxy-prime-model-boundary.jsonl")
+            if stage == "score-proxy"
+            else None
+        ),
+        model_evidence_path=Path(f"/private/{stage}-model-cache-evidence.json"),
+        model_identity_sha256="e" * 64,
+        model_contract_sha256="f" * 64,
         preflight_ledger=Path("/private/preflight.jsonl"),
         output_ledger=Path(f"/private/{stage}.jsonl"),
         attestation_path=Path("/private/runtime-attestation.json"),
@@ -1655,16 +2142,21 @@ def test_thin_cli_derives_fixed_child_argv_without_secret_values(stage) -> None:
     assert "--candidate-image-digest" in argv
     assert "--run-manifest-sha256" in argv
     assert argv[argv.index("--run-id") + 1] == "qualified-run"
+    assert argv[argv.index("--cache-mode") + 1] == "warm-prefix"
     assert "private-secret-value" not in serialized
     assert "--model" in argv
     if stage == "preflight":
         assert "--paired-preflight" in argv
         assert "--direct-base-url" in argv
         assert "--proxy-base-url" in argv
+        assert argv[argv.index("--direct-model-attempt-ledger") + 1] == (
+            "/private/preflight-direct-model-boundary.jsonl"
+        )
         assert argv[argv.index("--variant") + 1] == "warm-prefix-pair2-preflight-expanded"
     elif stage == "score-direct":
         assert "--proxy-policy" not in argv
         assert "--base-url" in argv
+        assert argv[argv.index("--direct-model-attempt-ledger") + 1] == ("/private/scored-direct-model-boundary.jsonl")
         assert argv[argv.index("--variant") + 1] == "warm-prefix-pair2-direct-expanded"
         assert argv[argv.index("--preflight-runtime-outcome") + 1] == "/private/preflight-runtime-outcome.json"
     else:
@@ -1677,21 +2169,46 @@ def test_thin_cli_derives_fixed_child_argv_without_secret_values(stage) -> None:
 
 def test_thin_cli_runs_child_with_only_pinned_benchmark_source_environment(monkeypatch) -> None:
     cli = _load_runtime_cli()
-    captured: dict[str, object] = {}
+    captured: list[dict[str, object]] = []
 
     def fake_run(argv, *, check, env):
-        captured.update({"argv": argv, "check": check, "env": env})
+        captured.append({"argv": argv, "check": check, "env": env})
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
 
     assert cli.invoke_paired_runner(_lease("score-direct")) == 0
-    assert captured["check"] is False
-    assert captured["env"] == {
+    assert len(captured) == 2
+    prime = captured[0]["argv"]
+    assert "--cache-prime-only" in prime
+    assert prime[prime.index("--cache-prime-arm") + 1] == "direct"
+    assert prime[prime.index("--model-attempt-ledger") + 1] == ("/private/scored-direct-prime-model-boundary.jsonl")
+    assert prime[prime.index("--base-url") + 1] == "https://private-model.invalid/v1"
+    scored = captured[1]
+    assert scored["check"] is False
+    assert scored["env"] == {
         "PYTHONPATH": "/private/benchmark/src",
         "PYTHONNOUSERSITE": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
     }
+
+
+def test_thin_cli_cold_lane_uses_bypass_and_never_primes(monkeypatch) -> None:
+    cli = _load_runtime_cli()
+    captured: list[list[str]] = []
+
+    def fake_run(argv, *, check, env):
+        del check, env
+        captured.append(argv)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    lease = replace(_lease("score-direct"), cache_lane="cold", prime_model_attempt_ledger=None)
+
+    assert cli.invoke_paired_runner(lease) == 0
+    assert len(captured) == 1
+    assert captured[0][captured[0].index("--cache-mode") + 1] == "bypass"
+    assert "--cache-prime-only" not in captured[0]
 
 
 def test_thin_cli_only_passes_manifest_stage_and_private_directory_to_supervisor(tmp_path) -> None:
@@ -1717,6 +2234,50 @@ def test_thin_cli_only_passes_manifest_stage_and_private_directory_to_supervisor
     assert result == 0
     assert set(calls) == {"manifest", "stage", "private_run_dir", "action"}
     assert calls["action"] is cli.invoke_paired_runner
+
+
+def test_benchmarking_manifest_example_is_duplicate_rejecting_json_with_c1_model_contract() -> None:
+    document = (Path(__file__).parents[1] / "docs" / "benchmarking.md").read_text(encoding="utf-8")
+    manifest_section = document.split("### Private manifest v1", 1)[1]
+    encoded = manifest_section.split("```json\n", 1)[1].split("\n```", 1)[0]
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate key")
+            result[key] = value
+        return result
+
+    parsed = json.loads(encoded, object_pairs_hook=unique_object)
+    runtime = parsed["qualification_runtime"]
+    assert isinstance(runtime, dict)
+    model = runtime["model"]
+    trial = runtime["trial"]
+    assert isinstance(model, dict)
+    assert isinstance(trial, dict)
+    assert set(model) == {
+        "public_id",
+        "upstream_url",
+        "upstream_authenticated",
+        "stage_path",
+        "stage_revision",
+        "identity_ledger",
+        "identity_ledger_sha256",
+        "inspect_artifact",
+        "inspect_artifact_sha256",
+        "runtime_executable",
+        "runtime_executable_sha256",
+        "mtplx_distribution_root",
+        "mtplx_record",
+        "mtplx_version",
+        "launch_command_sha256",
+        "required_launch_flags",
+        "health_contract_sha256",
+        "settings_contract_sha256",
+    }
+    assert set(trial) == {"run_id", "cache_lane", "pair_index", "treatment_order"}
+    assert runtime["benchmark"]["scenario_count"] > 0
 
 
 def test_private_manifest_documentation_is_valid_json_with_positive_scenario_count() -> None:

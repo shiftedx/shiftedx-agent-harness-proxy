@@ -22,7 +22,7 @@ import tempfile
 import time
 import tomllib
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -35,7 +35,22 @@ from pydantic import SecretStr
 
 from .config import Settings
 from .core import HARNESS_PROFILE
-from .qualification_contract import BENCHMARK_REVISION
+from .qualification_contract import (
+    BENCHMARK_REVISION,
+    ModelBoundaryRecord,
+    PreflightFailure,
+    load_model_evidence,
+    read_model_boundary_observer_records,
+)
+from .qualification_model_evidence import (
+    ModelEvidenceContract,
+    ModelEvidenceSession,
+    SafeAttemptRecord,
+    SystemModelEvidenceProbe,
+)
+from .qualification_model_evidence import (
+    ModelEvidenceFailure as ModelEvidenceSessionFailure,
+)
 
 RuntimeStage = Literal["preflight", "score-direct", "score-proxy"]
 AttestationStage = Literal["preflight", "scored_proxy"]
@@ -203,6 +218,52 @@ class SubprocessRuntimeCommandRunner:
             return (status if isinstance(status, int) else 0), None
 
 
+class _RuntimeModelEvidenceProbe:
+    """Adapt the supervisor's narrow runtime seam to C1's read-only probe seam."""
+
+    def __init__(self, runner: RuntimeCommandRunner) -> None:
+        self._runner = runner
+
+    def snapshot(
+        self,
+        *,
+        host: str,
+        port: int,
+        api_key: str | None,
+        contract: ModelEvidenceContract,
+    ) -> Any:
+        # Keep the production probe on C1's hardened transport: it disables
+        # ambient proxies, rejects redirects, and bounds response bytes. The
+        # adapter below exists solely for the injected fake runtime seam.
+        if isinstance(self._runner, SubprocessRuntimeCommandRunner):
+            return SystemModelEvidenceProbe().snapshot(
+                host=host,
+                port=port,
+                api_key=api_key,
+                contract=contract,
+            )
+        prepare = getattr(self._runner, "prepare_model_evidence_contract", None)
+        if callable(prepare):
+            prepare(contract)
+
+        def http_get(url: str, headers: Mapping[str, str]) -> Mapping[str, Any]:
+            status, document = self._runner.http_json(url, headers=dict(headers), timeout=5.0)
+            if status != 200 or document is None:
+                raise ModelEvidenceSessionFailure("model_probe_failed")
+            return document
+
+        def command(argv: tuple[str, ...], *, env: Mapping[str, str]) -> tuple[int, str]:
+            result = self._runner.run(argv, env=dict(env), timeout=5.0)
+            return result.returncode, result.stdout
+
+        return SystemModelEvidenceProbe(http_get=http_get, command_runner=command).snapshot(
+            host=host,
+            port=port,
+            api_key=api_key,
+            contract=contract,
+        )
+
+
 @dataclass(frozen=True)
 class RuntimeLease:
     """The runner-facing qualification lease; it intentionally hides Docker/process details."""
@@ -226,6 +287,11 @@ class RuntimeLease:
     proxy_metrics_url: str | None
     proxy_api_key_file: Path | None
     observer_ledger: Path | None
+    direct_model_attempt_ledger: Path | None
+    prime_model_attempt_ledger: Path | None
+    model_evidence_path: Path
+    model_identity_sha256: str
+    model_contract_sha256: str
     preflight_ledger: Path
     output_ledger: Path
     attestation_path: Path | None
@@ -256,6 +322,21 @@ class _ModelSpec:
     public_id: str
     upstream_url: str
     upstream_authenticated: bool
+    stage_path: Path
+    stage_revision: str
+    identity_ledger: Path
+    identity_ledger_sha256: str
+    inspect_artifact: Path
+    inspect_artifact_sha256: str
+    runtime_executable: Path
+    runtime_executable_sha256: str
+    mtplx_distribution_root: Path
+    mtplx_record: Path
+    mtplx_version: str
+    launch_command_sha256: str
+    required_launch_flags: tuple[str, ...]
+    health_contract_sha256: str
+    settings_contract_sha256: str
 
 
 @dataclass(frozen=True)
@@ -302,7 +383,6 @@ class _TrialSpec:
     cache_lane: Literal["cold", "warm-prefix"]
     pair_index: int
     treatment_order: tuple[Literal["direct", "proxy"], Literal["direct", "proxy"]]
-    cache_proof_sha256: str
 
 
 @dataclass(frozen=True)
@@ -350,6 +430,7 @@ def supervise_qualification_runtime(
     proxy_attempted = False
     spec: _RuntimeSpec | None = None
     instance: str | None = None
+    model_session: ModelEvidenceSession | None = None
 
     try:
         _validate_stage(stage)
@@ -359,13 +440,24 @@ def supervise_qualification_runtime(
             raise QualificationRuntimeFailure("runtime_outcome_exists")
         outcome_path = candidate_outcome_path
         spec = _load_runtime_spec(manifest, runner)
-        _validate_stage_evidence_absent(private_run_dir, stage)
+        _validate_stage_evidence_absent(private_run_dir, stage, spec)
         if stage == "score-direct":
             attestation_path = _validate_existing_preflight_attestation(private_run_dir, spec)
             _validate_prior_outcome(private_run_dir, "preflight", spec, attestation_path)
             _validate_credentials(spec.credentials, upstream_authenticated=spec.model.upstream_authenticated)
-            lease = _direct_lease(spec, stage, private_run_dir, attestation_path)
+            model_session = _begin_model_evidence(runner, spec, stage, private_run_dir)
+            if _attestation_model_identity(attestation_path) != model_session.model_identity_sha256:
+                raise QualificationRuntimeFailure("runtime_model_identity_mismatch")
+            lease = _direct_lease(spec, stage, private_run_dir, attestation_path, model_session)
             action_exit_code = _invoke_action(action, lease)
+            try:
+                _complete_model_evidence(model_session, spec, stage, private_run_dir)
+            except QualificationRuntimeFailure:
+                # A nonzero child is already a categorical failed treatment.
+                # Still retain C1's failed evidence, but do not mask the child
+                # result with a consequent missing/incomplete attempt ledger.
+                if action_exit_code == 0:
+                    raise
             if action_exit_code == 0:
                 _require_complete_output(lease.output_ledger, stage, spec)
                 status = "passed"
@@ -377,6 +469,12 @@ def supervise_qualification_runtime(
                 _validate_prior_outcome(private_run_dir, "preflight", spec, preflight_attestation)
                 _validate_prior_outcome(private_run_dir, "score-direct", spec, preflight_attestation)
             _validate_credentials(spec.credentials, upstream_authenticated=spec.model.upstream_authenticated)
+            model_session = _begin_model_evidence(runner, spec, stage, private_run_dir)
+            if (
+                stage == "score-proxy"
+                and _attestation_model_identity(preflight_attestation) != model_session.model_identity_sha256
+            ):
+                raise QualificationRuntimeFailure("runtime_model_identity_mismatch")
             _assert_port_available(spec.proxy.host, spec.proxy.port, "proxy_port_unavailable")
             _assert_port_available(spec.observer.host, spec.observer.port, "observer_port_unavailable")
             instance = _instance_token(spec.manifest_sha256, stage)
@@ -411,11 +509,18 @@ def supervise_qualification_runtime(
             _verify_proxy_auth_and_metrics(runner, container_id, spec)
             _ensure_live(observer, runner, container_id, spec, image_id, volume_name, instance, stage)
             attestation_path = _attestation_path(private_run_dir, stage)
-            _write_attestation(attestation_path, spec, stage, instance, image_id)
-            lease = _proxy_lease(spec, stage, private_run_dir, observer_ledger, attestation_path)
+            _write_attestation(attestation_path, spec, stage, instance, image_id, model_session)
+            lease = _proxy_lease(spec, stage, private_run_dir, observer_ledger, attestation_path, model_session)
             _validate_credentials(spec.credentials, upstream_authenticated=spec.model.upstream_authenticated)
             action_exit_code = _invoke_action(action, lease)
             _ensure_live(observer, runner, container_id, spec, image_id, volume_name, instance, stage)
+            try:
+                _complete_model_evidence(model_session, spec, stage, private_run_dir)
+            except QualificationRuntimeFailure:
+                # See the direct treatment branch: preserve the failed model
+                # artifact without replacing a known child failure category.
+                if action_exit_code == 0:
+                    raise
             if action_exit_code == 0:
                 _require_complete_output(lease.output_ledger, stage, spec)
                 status = "passed"
@@ -450,11 +555,18 @@ def supervise_qualification_runtime(
             failure_category = "runtime_cleanup_failed"
         completed_outcome_path = outcome_path
         if outcome_path is not None:
-            attestation_sha256, output_ledger_sha256, output_record_count, evidence_error = _outcome_evidence(
+            (
+                attestation_sha256,
+                model_evidence_sha256,
+                output_ledger_sha256,
+                output_record_count,
+                evidence_error,
+            ) = _outcome_evidence(
                 attestation_path,
+                _model_evidence_path(private_run_dir, stage),
                 _scored_ledger_path(private_run_dir, stage),
             )
-            if evidence_error is not None:
+            if evidence_error is not None and status == "passed":
                 status = "failed"
                 failure_category = evidence_error
             try:
@@ -466,6 +578,7 @@ def supervise_qualification_runtime(
                     failure_category,
                     run_manifest_sha256=spec.manifest_sha256 if spec is not None else None,
                     attestation_sha256=attestation_sha256,
+                    model_evidence_sha256=model_evidence_sha256,
                     output_ledger_sha256=output_ledger_sha256,
                     output_record_count=output_record_count,
                 )
@@ -537,13 +650,66 @@ def _parse_image(value: Any) -> _ImageSpec:
 
 
 def _parse_model(value: Any) -> _ModelSpec:
-    model = _exact_object(value, {"public_id", "upstream_url", "upstream_authenticated"})
+    model = _exact_object(
+        value,
+        {
+            "public_id",
+            "upstream_url",
+            "upstream_authenticated",
+            "stage_path",
+            "stage_revision",
+            "identity_ledger",
+            "identity_ledger_sha256",
+            "inspect_artifact",
+            "inspect_artifact_sha256",
+            "runtime_executable",
+            "runtime_executable_sha256",
+            "mtplx_distribution_root",
+            "mtplx_record",
+            "mtplx_version",
+            "launch_command_sha256",
+            "required_launch_flags",
+            "health_contract_sha256",
+            "settings_contract_sha256",
+        },
+    )
     public_id = _required_text(model.get("public_id"))
     upstream_url = _safe_absolute_http_url(_required_text(model.get("upstream_url")))
+    upstream = urlsplit(upstream_url)
+    if upstream.scheme != "http" or upstream.hostname is None or upstream.port is None:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    _loopback_host(upstream.hostname)
     authenticated = model.get("upstream_authenticated")
     if not isinstance(authenticated, bool):
         raise QualificationRuntimeFailure("runtime_manifest_invalid")
-    return _ModelSpec(public_id, upstream_url, authenticated)
+    flags = model.get("required_launch_flags")
+    if (
+        not isinstance(flags, list)
+        or not flags
+        or any(not isinstance(flag, str) or not flag for flag in flags)
+        or len(set(flags)) != len(flags)
+    ):
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    return _ModelSpec(
+        public_id,
+        upstream_url,
+        authenticated,
+        _absolute_path(model.get("stage_path")),
+        _exact_string(model, "stage_revision", _SOURCE_COMMIT),
+        _absolute_path(model.get("identity_ledger")),
+        _exact_string(model, "identity_ledger_sha256", _SHA256),
+        _absolute_path(model.get("inspect_artifact")),
+        _exact_string(model, "inspect_artifact_sha256", _SHA256),
+        _absolute_path(model.get("runtime_executable")),
+        _exact_string(model, "runtime_executable_sha256", _SHA256),
+        _absolute_path(model.get("mtplx_distribution_root")),
+        _absolute_path(model.get("mtplx_record")),
+        _required_text(model.get("mtplx_version")),
+        _exact_string(model, "launch_command_sha256", _SHA256),
+        tuple(flags),
+        _exact_string(model, "health_contract_sha256", _SHA256),
+        _exact_string(model, "settings_contract_sha256", _SHA256),
+    )
 
 
 def _parse_benchmark(value: Any) -> _BenchmarkSpec:
@@ -587,7 +753,7 @@ def _parse_benchmark(value: Any) -> _BenchmarkSpec:
 
 
 def _parse_trial(value: Any) -> _TrialSpec:
-    trial = _exact_object(value, {"run_id", "cache_lane", "pair_index", "treatment_order", "cache_proof_sha256"})
+    trial = _exact_object(value, {"run_id", "cache_lane", "pair_index", "treatment_order"})
     run_id = _required_text(trial.get("run_id"))
     if _RUN_ID.fullmatch(run_id) is None:
         raise QualificationRuntimeFailure("runtime_manifest_invalid")
@@ -600,8 +766,7 @@ def _parse_trial(value: Any) -> _TrialSpec:
     treatment_order = trial.get("treatment_order")
     if treatment_order != ["direct", "proxy"]:
         raise QualificationRuntimeFailure("runtime_manifest_invalid")
-    cache_proof_sha256 = _exact_string(trial, "cache_proof_sha256", _SHA256)
-    return _TrialSpec(run_id, cache_lane, pair_index, ("direct", "proxy"), cache_proof_sha256)
+    return _TrialSpec(run_id, cache_lane, pair_index, ("direct", "proxy"))
 
 
 def _validate_benchmark_checkout(runner: RuntimeCommandRunner, benchmark: _BenchmarkSpec) -> None:
@@ -624,9 +789,7 @@ def _validate_benchmark_checkout(runner: RuntimeCommandRunner, benchmark: _Bench
         raise QualificationRuntimeFailure("runtime_benchmark_invalid")
     head = runner.run(("git", "-C", str(benchmark.checkout_path), "rev-parse", "HEAD"))
     tree = runner.run(("git", "-C", str(benchmark.checkout_path), "rev-parse", "HEAD^{tree}"))
-    clean = runner.run(
-        ("git", "-C", str(benchmark.checkout_path), "status", "--porcelain=v1", "--untracked-files=all")
-    )
+    clean = runner.run(("git", "-C", str(benchmark.checkout_path), "status", "--porcelain=v1", "--untracked-files=all"))
     if (
         head.returncode != 0
         or head.stdout.strip() != benchmark.revision
@@ -648,11 +811,7 @@ def _validate_benchmark_checkout(runner: RuntimeCommandRunner, benchmark: _Bench
     )
     document = _parse_command_json(probe.stdout, "runtime_benchmark_invalid")
     module = document.get("module")
-    if (
-        probe.returncode != 0
-        or not isinstance(module, str)
-        or not _is_path_beneath(Path(module), source)
-    ):
+    if probe.returncode != 0 or not isinstance(module, str) or not _is_path_beneath(Path(module), source):
         raise QualificationRuntimeFailure("runtime_benchmark_invalid")
 
 
@@ -1021,7 +1180,7 @@ def _initializer_script(upstream_authenticated: bool) -> str:
             "command -v python >/dev/null",
             "test -s /source/proxy_api_key",
             "test -s /source/trusted_policy_extension_api_keys",
-            *( ["test -s /source/upstream_api_key"] if upstream_authenticated else [] ),
+            *(["test -s /source/upstream_api_key"] if upstream_authenticated else []),
             comparisons,
             copy_lines,
             f"chmod 0400 {joined}",
@@ -1274,9 +1433,7 @@ def _wait_for_proxy(runner: RuntimeCommandRunner, proxy: _ProxySpec) -> None:
     raise QualificationRuntimeFailure("runtime_proxy_unready")
 
 
-def _verify_proxy_auth_and_metrics(
-    runner: RuntimeCommandRunner, container_id: str, spec: _RuntimeSpec
-) -> None:
+def _verify_proxy_auth_and_metrics(runner: RuntimeCommandRunner, container_id: str, spec: _RuntimeSpec) -> None:
     """Check effective non-secret settings and trusted metrics access inside the candidate."""
 
     setting_names = tuple(sorted(_SETTINGS_KEYS))
@@ -1401,6 +1558,7 @@ def _proxy_lease(
     private_run_dir: Path,
     observer_ledger: Path,
     attestation_path: Path,
+    model_session: ModelEvidenceSession,
 ) -> RuntimeLease:
     return RuntimeLease(
         stage=stage,
@@ -1422,6 +1580,11 @@ def _proxy_lease(
         proxy_metrics_url=f"http://{_url_host(spec.proxy.host)}:{spec.proxy.port}/metrics",
         proxy_api_key_file=spec.credentials.qualification_policy_api_key_file,
         observer_ledger=observer_ledger,
+        direct_model_attempt_ledger=_direct_attempt_ledger_path(private_run_dir, stage),
+        prime_model_attempt_ledger=_prime_attempt_ledger_path(private_run_dir, stage, spec.trial.cache_lane),
+        model_evidence_path=_model_evidence_path(private_run_dir, stage),
+        model_identity_sha256=model_session.model_identity_sha256,
+        model_contract_sha256=model_session.model_contract_sha256,
         preflight_ledger=private_run_dir / "preflight.jsonl",
         output_ledger=_scored_ledger_path(private_run_dir, stage),
         attestation_path=attestation_path,
@@ -1429,7 +1592,11 @@ def _proxy_lease(
 
 
 def _direct_lease(
-    spec: _RuntimeSpec, stage: RuntimeStage, private_run_dir: Path, attestation_path: Path
+    spec: _RuntimeSpec,
+    stage: RuntimeStage,
+    private_run_dir: Path,
+    attestation_path: Path,
+    model_session: ModelEvidenceSession,
 ) -> RuntimeLease:
     return RuntimeLease(
         stage=stage,
@@ -1451,15 +1618,160 @@ def _direct_lease(
         proxy_metrics_url=None,
         proxy_api_key_file=None,
         observer_ledger=None,
+        direct_model_attempt_ledger=_direct_attempt_ledger_path(private_run_dir, stage),
+        prime_model_attempt_ledger=_prime_attempt_ledger_path(private_run_dir, stage, spec.trial.cache_lane),
+        model_evidence_path=_model_evidence_path(private_run_dir, stage),
+        model_identity_sha256=model_session.model_identity_sha256,
+        model_contract_sha256=model_session.model_contract_sha256,
         preflight_ledger=private_run_dir / "preflight.jsonl",
         output_ledger=_scored_ledger_path(private_run_dir, stage),
         attestation_path=attestation_path,
     )
 
 
-def _write_attestation(
-    path: Path, spec: _RuntimeSpec, stage: RuntimeStage, instance: str, image_id: str
+def _model_evidence_contract(spec: _RuntimeSpec, stage: RuntimeStage) -> ModelEvidenceContract:
+    """Construct C1's private contract from the strict manifest without exposing it."""
+
+    parsed = urlsplit(spec.model.upstream_url)
+    host = parsed.hostname
+    port = parsed.port
+    if host is None or port is None:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    lane: Literal["preflight", "cold", "warm-prefix"] = "preflight" if stage == "preflight" else spec.trial.cache_lane
+    return ModelEvidenceContract(
+        public_model_id=spec.model.public_id,
+        stage_path=spec.model.stage_path,
+        stage_revision=spec.model.stage_revision,
+        identity_ledger=spec.model.identity_ledger,
+        identity_ledger_sha256=spec.model.identity_ledger_sha256,
+        inspect_artifact=spec.model.inspect_artifact,
+        inspect_artifact_sha256=spec.model.inspect_artifact_sha256,
+        runtime_executable=spec.model.runtime_executable,
+        runtime_executable_sha256=spec.model.runtime_executable_sha256,
+        mtplx_distribution_root=spec.model.mtplx_distribution_root,
+        mtplx_record=spec.model.mtplx_record,
+        mtplx_version=spec.model.mtplx_version,
+        launch_command_sha256=spec.model.launch_command_sha256,
+        required_launch_flags=spec.model.required_launch_flags,
+        host=host,
+        port=port,
+        health_contract_sha256=spec.model.health_contract_sha256,
+        settings_contract_sha256=spec.model.settings_contract_sha256,
+        cache_lane=lane,
+    )
+
+
+def _begin_model_evidence(
+    runner: RuntimeCommandRunner,
+    spec: _RuntimeSpec,
+    stage: RuntimeStage,
+    private_run_dir: Path,
+) -> ModelEvidenceSession:
+    try:
+        return ModelEvidenceSession.begin(
+            _model_evidence_contract(spec, stage),
+            stage=stage,
+            run_manifest_sha256=spec.manifest_sha256,
+            evidence_path=_model_evidence_path(private_run_dir, stage),
+            credential_file=spec.credentials.upstream_model_api_key_file,
+            probe=_RuntimeModelEvidenceProbe(runner),
+        )
+    except ModelEvidenceSessionFailure as error:
+        raise QualificationRuntimeFailure(error.category) from None
+
+
+def _adapt_model_attempt(record: ModelBoundaryRecord) -> SafeAttemptRecord:
+    if 200 <= (record.status_code or 0) <= 299:
+        if record.cache is None:
+            raise QualificationRuntimeFailure("runtime_model_attempt_invalid")
+        cache = record.cache
+        return SafeAttemptRecord(
+            request_digest=record.digest,
+            status="succeeded",
+            prompt_tokens=cache.prompt_tokens,
+            cached_tokens=cache.cached_tokens,
+            new_prefill_tokens=cache.new_prefill_tokens,
+            cache_source=cache.cache_source,
+            ssd_cache_hit=cache.ssd_cache_hit,
+            ssd_cached_tokens=cache.ssd_cached_tokens,
+            session_cache_hit=cache.session_cache_hit,
+            request_session_bank_bypass=cache.request_session_bank_bypass,
+            postcommit_stored=cache.postcommit_stored,
+        )
+    if record.cache is not None:
+        raise QualificationRuntimeFailure("runtime_model_attempt_invalid") from None
+    return SafeAttemptRecord(
+        request_digest=record.digest,
+        status="failed",
+        prompt_tokens=0,
+        cached_tokens=0,
+        new_prefill_tokens=0,
+        cache_source="none",
+        ssd_cache_hit=False,
+        ssd_cached_tokens=0,
+        session_cache_hit=False,
+        request_session_bank_bypass=False,
+        postcommit_stored=False,
+    )
+
+
+def _stage_model_attempts(
+    private_run_dir: Path,
+    stage: RuntimeStage,
+    lane: Literal["cold", "warm-prefix"],
+) -> tuple[tuple[SafeAttemptRecord, ...], SafeAttemptRecord | None]:
+    try:
+        if stage == "preflight":
+            records = (
+                *read_model_boundary_observer_records(_direct_attempt_ledger_path_required(private_run_dir, stage)),
+                *read_model_boundary_observer_records(_observer_ledger_path(private_run_dir, stage)),
+            )
+        elif stage == "score-direct":
+            records = read_model_boundary_observer_records(_direct_attempt_ledger_path_required(private_run_dir, stage))
+        else:
+            records = read_model_boundary_observer_records(_observer_ledger_path(private_run_dir, stage))
+        attempts = tuple(_adapt_model_attempt(record) for record in records)
+        prime_path = _prime_attempt_ledger_path(private_run_dir, stage, lane)
+        if prime_path is None:
+            return attempts, None
+        prime_records = read_model_boundary_observer_records(prime_path)
+        if len(prime_records) != 1:
+            raise QualificationRuntimeFailure("runtime_model_attempt_invalid")
+        return attempts, _adapt_model_attempt(prime_records[0])
+    except (PreflightFailure, QualificationRuntimeFailure):
+        raise QualificationRuntimeFailure("runtime_model_attempt_invalid") from None
+
+
+def _complete_model_evidence(
+    session: ModelEvidenceSession,
+    spec: _RuntimeSpec,
+    stage: RuntimeStage,
+    private_run_dir: Path,
 ) -> None:
+    try:
+        attempts, prime = _stage_model_attempts(private_run_dir, stage, spec.trial.cache_lane)
+        session.complete(attempts, prime_record=prime)
+    except QualificationRuntimeFailure:
+        # Force C1 to retain a categorical post-probe failure artifact even if
+        # the runner ledger was missing, stale, or malformed.
+        try:
+            session.complete([{}])
+        except ModelEvidenceSessionFailure as error:
+            raise QualificationRuntimeFailure(error.category) from None
+        raise QualificationRuntimeFailure("runtime_model_attempt_invalid") from None
+    except ModelEvidenceSessionFailure as error:
+        raise QualificationRuntimeFailure(error.category) from None
+
+
+def _write_attestation(
+    path: Path,
+    spec: _RuntimeSpec,
+    stage: RuntimeStage,
+    instance: str,
+    image_id: str,
+    model_session: ModelEvidenceSession,
+) -> None:
+    runtime_contract_sha256 = _runtime_contract_sha256(spec, model_session.model_contract_sha256)
     record = {
         "schema_version": "1.0",
         "record_type": "qualification_runtime_attestation",
@@ -1474,8 +1786,9 @@ def _write_attestation(
             "sha256": spec.benchmark.scenario_order_sha256,
             "count": spec.benchmark.scenario_count,
         },
-        "runtime_contract_sha256": _runtime_contract_sha256(spec),
-        "runtime_instance_sha256": _runtime_instance_sha256(spec, stage, instance, image_id),
+        "model_identity_sha256": model_session.model_identity_sha256,
+        "runtime_contract_sha256": runtime_contract_sha256,
+        "runtime_instance_sha256": _runtime_instance_sha256(stage, instance, image_id, runtime_contract_sha256),
         "checks": {key: True for key in _CHECK_KEYS},
     }
     _atomic_write_no_clobber(path, record)
@@ -1490,6 +1803,7 @@ def _write_outcome(
     *,
     run_manifest_sha256: str | None,
     attestation_sha256: str | None,
+    model_evidence_sha256: str | None,
     output_ledger_sha256: str | None,
     output_record_count: int,
 ) -> None:
@@ -1504,6 +1818,7 @@ def _write_outcome(
         "failure_category": failure_category,
         "run_manifest_sha256": run_manifest_sha256,
         "attestation_sha256": attestation_sha256,
+        "model_evidence_sha256": model_evidence_sha256,
         "output_ledger_sha256": output_ledger_sha256,
         "output_record_count": output_record_count,
     }
@@ -1511,21 +1826,25 @@ def _write_outcome(
 
 
 def _outcome_evidence(
-    attestation_path: Path | None, output_ledger: Path
-) -> tuple[str | None, str | None, int, str | None]:
+    attestation_path: Path | None, model_evidence_path: Path, output_ledger: Path
+) -> tuple[str | None, str | None, str | None, int, str | None]:
     try:
         attestation_sha256 = (
             _private_file_sha256(attestation_path, "runtime_attestation_invalid") if attestation_path else None
         )
     except QualificationRuntimeFailure as error:
-        return None, None, 0, error.category
+        return None, None, None, 0, error.category
+    try:
+        model_evidence_sha256 = _private_file_sha256(model_evidence_path, "runtime_model_evidence_invalid")
+    except QualificationRuntimeFailure as error:
+        return attestation_sha256, None, None, 0, error.category
     if not (output_ledger.exists() or output_ledger.is_symlink()):
-        return attestation_sha256, None, 0, None
+        return attestation_sha256, model_evidence_sha256, None, 0, None
     try:
         output_ledger_sha256, output_record_count = _output_ledger_evidence(output_ledger)
     except QualificationRuntimeFailure as error:
-        return attestation_sha256, None, 0, error.category
-    return attestation_sha256, output_ledger_sha256, output_record_count, None
+        return attestation_sha256, model_evidence_sha256, None, 0, error.category
+    return attestation_sha256, model_evidence_sha256, output_ledger_sha256, output_record_count, None
 
 
 def _require_complete_output(path: Path, stage: RuntimeStage, spec: _RuntimeSpec) -> None:
@@ -1613,8 +1932,18 @@ def _atomic_write_no_clobber(path: Path, record: dict[str, Any]) -> None:
         raise QualificationRuntimeFailure("runtime_evidence_write_failed") from error
 
 
-def _validate_stage_evidence_absent(private_run_dir: Path, stage: RuntimeStage) -> None:
-    paths = [_outcome_path(private_run_dir, stage), _scored_ledger_path(private_run_dir, stage)]
+def _validate_stage_evidence_absent(private_run_dir: Path, stage: RuntimeStage, spec: _RuntimeSpec) -> None:
+    paths = [
+        _outcome_path(private_run_dir, stage),
+        _scored_ledger_path(private_run_dir, stage),
+        _model_evidence_path(private_run_dir, stage),
+    ]
+    direct_attempt = _direct_attempt_ledger_path(private_run_dir, stage)
+    if direct_attempt is not None:
+        paths.append(direct_attempt)
+    prime_attempt = _prime_attempt_ledger_path(private_run_dir, stage, spec.trial.cache_lane)
+    if prime_attempt is not None:
+        paths.append(prime_attempt)
     if stage != "score-direct":
         paths.extend(
             (
@@ -1654,6 +1983,7 @@ def _validate_existing_preflight_attestation(private_run_dir: Path, spec: _Runti
         "model_id_sha256",
         "benchmark_revision",
         "scenario_order",
+        "model_identity_sha256",
         "runtime_contract_sha256",
         "runtime_instance_sha256",
         "checks",
@@ -1674,6 +2004,8 @@ def _validate_existing_preflight_attestation(private_run_dir: Path, spec: _Runti
         or value.get("benchmark_revision") != spec.benchmark.revision
         or not isinstance(order, dict)
         or order != {"sha256": spec.benchmark.scenario_order_sha256, "count": spec.benchmark.scenario_count}
+        or not isinstance(value.get("model_identity_sha256"), str)
+        or _SHA256.fullmatch(value["model_identity_sha256"]) is None
         or not isinstance(value.get("runtime_contract_sha256"), str)
         or _SHA256.fullmatch(value["runtime_contract_sha256"]) is None
         or not isinstance(value.get("runtime_instance_sha256"), str)
@@ -1684,6 +2016,20 @@ def _validate_existing_preflight_attestation(private_run_dir: Path, spec: _Runti
     ):
         raise QualificationRuntimeFailure("runtime_preflight_attestation_invalid")
     return path
+
+
+def _attestation_model_identity(path: Path) -> str:
+    try:
+        value = json.loads(
+            _read_private_file(path, "runtime_preflight_attestation_invalid"),
+            object_pairs_hook=_unique_json_object,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise QualificationRuntimeFailure("runtime_preflight_attestation_invalid") from None
+    identity = value.get("model_identity_sha256") if isinstance(value, dict) else None
+    if not isinstance(identity, str) or _SHA256.fullmatch(identity) is None:
+        raise QualificationRuntimeFailure("runtime_preflight_attestation_invalid")
+    return identity
 
 
 def _validate_prior_outcome(
@@ -1705,8 +2051,18 @@ def _validate_prior_outcome(
     try:
         output_sha256, output_count = _output_ledger_evidence(_scored_ledger_path(private_run_dir, stage))
         attestation_sha256 = _private_file_sha256(attestation_path, "runtime_prior_outcome_invalid")
-    except QualificationRuntimeFailure as error:
-        raise QualificationRuntimeFailure("runtime_prior_outcome_invalid") from error
+        model_identity_sha256 = _attestation_model_identity(attestation_path)
+        evidence_stage: Literal["preflight", "score-direct", "score-proxy"] = (
+            "preflight" if stage == "preflight" else "score-direct"
+        )
+        model_evidence = load_model_evidence(
+            _model_evidence_path(private_run_dir, stage),
+            expected_stage=evidence_stage,
+            run_manifest_sha256=spec.manifest_sha256,
+            model_identity_sha256=model_identity_sha256,
+        )
+    except (QualificationRuntimeFailure, PreflightFailure):
+        raise QualificationRuntimeFailure("runtime_prior_outcome_invalid") from None
     expected_count = 5 if stage == "preflight" else spec.benchmark.scenario_count
     expected_keys = {
         "schema_version",
@@ -1717,6 +2073,7 @@ def _validate_prior_outcome(
         "failure_category",
         "run_manifest_sha256",
         "attestation_sha256",
+        "model_evidence_sha256",
         "output_ledger_sha256",
         "output_record_count",
     }
@@ -1732,6 +2089,7 @@ def _validate_prior_outcome(
         or document.get("failure_category") is not None
         or document.get("run_manifest_sha256") != spec.manifest_sha256
         or document.get("attestation_sha256") != attestation_sha256
+        or document.get("model_evidence_sha256") != model_evidence.file_sha256
         or document.get("output_ledger_sha256") != output_sha256
         or document.get("output_record_count") != output_count
         or isinstance(document.get("output_record_count"), bool)
@@ -1896,13 +2254,14 @@ def _owned_volume_labels(
     )
 
 
-def _runtime_contract_sha256(spec: _RuntimeSpec) -> str:
+def _runtime_contract_sha256(spec: _RuntimeSpec, model_contract_sha256: str) -> str:
     return _canonical_sha256(
         {
             "source_commit": spec.source_commit,
             "image_digest": spec.image.digest,
             "run_manifest_sha256": spec.manifest_sha256,
             "model_id_sha256": _canonical_sha256(spec.model.public_id),
+            "model_contract_sha256": model_contract_sha256,
             "benchmark": {
                 "revision": spec.benchmark.revision,
                 "tree": spec.benchmark.tree,
@@ -1919,7 +2278,6 @@ def _runtime_contract_sha256(spec: _RuntimeSpec) -> str:
                 "cache_lane": spec.trial.cache_lane,
                 "pair_index": spec.trial.pair_index,
                 "treatment_order": list(spec.trial.treatment_order),
-                "cache_proof_sha256": spec.trial.cache_proof_sha256,
             },
             "settings_sha256": _canonical_sha256(spec.proxy.settings),
             "routes_sha256": _canonical_sha256(
@@ -1949,10 +2307,10 @@ def _runtime_contract_sha256(spec: _RuntimeSpec) -> str:
     )
 
 
-def _runtime_instance_sha256(spec: _RuntimeSpec, stage: RuntimeStage, instance: str, image_id: str) -> str:
+def _runtime_instance_sha256(stage: RuntimeStage, instance: str, image_id: str, runtime_contract_sha256: str) -> str:
     return _canonical_sha256(
         {
-            "runtime_contract_sha256": _runtime_contract_sha256(spec),
+            "runtime_contract_sha256": runtime_contract_sha256,
             "stage": _attestation_stage(stage),
             "supervisor_instance": instance,
             "image_id": image_id,
@@ -1991,6 +2349,39 @@ def _observer_ledger_path(private_run_dir: Path, stage: RuntimeStage) -> Path:
     if stage == "score-proxy":
         return private_run_dir / "scored-proxy-model-boundary.jsonl"
     raise QualificationRuntimeFailure("runtime_stage_invalid")
+
+
+def _direct_attempt_ledger_path(private_run_dir: Path, stage: RuntimeStage) -> Path | None:
+    if stage == "preflight":
+        return private_run_dir / "preflight-direct-model-boundary.jsonl"
+    if stage == "score-direct":
+        return private_run_dir / "scored-direct-model-boundary.jsonl"
+    return None
+
+
+def _direct_attempt_ledger_path_required(private_run_dir: Path, stage: RuntimeStage) -> Path:
+    path = _direct_attempt_ledger_path(private_run_dir, stage)
+    if path is None:
+        raise QualificationRuntimeFailure("runtime_stage_invalid")
+    return path
+
+
+def _prime_attempt_ledger_path(
+    private_run_dir: Path,
+    stage: RuntimeStage,
+    lane: Literal["cold", "warm-prefix"],
+) -> Path | None:
+    if lane != "warm-prefix" or stage == "preflight":
+        return None
+    if stage == "score-direct":
+        return private_run_dir / "scored-direct-prime-model-boundary.jsonl"
+    if stage == "score-proxy":
+        return private_run_dir / "scored-proxy-prime-model-boundary.jsonl"
+    raise QualificationRuntimeFailure("runtime_stage_invalid")
+
+
+def _model_evidence_path(private_run_dir: Path, stage: RuntimeStage) -> Path:
+    return private_run_dir / f"{_outcome_stage(stage)}-model-cache-evidence.json"
 
 
 def _scored_ledger_path(private_run_dir: Path, stage: RuntimeStage) -> Path:

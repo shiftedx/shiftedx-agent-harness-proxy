@@ -87,9 +87,9 @@ The supervisor reserves these private evidence names:
 
 | Stage | New evidence |
 | --- | --- |
-| `preflight` | `preflight.jsonl`, `preflight-proxy-model-boundary.jsonl`, `preflight-runtime-attestation.json`, `preflight-runtime-outcome.json` |
-| `score-direct` | `scored-direct.jsonl`, `scored-direct-runtime-outcome.json` |
-| `score-proxy` | `scored-proxy.jsonl`, `scored-proxy-model-boundary.jsonl`, `scored-proxy-runtime-attestation.json`, `scored-proxy-runtime-outcome.json` |
+| `preflight` | `preflight.jsonl`, `preflight-direct-model-boundary.jsonl`, `preflight-proxy-model-boundary.jsonl`, `preflight-model-cache-evidence.json`, `preflight-runtime-attestation.json`, `preflight-runtime-outcome.json` |
+| `score-direct` | `scored-direct.jsonl`, `scored-direct-model-boundary.jsonl`, `scored-direct-prime-model-boundary.jsonl` (warm lane only), `scored-direct-model-cache-evidence.json`, `scored-direct-runtime-outcome.json` |
+| `score-proxy` | `scored-proxy.jsonl`, `scored-proxy-model-boundary.jsonl`, `scored-proxy-prime-model-boundary.jsonl` (warm lane only), `scored-proxy-model-cache-evidence.json`, `scored-proxy-runtime-attestation.json`, `scored-proxy-runtime-outcome.json` |
 
 The attestation is allowlist-only: candidate source commit, image digest, manifest SHA-256,
 canonical model/order hashes, benchmark revision, runtime-contract/instance hashes, and the fixed
@@ -116,8 +116,30 @@ uses `"schema_version": "1.0"` and exactly these keys:
     },
     "model": {
       "public_id": "approved-public-model-id",
-      "upstream_url": "https://private-model.example/v1",
-      "upstream_authenticated": true
+      "upstream_url": "http://127.0.0.1:19999/v1",
+      "upstream_authenticated": true,
+      "stage_path": "/absolute/private/path/mtplx-stage",
+      "stage_revision": "1111111111111111111111111111111111111111",
+      "identity_ledger": "/absolute/private/path/mtplx-identity.json",
+      "identity_ledger_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "inspect_artifact": "/absolute/private/path/mtplx-inspect.json",
+      "inspect_artifact_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "runtime_executable": "/absolute/private/path/mtplx-runtime",
+      "runtime_executable_sha256": "0101010101010101010101010101010101010101010101010101010101010101",
+      "mtplx_distribution_root": "/absolute/private/path/site-packages",
+      "mtplx_record": "/absolute/private/path/site-packages/mtplx-2.7.1.dist-info/RECORD",
+      "mtplx_version": "2.7.1",
+      "launch_command_sha256": "0202020202020202020202020202020202020202020202020202020202020202",
+      "required_launch_flags": [
+        "--host=127.0.0.1",
+        "--port=19999",
+        "--no-auth",
+        "--generation-mode=mtp",
+        "--depth=3",
+        "--temperature=0"
+      ],
+      "health_contract_sha256": "0303030303030303030303030303030303030303030303030303030303030303",
+      "settings_contract_sha256": "0404040404040404040404040404040404040404040404040404040404040404"
     },
     "benchmark": {
       "revision": "335e6694e4aec13e9370af8a993d8c8f14d7ffb5",
@@ -133,8 +155,7 @@ uses `"schema_version": "1.0"` and exactly these keys:
       "run_id": "qualification-2026-08-20-a",
       "cache_lane": "cold",
       "pair_index": 1,
-      "treatment_order": ["direct", "proxy"],
-      "cache_proof_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      "treatment_order": ["direct", "proxy"]
     },
     "observer": {
       "host": "127.0.0.1",
@@ -179,10 +200,28 @@ uses `"schema_version": "1.0"` and exactly these keys:
 ```
 
 `image` is the local exact digest image (`--pull never`) and UID/GID must be `10001`. The model
-and observer URLs must be absolute `http(s)` URLs without userinfo, query, or fragment. The
-observer host and proxy publish host are loopback only. `observer.container_url` is the reviewed
-container-reachable route to that loopback-bound observer; container loopback is not the host
-observer. Stop if that route cannot be proven rather than weakening the observer bind.
+URL is an absolute `http` URL for a local loopback MTPLX listener; the observer URL is an absolute
+`http(s)` URL. Neither permits userinfo, query, or fragment. The observer host and proxy publish host are loopback only.
+`observer.container_url` is the reviewed container-reachable route to that loopback-bound
+observer; container loopback is not the host observer. Stop if that route cannot be proven rather
+than weakening the observer bind.
+
+The full `model` object is a private identity contract, not an assertion supplied by the runner.
+It binds the staged model revision, mode-`600` identity and inspect artifacts, non-symlink runtime
+executable and hash, the pinned `mtplx==2.7.1` distribution `RECORD`, complete launch argv hash,
+and every reviewed semantic launch flag. It also binds safe projections of `/health` and
+`/v1/mtplx/settings`. Produce their two manifest hashes with
+`model_endpoint_contract_hashes(health, settings)` from
+`shiftedx_harness_proxy.qualification_model_evidence`; do not hand-reimplement its allowlist or
+put endpoint bodies in the manifest. The placeholder flag list above is illustrative: a real
+manifest carries the complete frozen semantic vector for that model process.
+
+The supervisor probes only `/health`, `/v1/models`, and `/v1/mtplx/settings`, joins the health
+startup PID to the sole loopback listener, and verifies the executable, launch vector, package,
+model identity, and quiescent request count before and after each stage. An already-ready unrelated
+service, a replacement PID, or intervening model traffic fails the exclusive qualification window.
+No model endpoint, path, PID, launch argv, or server response is emitted into an attestation,
+outcome, or cache-evidence artifact.
 
 `credentials` names three distinct, regular, non-symlink, mode-`600`, nonempty host files. The
 first is the ordinary production `PROXY_API_KEY`; the second is the distinct trusted
@@ -217,12 +256,26 @@ records an interruption outcome after the same scoped cleanup; additional interr
 that cleanup and the atomic outcome write finish.
 
 The outcome is a mode-`600`, no-clobber JSON record written only after cleanup. Its exact fields
-bind the manifest, attestation, output-ledger SHA-256, and output count. A passed preflight requires
-five complete ledger rows; a passed scored treatment requires exactly the manifest's positive
-`scenario_count`. `score-direct` requires a passed preflight outcome and attestation, while
-`score-proxy` additionally requires the passed direct outcome and ledger. The supervisor supplies
-the same manifest `trial.run_id` to both treatments and derives their child variants as
+are `schema_version`, `record_type`, `stage`, `status`, `action_exit_code`, `failure_category`,
+`run_manifest_sha256`, `attestation_sha256`, `model_evidence_sha256`, `output_ledger_sha256`, and
+`output_record_count`. A passed outcome requires a passed exact model-cache-evidence artifact. A
+passed preflight requires five complete ledger rows; a passed scored treatment requires exactly the
+manifest's positive `scenario_count`. `score-direct` requires a passed preflight outcome,
+attestation, and model evidence, while `score-proxy` additionally requires the passed direct
+outcome, ledger, and model evidence. The supervisor supplies the same manifest `trial.run_id` to
+both treatments and derives their child variants as
 `<cache_lane>-pair<pair_index>-direct|proxy-<agentic_set>`.
+
+`cache_lane` is measured proof, not a `cache_proof_sha256` self-assertion. In the `cold` lane the
+child receives `--cache-mode bypass`; every successful actual attempt must report bypass, no RAM or
+SSD hit, zero cached tokens, a full new prefill, and no postcommit store. In the `warm-prefix` lane
+the supervisor first runs one direct-to-model prime child with the same frozen run ID, scenario
+order, variant, and a `direct` or `proxy` prime arm. It records exactly one safe prime attempt,
+then runs the scored child. The prime request digest must equal the first measured request digest;
+that first measured attempt must be a non-bypass RAM or SSD hit with positive cached tokens, and
+the server request-count delta must leave no room for intervening traffic. A pending postcommit
+flag is corroborating information only, because a tool-required MTPLX prime can commit after the
+first matching request.
 
 The paired child still fails before any scored row when either arm produces zero native acquisition
 calls, phase/field fingerprints differ outside the declared proxy receipt policy, proxy phase

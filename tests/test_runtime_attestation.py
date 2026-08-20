@@ -9,12 +9,15 @@ from shiftedx_harness_proxy.qualification_contract import (
     BENCHMARK_REVISION,
     CacheObservation,
     ModelBoundaryRecord,
+    ModelEvidence,
+    ModelEvidenceFailure,
     PreflightFailure,
     RuntimeAttestation,
     RuntimeAttestationFailure,
     RuntimeOutcome,
     RuntimeOutcomeFailure,
     cache_observation_from_response,
+    load_model_evidence,
     load_runtime_attestation,
     load_runtime_outcome,
     model_boundary_fingerprint,
@@ -217,6 +220,7 @@ def test_runtime_attestation_loads_exact_verified_identity(tmp_path) -> None:
             "sha256": "e36906789ac1c1a27abe7e60762c17fa92b660e7e29920ed603b89914b99545c",
             "count": 2,
         },
+        "model_identity_sha256": "f" * 64,
         "runtime_contract_sha256": "d" * 64,
         "runtime_instance_sha256": "e" * 64,
         "checks": {
@@ -245,16 +249,18 @@ def test_runtime_attestation_loads_exact_verified_identity(tmp_path) -> None:
     assert isinstance(attestation, RuntimeAttestation)
     assert attestation.file_sha256 == hashlib.sha256(serialized).hexdigest()
     assert attestation.runtime_contract_sha256 == "d" * 64
+    assert attestation.model_identity_sha256 == "f" * 64
     assert attestation.runtime_instance_sha256 == "e" * 64
 
 
 def test_runtime_outcome_loads_exact_private_evidence_identity(tmp_path) -> None:
     attestation = tmp_path / "preflight-runtime-attestation.json"
-    attestation.write_text('{"safe":"attestation"}\n', encoding="utf-8")
+    attestation.write_text('{"model_identity_sha256":"' + "f" * 64 + '"}\n', encoding="utf-8")
     attestation.chmod(0o600)
     output = tmp_path / "preflight.jsonl"
     output.write_text("".join(f'{{"record":{index}}}\n' for index in range(5)), encoding="utf-8")
     output.chmod(0o600)
+    evidence = _write_model_evidence(tmp_path / "preflight-model-cache-evidence.json")
     path = tmp_path / "preflight-runtime-outcome.json"
     document = {
         "schema_version": "1.0",
@@ -265,6 +271,7 @@ def test_runtime_outcome_loads_exact_private_evidence_identity(tmp_path) -> None
         "failure_category": None,
         "run_manifest_sha256": "c" * 64,
         "attestation_sha256": hashlib.sha256(attestation.read_bytes()).hexdigest(),
+        "model_evidence_sha256": hashlib.sha256(evidence.read_bytes()).hexdigest(),
         "output_ledger_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
         "output_record_count": 5,
     }
@@ -277,6 +284,9 @@ def test_runtime_outcome_loads_exact_private_evidence_identity(tmp_path) -> None
         expected_stage="preflight",
         run_manifest_sha256="c" * 64,
         attestation=attestation,
+        model_evidence=evidence,
+        model_identity_sha256="f" * 64,
+        model_contract_sha256="f" * 64,
         output_ledger=output,
         expected_output_record_count=5,
     )
@@ -284,6 +294,7 @@ def test_runtime_outcome_loads_exact_private_evidence_identity(tmp_path) -> None
     assert isinstance(outcome, RuntimeOutcome)
     assert outcome.file_sha256 == hashlib.sha256(serialized).hexdigest()
     assert outcome.attestation_sha256 == document["attestation_sha256"]
+    assert outcome.model_evidence_sha256 == document["model_evidence_sha256"]
     assert outcome.output_ledger_sha256 == document["output_ledger_sha256"]
     assert outcome.output_record_count == 5
 
@@ -301,6 +312,7 @@ def test_runtime_outcome_loads_exact_private_evidence_identity(tmp_path) -> None
         ("failure_category", "runtime_cleanup_failed"),
         ("run_manifest_sha256", "d" * 64),
         ("attestation_sha256", "e" * 64),
+        ("model_evidence_sha256", "e" * 64),
         ("output_ledger_sha256", "f" * 64),
         ("output_record_count", 4),
         ("output_record_count", True),
@@ -308,10 +320,8 @@ def test_runtime_outcome_loads_exact_private_evidence_identity(tmp_path) -> None
         ("private_prompt", "must never survive validation"),
     ],
 )
-def test_runtime_outcome_rejects_any_non_allowlisted_or_nonpassing_field(
-    tmp_path, field, replacement
-) -> None:
-    path, attestation, output, document = _runtime_outcome_fixture(tmp_path)
+def test_runtime_outcome_rejects_any_non_allowlisted_or_nonpassing_field(tmp_path, field, replacement) -> None:
+    path, attestation, evidence, output, document = _runtime_outcome_fixture(tmp_path)
     document[field] = replacement
     path.write_text(json.dumps(document), encoding="utf-8")
     path.chmod(0o600)
@@ -322,6 +332,9 @@ def test_runtime_outcome_rejects_any_non_allowlisted_or_nonpassing_field(
             expected_stage="preflight",
             run_manifest_sha256="c" * 64,
             attestation=attestation,
+            model_evidence=evidence,
+            model_identity_sha256="f" * 64,
+            model_contract_sha256="f" * 64,
             output_ledger=output,
             expected_output_record_count=5,
         )
@@ -343,10 +356,13 @@ def test_runtime_outcome_rejects_any_non_allowlisted_or_nonpassing_field(
         "output_tampered",
         "output_insecure_mode",
         "output_incomplete",
+        "model_evidence_tampered",
+        "model_evidence_symlink",
+        "model_evidence_insecure_mode",
     ],
 )
 def test_runtime_outcome_rejects_untrusted_or_tampered_private_evidence(tmp_path, kind) -> None:
-    path, attestation, output, document = _runtime_outcome_fixture(tmp_path)
+    path, attestation, evidence, output, document = _runtime_outcome_fixture(tmp_path)
     if kind == "missing":
         path.unlink()
     elif kind == "directory":
@@ -375,6 +391,14 @@ def test_runtime_outcome_rejects_untrusted_or_tampered_private_evidence(tmp_path
         output.write_text(output.read_text(encoding="utf-8") + '{"extra":true}\n', encoding="utf-8")
     elif kind == "output_insecure_mode":
         output.chmod(0o644)
+    elif kind == "model_evidence_tampered":
+        evidence.write_text("tampered\n", encoding="utf-8")
+    elif kind == "model_evidence_symlink":
+        target = tmp_path / "model-evidence-target.json"
+        evidence.replace(target)
+        evidence.symlink_to(target)
+    elif kind == "model_evidence_insecure_mode":
+        evidence.chmod(0o644)
     else:
         output.write_text('{"record":0}\n' * 4, encoding="utf-8")
 
@@ -384,6 +408,9 @@ def test_runtime_outcome_rejects_untrusted_or_tampered_private_evidence(tmp_path
             expected_stage="preflight",
             run_manifest_sha256="c" * 64,
             attestation=attestation,
+            model_evidence=evidence,
+            model_identity_sha256="f" * 64,
+            model_contract_sha256="f" * 64,
             output_ledger=output,
             expected_output_record_count=5,
         )
@@ -402,15 +429,14 @@ def test_runtime_outcome_rejects_untrusted_or_tampered_private_evidence(tmp_path
         ("model_id_sha256", "f" * 64),
         ("benchmark_revision", "f" * 40),
         ("scenario_order", {"sha256": "f" * 64, "count": 2}),
+        ("model_identity_sha256", "F" * 64),
         ("runtime_contract_sha256", "D" * 64),
         ("runtime_instance_sha256", "e" * 63),
         ("checks", {"exact_image": True}),
         ("private_prompt", "must never survive validation"),
     ],
 )
-def test_runtime_attestation_rejects_any_non_allowlisted_or_mismatched_field(
-    tmp_path, field, replacement
-) -> None:
+def test_runtime_attestation_rejects_any_non_allowlisted_or_mismatched_field(tmp_path, field, replacement) -> None:
     path = tmp_path / "runtime-attestation.json"
     document = {
         "schema_version": "1.0",
@@ -426,6 +452,7 @@ def test_runtime_attestation_rejects_any_non_allowlisted_or_mismatched_field(
             "sha256": "e36906789ac1c1a27abe7e60762c17fa92b660e7e29920ed603b89914b99545c",
             "count": 2,
         },
+        "model_identity_sha256": "f" * 64,
         "runtime_contract_sha256": "d" * 64,
         "runtime_instance_sha256": "e" * 64,
         "checks": {
@@ -470,6 +497,7 @@ def _valid_attestation_document() -> dict[str, object]:
             "sha256": "e36906789ac1c1a27abe7e60762c17fa92b660e7e29920ed603b89914b99545c",
             "count": 2,
         },
+        "model_identity_sha256": "f" * 64,
         "runtime_contract_sha256": "d" * 64,
         "runtime_instance_sha256": "e" * 64,
         "checks": {
@@ -484,13 +512,91 @@ def _valid_attestation_document() -> dict[str, object]:
     }
 
 
+def _write_model_evidence(
+    path,
+    *,
+    stage="preflight",
+    manifest_sha256="c" * 64,
+    identity_sha256="f" * 64,
+    contract_sha256="f" * 64,
+):
+    document = {
+        "schema_version": "1.0",
+        "record_type": "qualification_model_cache_evidence",
+        "stage": stage,
+        "status": "passed",
+        "failure_category": None,
+        "run_manifest_sha256": manifest_sha256,
+        "model_identity_sha256": identity_sha256,
+        "model_contract_sha256": contract_sha256,
+        "runtime_instance_sha256": "1" * 64,
+        "live_before_sha256": "2" * 64,
+        "live_after_sha256": "3" * 64,
+        "request_window": {
+            "before": 0,
+            "after": 0,
+            "delta": 0,
+            "expected": 0,
+            "successful_measured": 0,
+        },
+        "prime": {"record_sha256": None, "count": 0, "request_digest": None},
+        "first_attempt": {
+            "record_sha256": None,
+            "status": None,
+            "measured_count": 0,
+            "successful_count": 0,
+            "prompt_tokens": None,
+            "cached_tokens": None,
+            "new_prefill_tokens": None,
+        },
+        "checks": {
+            "contract": True,
+            "live_before": True,
+            "attempts": True,
+            "request_window": True,
+            "live_after": True,
+        },
+    }
+    path.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
+
+def test_model_evidence_rejects_wrong_stage_contract_and_raw_nested_fields(tmp_path) -> None:
+    evidence = _write_model_evidence(tmp_path / "model-evidence.json")
+
+    loaded = load_model_evidence(
+        evidence,
+        expected_stage="preflight",
+        run_manifest_sha256="c" * 64,
+        model_identity_sha256="f" * 64,
+        model_contract_sha256="f" * 64,
+    )
+    assert isinstance(loaded, ModelEvidence)
+    document = json.loads(evidence.read_text(encoding="utf-8"))
+    document["first_attempt"]["raw_prompt"] = "must not survive"
+    evidence.write_text(json.dumps(document), encoding="utf-8")
+    evidence.chmod(0o600)
+
+    with pytest.raises(ModelEvidenceFailure, match="^model_evidence_invalid$") as raised:
+        load_model_evidence(
+            evidence,
+            expected_stage="preflight",
+            run_manifest_sha256="c" * 64,
+            model_identity_sha256="f" * 64,
+            model_contract_sha256="f" * 64,
+        )
+    assert "must not survive" not in str(raised.value)
+
+
 def _runtime_outcome_fixture(tmp_path):
     attestation = tmp_path / "preflight-runtime-attestation.json"
-    attestation.write_text('{"safe":"attestation"}\n', encoding="utf-8")
+    attestation.write_text('{"model_identity_sha256":"' + "f" * 64 + '"}\n', encoding="utf-8")
     attestation.chmod(0o600)
     output = tmp_path / "preflight.jsonl"
     output.write_text("".join(f'{{"record":{index}}}\n' for index in range(5)), encoding="utf-8")
     output.chmod(0o600)
+    evidence = _write_model_evidence(tmp_path / "preflight-model-cache-evidence.json")
     path = tmp_path / "preflight-runtime-outcome.json"
     document = {
         "schema_version": "1.0",
@@ -501,12 +607,13 @@ def _runtime_outcome_fixture(tmp_path):
         "failure_category": None,
         "run_manifest_sha256": "c" * 64,
         "attestation_sha256": hashlib.sha256(attestation.read_bytes()).hexdigest(),
+        "model_evidence_sha256": hashlib.sha256(evidence.read_bytes()).hexdigest(),
         "output_ledger_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
         "output_record_count": 5,
     }
     path.write_text(json.dumps(document), encoding="utf-8")
     path.chmod(0o600)
-    return path, attestation, output, document
+    return path, attestation, evidence, output, document
 
 
 @pytest.mark.parametrize("kind", ["missing", "directory", "symlink", "duplicate_key", "malformed"])
