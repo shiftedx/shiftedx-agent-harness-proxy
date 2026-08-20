@@ -158,6 +158,20 @@ def assert_ledger(values: dict[str, int], *, requests: int, attempts: int, calls
     assert values["shiftedx_proxy_upstream_calls_total"] == attempts == calls
 
 
+def correction_turns_sent(upstream: ScriptedUpstream) -> int:
+    """Count retry turns in the authoritative fake-server request ledger."""
+    return sum(
+        any(
+            message.get("role") == "user"
+            and isinstance(message.get("content"), str)
+            and message["content"].startswith("[shiftedx harness correction]")
+            for message in request["messages"]
+            if isinstance(message, dict)
+        )
+        for request in upstream.calls
+    )
+
+
 @pytest.mark.asyncio
 async def test_success_and_passthrough_reconcile_to_the_authoritative_upstream_ledger() -> None:
     upstream = ScriptedUpstream([completion()])
@@ -165,6 +179,9 @@ async def test_success_and_passthrough_reconcile_to_the_authoritative_upstream_l
 
     assert response.status_code == 200
     assert_ledger(values, requests=1, attempts=1, calls=len(upstream.calls))
+    assert values["shiftedx_proxy_errors_total"] == 0
+    assert values["shiftedx_proxy_correction_turns_total"] == 0
+    assert values["shiftedx_proxy_downstream_cancellations_total"] == 0
     assert values["shiftedx_proxy_phase_acquisition_total"] == 0
     assert values["shiftedx_proxy_phase_finalization_total"] == 0
 
@@ -202,6 +219,9 @@ async def test_local_projection_is_admitted_but_has_zero_upstream_attempts() -> 
     assert_ledger(values, requests=1, attempts=0, calls=len(upstream.calls))
     assert values["shiftedx_proxy_receipt_projections_total"] == 1
     assert values["shiftedx_proxy_local_projection_upstream_calls_avoided_total"] == 1
+    assert values["shiftedx_proxy_errors_total"] == 0
+    assert values["shiftedx_proxy_correction_turns_total"] == 0
+    assert values["shiftedx_proxy_downstream_cancellations_total"] == 0
 
 
 @pytest.mark.asyncio
@@ -216,6 +236,9 @@ async def test_admitted_body_and_validation_errors_count_once_without_an_attempt
 
     assert response.status_code == 400
     assert_ledger(values, requests=1, attempts=0, calls=len(upstream.calls))
+    assert values["shiftedx_proxy_errors_total"] == 1
+    assert values["shiftedx_proxy_correction_turns_total"] == 0
+    assert values["shiftedx_proxy_downstream_cancellations_total"] == 0
 
 
 @pytest.mark.asyncio
@@ -235,6 +258,8 @@ async def test_admission_and_principal_rate_rejections_are_outside_the_admitted_
     assert_ledger(values, requests=1, attempts=1, calls=len(upstream.calls))
     assert values["shiftedx_proxy_admission_rejections_total"] == 1
     assert values["shiftedx_proxy_principal_rate_rejections_total"] == 1
+    assert values["shiftedx_proxy_errors_total"] == 2
+    assert values["shiftedx_proxy_downstream_cancellations_total"] == 0
 
 
 @pytest.mark.asyncio
@@ -278,6 +303,12 @@ async def test_retry_exhaustion_counts_every_started_attempt() -> None:
     assert response.status_code == 502
     assert response.json()["error"]["code"] == "harness_retry_exhausted"
     assert_ledger(values, requests=1, attempts=3, calls=len(upstream.calls))
+    assert correction_turns_sent(upstream) == 2
+    assert values["shiftedx_proxy_upstream_calls_total"] == 1 + correction_turns_sent(upstream)
+    # Successful-policy telemetry deliberately does not report corrections from an exhausted request.
+    assert values["shiftedx_proxy_correction_turns_total"] == 0
+    assert values["shiftedx_proxy_errors_total"] == 1
+    assert values["shiftedx_proxy_downstream_cancellations_total"] == 0
 
 
 @pytest.mark.asyncio
@@ -308,6 +339,9 @@ async def test_httpx_failure_attempts_reconcile_after_delegate_starts(kind: str)
 
     assert response.status_code in {429, 502, 504}
     assert_ledger(values, requests=1, attempts=1, calls=calls)
+    assert values["shiftedx_proxy_errors_total"] == 1
+    assert values["shiftedx_proxy_correction_turns_total"] == 0
+    assert values["shiftedx_proxy_downstream_cancellations_total"] == 0
 
 
 @pytest.mark.asyncio
@@ -318,6 +352,9 @@ async def test_malformed_completion_counts_the_started_attempt() -> None:
     assert response.status_code == 502
     assert response.json()["error"]["code"] == "upstream_malformed_completion"
     assert_ledger(values, requests=1, attempts=1, calls=len(upstream.calls))
+    assert values["shiftedx_proxy_errors_total"] == 1
+    assert values["shiftedx_proxy_correction_turns_total"] == 0
+    assert values["shiftedx_proxy_downstream_cancellations_total"] == 0
 
 
 @pytest.mark.asyncio
@@ -365,11 +402,16 @@ def request_with_events(app: Any, events: list[JsonObject]) -> Request:
 @pytest.mark.asyncio
 async def test_body_disconnect_is_admitted_once_without_an_attempt() -> None:
     app = create_app(settings(), ScriptedUpstream([]))
-    with pytest.raises(ProxyError, match="disconnected"):
-        await chat_endpoint(app)(request_with_events(app, [{"type": "http.disconnect"}]))
+    request = request_with_events(app, [{"type": "http.disconnect"}])
+    with pytest.raises(ProxyError, match="disconnected") as raised:
+        await chat_endpoint(app)(request)
+    response = await app.exception_handlers[ProxyError](request, raised.value)
 
+    assert response.status_code == 499
     assert app.state.counters.downstream_requests == 1
     assert app.state.counters.upstream_calls == 0
+    assert app.state.counters.errors == 1
+    assert app.state.counters.cancellations == 1
 
 
 @pytest.mark.asyncio
@@ -384,10 +426,13 @@ async def test_inflight_disconnect_and_external_cancellation_retain_the_started_
             {"type": "http.disconnect"},
         ],
     )
-    with pytest.raises(ProxyError, match="disconnected"):
+    with pytest.raises(ProxyError, match="disconnected") as raised:
         await chat_endpoint(app)(request)
+    response = await app.exception_handlers[ProxyError](request, raised.value)
+    assert response.status_code == 499
     assert upstream.cancelled.is_set()
     assert app.state.counters.downstream_requests == app.state.counters.upstream_calls == 1
+    assert app.state.counters.errors == app.state.counters.cancellations == 1
 
     external_upstream = WaitingUpstream()
     external_app = create_app(settings(), external_upstream)
@@ -404,6 +449,7 @@ async def test_inflight_disconnect_and_external_cancellation_retain_the_started_
     assert external_upstream.cancelled.is_set()
     assert external_app.state.counters.downstream_requests == external_app.state.counters.upstream_calls == 1
     assert external_app.state.counters.cancellations == 1
+    assert external_app.state.counters.errors == 0
 
 
 @pytest.mark.asyncio
@@ -415,3 +461,52 @@ async def test_total_deadline_counts_the_started_attempt_before_cancellation() -
     assert response.status_code == 504
     assert upstream.cancelled.is_set()
     assert_ledger(values, requests=1, attempts=1, calls=len(upstream.calls))
+    assert values["shiftedx_proxy_errors_total"] == 1
+    assert values["shiftedx_proxy_correction_turns_total"] == 0
+    assert values["shiftedx_proxy_downstream_cancellations_total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_mixed_request_ledger_has_exact_request_attempt_error_and_projection_deltas() -> None:
+    """One mixed window prevents successful responses from double-counting later failures."""
+    upstream = ScriptedUpstream([completion(), {"id": "chatcmpl", "choices": "not-a-list"}])
+    app = create_app(settings(), upstream)
+    projection_payload = {
+        "model": "model",
+        "messages": [
+            {"role": "user", "content": "synthetic"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "v", "type": "function", "function": {"name": "run_tests", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "v", "content": "14 passed"},
+        ],
+        "tools": [{"type": "function", "function": {"name": "run_tests", "parameters": {}}}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "result",
+                "schema": {
+                    "type": "object",
+                    "properties": {"status": {"type": "string"}, "tests": {"type": "integer"}},
+                },
+            },
+        },
+    }
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
+            success = await client.post("/v1/chat/completions", json=chat_payload())
+            projection = await client.post("/v1/chat/completions", json=projection_payload)
+            validation = await client.post("/v1/chat/completions", content=b"not-json")
+            malformed = await client.post("/v1/chat/completions", json=chat_payload())
+            values = await metrics(client)
+
+    assert [response.status_code for response in (success, projection, validation, malformed)] == [200, 200, 400, 502]
+    assert_ledger(values, requests=4, attempts=2, calls=len(upstream.calls))
+    assert values["shiftedx_proxy_errors_total"] == 2
+    assert values["shiftedx_proxy_receipt_projections_total"] == 1
+    assert values["shiftedx_proxy_local_projection_upstream_calls_avoided_total"] == 1
+    assert values["shiftedx_proxy_correction_turns_total"] == 0
+    assert values["shiftedx_proxy_downstream_cancellations_total"] == 0
