@@ -63,13 +63,112 @@ PREFLIGHT_OBSERVER_LEDGER="$RUN_DIR/preflight-proxy-model-boundary.jsonl"
 PREFLIGHT_LEDGER="$RUN_DIR/preflight.jsonl"
 SCORED_PROXY_OBSERVER_LEDGER="$RUN_DIR/scored-proxy-model-boundary.jsonl"
 RUN_MANIFEST_SHA256="$(shasum -a 256 "$RUN_MANIFEST" | awk '{print $1}')"
+ORDINARY_PROXY_API_KEY_FILE="$(pwd)/secrets/proxy_server_key"
+QUALIFICATION_POLICY_API_KEY_FILE="$(pwd)/secrets/qualification_policy_key"
+UPSTREAM_MODEL_API_KEY_FILE="$(pwd)/secrets/upstream_model_key"
+: "${QUALIFICATION_RUN_ID:?Set the manifest-frozen qualification run identifier}"
+: "${CANDIDATE_IMAGE_REF:?Set the approved image reference by digest}"
+: "${QUALIFICATION_OBSERVER_CONTAINER_URL:?Set the manifest-frozen observer URL reachable from the container}"
+[[ "$QUALIFICATION_RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]
+[[ "$CANDIDATE_IMAGE_REF" =~ @sha256:[0-9a-f]{64}$ ]]
+CANDIDATE_IMAGE_DIGEST="${CANDIDATE_IMAGE_REF##*@}"
+PREFLIGHT_PROXY_CONTAINER="shiftedx-qualification-preflight-$QUALIFICATION_RUN_ID"
+SCORED_PROXY_CONTAINER="shiftedx-qualification-scored-$QUALIFICATION_RUN_ID"
+QUALIFICATION_SECRETS_VOLUME="shiftedx-qualification-secrets-$QUALIFICATION_RUN_ID"
+PROXY_URL=http://127.0.0.1:8090/v1
+PRIVATE_PROXY_METRICS_URL=http://127.0.0.1:8090/metrics
+
+docker image inspect "$CANDIDATE_IMAGE_REF" >/dev/null
+docker run --rm --pull never --network none --read-only --cap-drop ALL \
+  --security-opt no-new-privileges:true --entrypoint /bin/sh "$CANDIDATE_IMAGE_REF" \
+  -c 'command -v cp >/dev/null && command -v chown >/dev/null && command -v chmod >/dev/null'
+if docker volume inspect "$QUALIFICATION_SECRETS_VOLUME" >/dev/null 2>&1; then
+  echo "qualification secret volume already exists" >&2
+  exit 1
+fi
+docker volume create "$QUALIFICATION_SECRETS_VOLUME" >/dev/null
+docker run --rm --pull never --network none --read-only \
+  --user 0:0 --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
+  --security-opt no-new-privileges:true \
+  --mount "type=bind,src=$ORDINARY_PROXY_API_KEY_FILE,dst=/source/proxy_api_key,readonly" \
+  --mount "type=bind,src=$QUALIFICATION_POLICY_API_KEY_FILE,dst=/source/trusted_policy_extension_api_keys,readonly" \
+  --mount "type=bind,src=$UPSTREAM_MODEL_API_KEY_FILE,dst=/source/upstream_api_key,readonly" \
+  --mount "type=volume,src=$QUALIFICATION_SECRETS_VOLUME,dst=/target" \
+  --entrypoint /bin/sh "$CANDIDATE_IMAGE_REF" -c '
+    set -eu
+    cp /source/proxy_api_key /target/proxy_api_key
+    cp /source/trusted_policy_extension_api_keys /target/trusted_policy_extension_api_keys
+    cp /source/upstream_api_key /target/upstream_api_key
+    chmod 0400 /target/proxy_api_key /target/trusted_policy_extension_api_keys /target/upstream_api_key
+    chown 10001:10001 /target/proxy_api_key /target/trusted_policy_extension_api_keys /target/upstream_api_key
+  '
+
+start_qualification_proxy() {
+  qualification_container="$1"
+  if docker container inspect "$qualification_container" >/dev/null 2>&1; then
+    echo "qualification container already exists: $qualification_container" >&2
+    return 1
+  fi
+  docker run --detach --pull never --name "$qualification_container" \
+    --init --stop-timeout 20 --user 10001:10001 --read-only \
+    --cap-drop ALL --security-opt no-new-privileges:true \
+    --pids-limit 128 --cpus 1.0 --memory 512m \
+    --publish 127.0.0.1:8090:8090 \
+    --mount "type=volume,src=$QUALIFICATION_SECRETS_VOLUME,dst=/run/secrets,readonly" \
+    --env DEPLOYMENT_PROFILE=production \
+    --env LISTEN_HOST=0.0.0.0 \
+    --env TELEMETRY_ENABLED=true \
+    --env METRICS_ENABLED=true \
+    --env UPSTREAM_BASE_URL="$QUALIFICATION_OBSERVER_CONTAINER_URL" \
+    --env UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE=phase_split \
+    "$CANDIDATE_IMAGE_REF" >/dev/null
+  test "$(docker container inspect --format '{{.Image}}' "$qualification_container")" = \
+    "$(docker image inspect --format '{{.Id}}' "$CANDIDATE_IMAGE_REF")"
+  docker exec "$qualification_container" python -c '
+from shiftedx_harness_proxy.config import Settings
+s = Settings()
+assert s.deployment_profile == "production"
+assert s.listen_host == "0.0.0.0"
+assert s.telemetry_enabled and s.metrics_enabled
+assert s.upstream_tool_response_capability_mode == "phase_split"
+assert s.proxy_api_key is not None and s.upstream_api_key is not None
+trusted = s.trusted_policy_extension_keys()
+assert len(trusted) == 1
+assert len({s.proxy_api_key.get_secret_value(), s.upstream_api_key.get_secret_value(), *trusted}) == 3
+'
+  qualification_ready=false
+  for qualification_attempt in $(seq 1 30); do
+    if curl --fail --silent --show-error http://127.0.0.1:8090/readyz >/dev/null; then
+      qualification_ready=true
+      break
+    fi
+    sleep 1
+  done
+  test "$qualification_ready" = true
+}
 
 QUALIFICATION_OBSERVER_UPSTREAM="$MODEL_URL" \
 QUALIFICATION_OBSERVER_LEDGER="$PREFLIGHT_OBSERVER_LEDGER" \
   uv run python scripts/qualification_model_boundary_observer.py &
-UPSTREAM_BASE_URL=http://127.0.0.1:18092/v1 \
-  uv run shiftedx-agent-harness-proxy
+PREFLIGHT_OBSERVER_PID=$!
+start_qualification_proxy "$PREFLIGHT_PROXY_CONTAINER"
 ```
+
+Provision the three roles from distinct host mode-`600` files without printing their values: the
+ordinary downstream `PROXY_API_KEY`, the trusted qualification policy-extension key, and the
+upstream model key. The initializer copies them into a dedicated volume as the exact Pydantic secret
+filenames, owned by image UID/GID `10001:10001` with mode `0400`; the candidate mounts that volume
+read-only. Never reuse a value between roles. The runner's proxy key file is the trusted
+qualification key, not the ordinary server key. For an authenticated model, the proxy creates the
+upstream Authorization from `upstream_api_key`; the host observer forwards that header without
+loading the credential itself.
+
+The observer remains a host process, but the approved proxy is the exact digest-addressed image.
+Freeze `QUALIFICATION_OBSERVER_CONTAINER_URL`, the image reference, host port, resource limits, and
+all effective settings in the run manifest. The URL must be proven reachable from inside the
+container; container loopback is not the host observer. On an engine that cannot privately route a
+container to this loopback-only observer, stop and establish a reviewed route rather than weakening
+the observer bind. The settings assertion and `/readyz` gate must pass before preflight or scoring.
 
 The preflight runner requires that observer ledger to be absent or empty before requests and will
 neither delete nor overwrite it. Use a newly launched observer and a distinct new ledger for every
@@ -78,11 +177,13 @@ qualification-only observer exercise; do not use this observer as a production r
 
 ```bash
 uv run scripts/run_paired_agentic_trial.py \
-  --paired-preflight --model "$PUBLIC_MODEL_ID" --agentic-set expanded \
+  --paired-preflight --variant preflight \
+  --model "$PUBLIC_MODEL_ID" --agentic-set expanded \
   --direct-base-url "$DIRECT_URL" --proxy-base-url "$PROXY_URL" \
   --proxy-metrics-url "$PRIVATE_PROXY_METRICS_URL" \
   --proxy-observer-ledger "$PREFLIGHT_OBSERVER_LEDGER" \
-  --direct-api-key-file secrets/direct_key --proxy-api-key-file secrets/proxy_key \
+  --direct-api-key-file "$UPSTREAM_MODEL_API_KEY_FILE" \
+  --proxy-api-key-file "$QUALIFICATION_POLICY_API_KEY_FILE" \
   --output "$PREFLIGHT_LEDGER" \
   --candidate-source-commit "$CANDIDATE_SOURCE_COMMIT" \
   --candidate-image-digest "$CANDIDATE_IMAGE_DIGEST" \
@@ -101,6 +202,7 @@ binds each arm to its full selected scenario order and request-contract digest, 
 ```bash
 uv run scripts/run_paired_agentic_trial.py \
   --base-url "$DIRECT_URL" --model "$PUBLIC_MODEL_ID" --variant direct \
+  --api-key-file "$UPSTREAM_MODEL_API_KEY_FILE" \
   --output "$RUN_DIR/direct.jsonl" --agentic-set expanded \
   --preflight-ledger "$PREFLIGHT_LEDGER" \
   --candidate-source-commit "$CANDIDATE_SOURCE_COMMIT" \
@@ -108,16 +210,21 @@ uv run scripts/run_paired_agentic_trial.py \
   --run-manifest-sha256 "$RUN_MANIFEST_SHA256"
 ```
 
-Before the equivalent proxy command, stop the preflight-only observer/proxy, then launch a new
-observer wired to the distinct scored ledger and configure the dedicated qualification proxy to
-use its loopback listener:
+Before the equivalent proxy command, stop and remove only the named preflight container, then stop
+its observer. Launch a new host observer wired to the distinct scored ledger and start the same
+frozen candidate configuration under a new dedicated container name:
 
 ```bash
+docker stop "$PREFLIGHT_PROXY_CONTAINER" >/dev/null
+docker rm "$PREFLIGHT_PROXY_CONTAINER" >/dev/null
+kill "$PREFLIGHT_OBSERVER_PID"
+wait "$PREFLIGHT_OBSERVER_PID" 2>/dev/null || true
+
 QUALIFICATION_OBSERVER_UPSTREAM="$MODEL_URL" \
 QUALIFICATION_OBSERVER_LEDGER="$SCORED_PROXY_OBSERVER_LEDGER" \
   uv run python scripts/qualification_model_boundary_observer.py &
-UPSTREAM_BASE_URL=http://127.0.0.1:18092/v1 \
-  uv run shiftedx-agent-harness-proxy
+SCORED_OBSERVER_PID=$!
+start_qualification_proxy "$SCORED_PROXY_CONTAINER"
 ```
 
 Pass that same new path to the runner:
@@ -126,12 +233,25 @@ Pass that same new path to the runner:
 uv run scripts/run_paired_agentic_trial.py \
   --base-url "$PROXY_URL" --model "$PUBLIC_MODEL_ID" --variant proxy \
   --output "$RUN_DIR/proxy.jsonl" --agentic-set expanded --proxy-policy \
+  --api-key-file "$QUALIFICATION_POLICY_API_KEY_FILE" \
   --proxy-observer-ledger "$SCORED_PROXY_OBSERVER_LEDGER" \
   --preflight-ledger "$PREFLIGHT_LEDGER" \
   --candidate-source-commit "$CANDIDATE_SOURCE_COMMIT" \
   --candidate-image-digest "$CANDIDATE_IMAGE_DIGEST" \
   --run-manifest-sha256 "$RUN_MANIFEST_SHA256"
+
+docker stop "$SCORED_PROXY_CONTAINER" >/dev/null
+docker rm "$SCORED_PROXY_CONTAINER" >/dev/null
+kill "$SCORED_OBSERVER_PID"
+wait "$SCORED_OBSERVER_PID" 2>/dev/null || true
+docker volume rm "$QUALIFICATION_SECRETS_VOLUME" >/dev/null
 ```
+
+If the approved model endpoint is unauthenticated, omit together the upstream source mount and
+`upstream_api_key` copy/chmod/chown entries from the initializer, the upstream-key assertion from
+`start_qualification_proxy`, preflight `--direct-api-key-file`, and direct scored `--api-key-file`.
+This leaves the proxy's `UPSTREAM_API_KEY` unset. Do not omit only one side of that direct/proxy
+model-auth contract.
 
 Never invoke either command without the same frozen candidate provenance, model ID, and manifest
 digest; the runner refuses to append to an existing scored output. Proxy scored rows carry only
