@@ -31,7 +31,10 @@ from shiftedx_harness_proxy.qualification_contract import (
     PhasePlanner,
     PreflightFailure,
     PreflightObservation,
+    RuntimeAttestation,
+    RuntimeAttestationFailure,
     SafeFingerprint,
+    load_runtime_attestation,
     model_boundary_fingerprint,
     qualification_contract_digest,
     request_fingerprints,
@@ -524,6 +527,11 @@ def main() -> None:
         type=Path,
         help="Fresh hash-only ledger from a transparent proxy-to-model qualification observer.",
     )
+    parser.add_argument(
+        "--runtime-attestation",
+        type=Path,
+        help="Supervisor-issued allowlisted runtime evidence bound to this exact qualification invocation.",
+    )
     args = parser.parse_args()
 
     selected = scenario_set(args.agentic_set)
@@ -544,10 +552,11 @@ def main() -> None:
         or args.candidate_source_commit is None
         or args.candidate_image_digest is None
         or args.run_manifest_sha256 is None
+        or args.runtime_attestation is None
     ):
         raise SystemExit(
             "scored mode requires --preflight-ledger, --candidate-source-commit, --candidate-image-digest, "
-            "and --run-manifest-sha256"
+            "--run-manifest-sha256, and --runtime-attestation"
         )
     try:
         validate_run_manifest_sha256(args.run_manifest_sha256)
@@ -567,6 +576,8 @@ def main() -> None:
         arm="proxy" if args.proxy_policy else "direct",
         model=args.model,
         run_manifest_sha256=args.run_manifest_sha256,
+        scenario_order=[item.case_id for item in selected],
+        runtime_attestation=args.runtime_attestation,
     )
     api_key = args.api_key_file.read_text().strip() if args.api_key_file is not None else None
     if args.api_key_file is not None and not api_key:
@@ -685,6 +696,27 @@ def _run_paired_preflight(args: argparse.Namespace, selected: list[Any]) -> None
     contract_digests = _qualification_contract_digests(
         args.model, selected, scenario_order, args.run_manifest_sha256
     )
+    runtime_attestation: RuntimeAttestation | None = None
+    try:
+        if args.runtime_attestation is None:
+            raise RuntimeAttestationFailure("runtime_attestation_invalid")
+        runtime_attestation = load_runtime_attestation(
+            args.runtime_attestation,
+            expected_stage="preflight",
+            source_commit=args.candidate_source_commit,
+            image_digest=args.candidate_image_digest,
+            run_manifest_sha256=args.run_manifest_sha256,
+            model=args.model,
+            scenario_order=scenario_order,
+        )
+    except RuntimeAttestationFailure:
+        _record_failed_preflight(
+            args,
+            [],
+            contract_digests,
+            runtime_attestation=None,
+            reason="runtime_attestation_invalid",
+        )
     observations: list[PreflightObservation] = []
     try:
         observer = ModelBoundaryObserverCursor(args.proxy_observer_ledger, scenario_order)
@@ -736,6 +768,7 @@ def _run_paired_preflight(args: argparse.Namespace, selected: list[Any]) -> None
             args,
             observations,
             contract_digests,
+            runtime_attestation=runtime_attestation,
             reason=_preflight_failure_reason(error),
         )
     try:
@@ -746,6 +779,7 @@ def _run_paired_preflight(args: argparse.Namespace, selected: list[Any]) -> None
             image_digest=args.candidate_image_digest,
             contract_digests=contract_digests,
             run_manifest_sha256=args.run_manifest_sha256,
+            runtime_attestation=runtime_attestation,
         )
     except PreflightFailure as error:
         raise SystemExit("paired preflight failed before scored output: preflight_evidence_write_failed") from error
@@ -770,6 +804,7 @@ def _record_failed_preflight(
     observations: list[PreflightObservation],
     contract_digests: dict[str, str],
     *,
+    runtime_attestation: RuntimeAttestation | None,
     reason: str,
 ) -> None:
     with suppress(PreflightFailure):
@@ -780,12 +815,15 @@ def _record_failed_preflight(
             image_digest=args.candidate_image_digest,
             contract_digests=contract_digests,
             run_manifest_sha256=args.run_manifest_sha256,
+            runtime_attestation=runtime_attestation,
             failure_reason=reason,
         )
     raise SystemExit(f"paired preflight failed before scored output: {reason}")
 
 
 def _preflight_failure_reason(error: Exception) -> str:
+    if isinstance(error, RuntimeAttestationFailure):
+        return "runtime_attestation_invalid"
     if isinstance(error, PreflightFailure):
         known = {
             "proxy_phase_metrics_unavailable",

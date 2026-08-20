@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -29,12 +30,17 @@ COMPATIBILITY_VERSION = "shiftedx-phase-plan-v1"
 BENCHMARK_REVISION = "335e6694e4aec13e9370af8a993d8c8f14d7ffb5"
 _IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+_SOURCE_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _FAILURE_CATEGORY = re.compile(r"^[a-z0-9_]+$")
 _SAFE_POLICY_LITERALS = frozenset({"auto", "none", "required", "low", "medium", "high"})
 
 
 class PreflightFailure(RuntimeError):
     """Raised before the runner is permitted to create a scored row."""
+
+
+class RuntimeAttestationFailure(PreflightFailure):
+    """Raised when qualification runtime evidence is missing or invalid."""
 
 
 @dataclass(frozen=True)
@@ -76,6 +82,139 @@ class PreflightObservation:
             "model_facing_contracts": [item.to_dict() for item in self.model_facing],
             "proxy_phase_counts": self.proxy_phase_counts,
         }
+
+
+@dataclass(frozen=True)
+class RuntimeAttestation:
+    """Validated, allowlisted identity of one supervised qualification runtime."""
+
+    stage: Literal["preflight", "scored_proxy"]
+    source_commit: str
+    image_digest: str
+    run_manifest_sha256: str
+    model_id_sha256: str
+    benchmark_revision: str
+    scenario_order_sha256: str
+    scenario_order_count: int
+    runtime_contract_sha256: str
+    runtime_instance_sha256: str
+    checks: dict[str, bool]
+    file_sha256: str
+
+
+def load_runtime_attestation(
+    path: Path,
+    *,
+    expected_stage: Literal["preflight", "scored_proxy"],
+    source_commit: str,
+    image_digest: str,
+    run_manifest_sha256: str,
+    model: str,
+    scenario_order: list[str],
+) -> RuntimeAttestation:
+    """Load runtime evidence and bind it to the exact qualification invocation."""
+    try:
+        file_status = path.lstat()
+        if not stat.S_ISREG(file_status.st_mode) or path.is_symlink():
+            raise RuntimeAttestationFailure("runtime_attestation_invalid")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise RuntimeAttestationFailure("runtime_attestation_invalid")
+            with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                serialized = handle.read()
+        finally:
+            os.close(descriptor)
+        document = json.loads(serialized, object_pairs_hook=_unique_json_object)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise RuntimeAttestationFailure("runtime_attestation_invalid") from error
+    expected_order_sha256 = _sha256(scenario_order)
+    expected_model_sha256 = _sha256(model)
+    root_keys = {
+        "schema_version",
+        "record_type",
+        "status",
+        "stage",
+        "source_commit",
+        "image_digest",
+        "run_manifest_sha256",
+        "model_id_sha256",
+        "benchmark_revision",
+        "scenario_order",
+        "runtime_contract_sha256",
+        "runtime_instance_sha256",
+        "checks",
+    }
+    check_keys = {
+        "exact_image",
+        "settings",
+        "resources",
+        "bind",
+        "observer",
+        "ready",
+        "secret_roles_distinct",
+    }
+    checks = document.get("checks") if isinstance(document, dict) else None
+    order_identity = document.get("scenario_order") if isinstance(document, dict) else None
+    runtime_contract_sha256 = (
+        document.get("runtime_contract_sha256") if isinstance(document, dict) else None
+    )
+    runtime_instance_sha256 = (
+        document.get("runtime_instance_sha256") if isinstance(document, dict) else None
+    )
+    if (
+        not isinstance(document, dict)
+        or set(document) != root_keys
+        or document.get("schema_version") != "1.0"
+        or document.get("record_type") != "qualification_runtime_attestation"
+        or document.get("status") != "passed"
+        or document.get("stage") != expected_stage
+        or _SOURCE_COMMIT.fullmatch(source_commit) is None
+        or document.get("source_commit") != source_commit
+        or _IMAGE_DIGEST.fullmatch(image_digest) is None
+        or document.get("image_digest") != image_digest
+        or _SHA256_HEX.fullmatch(run_manifest_sha256) is None
+        or document.get("run_manifest_sha256") != run_manifest_sha256
+        or document.get("model_id_sha256") != expected_model_sha256
+        or document.get("benchmark_revision") != BENCHMARK_REVISION
+        or not isinstance(order_identity, dict)
+        or set(order_identity) != {"sha256", "count"}
+        or order_identity.get("sha256") != expected_order_sha256
+        or not isinstance(order_identity.get("count"), int)
+        or isinstance(order_identity.get("count"), bool)
+        or order_identity.get("count") != len(scenario_order)
+        or not isinstance(runtime_contract_sha256, str)
+        or _SHA256_HEX.fullmatch(runtime_contract_sha256) is None
+        or not isinstance(runtime_instance_sha256, str)
+        or _SHA256_HEX.fullmatch(runtime_instance_sha256) is None
+        or not isinstance(checks, dict)
+        or set(checks) != check_keys
+        or any(value is not True for value in checks.values())
+    ):
+        raise RuntimeAttestationFailure("runtime_attestation_invalid")
+    return RuntimeAttestation(
+        stage=expected_stage,
+        source_commit=source_commit,
+        image_digest=image_digest,
+        run_manifest_sha256=run_manifest_sha256,
+        model_id_sha256=expected_model_sha256,
+        benchmark_revision=BENCHMARK_REVISION,
+        scenario_order_sha256=expected_order_sha256,
+        scenario_order_count=len(scenario_order),
+        runtime_contract_sha256=runtime_contract_sha256,
+        runtime_instance_sha256=runtime_instance_sha256,
+        checks=checks,
+        file_sha256=hashlib.sha256(serialized).hexdigest(),
+    )
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
 
 
 class PhasePlanner:
@@ -523,6 +662,7 @@ def write_preflight_ledger(
     image_digest: str,
     contract_digests: dict[str, str],
     run_manifest_sha256: str,
+    runtime_attestation: RuntimeAttestation | None = None,
     failure_reason: str | None = None,
 ) -> None:
     """Atomically retain safe evidence for both passed and failed preflights."""
@@ -553,6 +693,15 @@ def write_preflight_ledger(
             "run_manifest_sha256": run_manifest_sha256,
             "qualification_contract_digests": dict(sorted(contract_digests.items())),
             "arm_identity_digests": _arm_identity_digests(observations, run_manifest_sha256),
+            "runtime_attestation_sha256": (
+                runtime_attestation.file_sha256 if runtime_attestation is not None else None
+            ),
+            "runtime_contract_sha256": (
+                runtime_attestation.runtime_contract_sha256 if runtime_attestation is not None else None
+            ),
+            "runtime_instance_sha256": (
+                runtime_attestation.runtime_instance_sha256 if runtime_attestation is not None else None
+            ),
             "failure": failure,
         }
     )
@@ -571,6 +720,8 @@ def require_scoring_gate(
     arm: Literal["direct", "proxy"],
     model: str,
     run_manifest_sha256: str,
+    scenario_order: list[str] | None = None,
+    runtime_attestation: Path | None = None,
 ) -> None:
     """Prohibit scored writes unless a matching paired preflight and immutable provenance exist."""
     if output.exists():
@@ -594,6 +745,31 @@ def require_scoring_gate(
         raise SystemExit("scored mode model identity does not match the paired preflight")
     if (summary.get("qualification_contract_digests") or {}).get(arm) != contract_digest:
         raise SystemExit("scored mode qualification contract does not match the paired preflight")
+    try:
+        if runtime_attestation is None or scenario_order is None:
+            raise RuntimeAttestationFailure("runtime_attestation_invalid")
+        attestation = load_runtime_attestation(
+            runtime_attestation,
+            expected_stage="preflight" if arm == "direct" else "scored_proxy",
+            source_commit=candidate_source_commit,
+            image_digest=candidate_image_digest,
+            run_manifest_sha256=run_manifest_sha256,
+            model=model,
+            scenario_order=scenario_order,
+        )
+    except RuntimeAttestationFailure as error:
+        raise SystemExit("scored mode requires a valid matching runtime attestation") from error
+    if arm == "direct" and (
+        summary.get("runtime_attestation_sha256") != attestation.file_sha256
+        or summary.get("runtime_contract_sha256") != attestation.runtime_contract_sha256
+        or summary.get("runtime_instance_sha256") != attestation.runtime_instance_sha256
+    ):
+        raise SystemExit("scored mode runtime attestation identity does not match the paired preflight")
+    if arm == "proxy":
+        if summary.get("runtime_contract_sha256") != attestation.runtime_contract_sha256:
+            raise SystemExit("scored proxy runtime contract does not match the paired preflight")
+        if summary.get("runtime_instance_sha256") == attestation.runtime_instance_sha256:
+            raise SystemExit("scored proxy requires a fresh runtime instance")
     require_candidate_provenance(candidate_source_commit, candidate_image_digest)
 
 

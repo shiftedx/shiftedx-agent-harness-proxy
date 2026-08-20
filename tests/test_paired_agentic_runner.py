@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import shutil
@@ -16,6 +17,7 @@ from shiftedx_harness_proxy.projection_accounting import (
     LOCAL_PROJECTION_EXTENSION,
     local_projection_accounting,
 )
+from shiftedx_harness_proxy.qualification_contract import BENCHMARK_REVISION
 
 _RUN_MANIFEST_SHA256 = "1" * 64
 
@@ -85,6 +87,13 @@ def test_client_failure_is_recorded_without_response_body_and_run_continues(monk
     ).stdout.strip()
     image_digest = "sha256:" + "0" * 64
     _write_passing_preflight(runner, preflight, source_commit, image_digest)
+    runtime_attestation = _write_runtime_attestation(
+        tmp_path / "scored-proxy-runtime-attestation.json",
+        stage="scored_proxy",
+        source_commit=source_commit,
+        image_digest=image_digest,
+        runtime_instance_sha256="5" * 64,
+    )
     monkeypatch.setattr(
         sys,
         "argv",
@@ -111,6 +120,8 @@ def test_client_failure_is_recorded_without_response_body_and_run_continues(monk
             image_digest,
             "--run-manifest-sha256",
             _RUN_MANIFEST_SHA256,
+            "--runtime-attestation",
+            str(runtime_attestation),
             "--proxy-observer-ledger",
             str(tmp_path / "scored-observer.jsonl"),
         ],
@@ -133,6 +144,48 @@ def test_client_failure_is_recorded_without_response_body_and_run_continues(monk
     serialized = json.dumps(rows)
     assert "private prompt marker" not in serialized
     assert "private body marker" not in serialized
+
+
+def test_scored_mode_rejects_missing_runtime_attestation_before_client_or_output(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    source_commit = _source_commit()
+    image_digest = "sha256:" + "0" * 64
+    preflight = tmp_path / "preflight.jsonl"
+    _write_passing_preflight(runner, preflight, source_commit, image_digest)
+    output = tmp_path / "scored.jsonl"
+
+    class UnexpectedClient:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("runtime attestation must be required before client construction")
+
+    runner.ProjectionAwareOpenAIClient = UnexpectedClient
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_paired_agentic_trial.py",
+            "--base-url",
+            "http://direct.invalid/v1",
+            "--model",
+            "model",
+            "--output",
+            str(output),
+            "--variant",
+            "direct",
+            "--preflight-ledger",
+            str(preflight),
+            "--candidate-source-commit",
+            source_commit,
+            "--candidate-image-digest",
+            image_digest,
+            "--run-manifest-sha256",
+            _RUN_MANIFEST_SHA256,
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="--runtime-attestation"):
+        runner.main()
+    assert not output.exists()
 
 
 def test_contract_fingerprints_are_exact_for_equal_arms_and_never_retain_payloads(monkeypatch):
@@ -414,17 +467,27 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
     runner.ProjectionAwareOpenAIClient = FakeClient
     metric_values = iter(({"acquisition": 0, "finalization": 0}, {"acquisition": 2, "finalization": 1}))
     monkeypatch.setattr(runner, "_phase_metrics", lambda *_args: next(metric_values))
+    source_commit = _source_commit()
+    image_digest = "sha256:" + "0" * 64
+    runtime_attestation = _write_runtime_attestation(
+        tmp_path / "preflight-runtime-attestation.json",
+        stage="preflight",
+        source_commit=source_commit,
+        image_digest=image_digest,
+        scenario_order=[scenario.case_id],
+    )
     args = SimpleNamespace(
         direct_base_url="http://direct.invalid/v1",
         proxy_base_url="http://proxy.invalid/v1",
         proxy_metrics_url="http://metrics.invalid",
         proxy_observer_ledger=observer,
-        candidate_source_commit=_source_commit(),
-        candidate_image_digest="sha256:" + "0" * 64,
+        candidate_source_commit=source_commit,
+        candidate_image_digest=image_digest,
         model="model",
         run_manifest_sha256=_RUN_MANIFEST_SHA256,
         direct_api_key_file=None,
         proxy_api_key_file=None,
+        runtime_attestation=runtime_attestation,
         output=tmp_path / "preflight.jsonl",
     )
 
@@ -438,17 +501,27 @@ def test_stale_proxy_observer_ledger_is_rejected_without_overwriting_it(monkeypa
     observer = tmp_path / "observer.jsonl"
     observer.write_text('{"old":"record"}\n')
     output = tmp_path / "preflight.jsonl"
+    source_commit = _source_commit()
+    image_digest = "sha256:" + "0" * 64
+    runtime_attestation = _write_runtime_attestation(
+        tmp_path / "preflight-runtime-attestation.json",
+        stage="preflight",
+        source_commit=source_commit,
+        image_digest=image_digest,
+        scenario_order=["case-1"],
+    )
     args = SimpleNamespace(
         direct_base_url="http://direct.invalid/v1",
         proxy_base_url="http://proxy.invalid/v1",
         proxy_metrics_url="http://metrics.invalid",
         proxy_observer_ledger=observer,
-        candidate_source_commit=_source_commit(),
-        candidate_image_digest="sha256:" + "0" * 64,
+        candidate_source_commit=source_commit,
+        candidate_image_digest=image_digest,
         model="model",
         run_manifest_sha256=_RUN_MANIFEST_SHA256,
         direct_api_key_file=None,
         proxy_api_key_file=None,
+        runtime_attestation=runtime_attestation,
         output=output,
     )
 
@@ -700,6 +773,94 @@ def test_scoring_gate_rejects_manifest_and_model_identity_mismatch(monkeypatch, 
         )
 
 
+def test_direct_scoring_requires_the_exact_preflight_runtime_attestation(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    source_commit = _source_commit()
+    image_digest = "sha256:" + "0" * 64
+    ledger = tmp_path / "preflight.jsonl"
+    runtime_attestation = _write_passing_preflight(runner, ledger, source_commit, image_digest)
+    summary = next(
+        json.loads(line)
+        for line in ledger.read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["record_type"] == "paired_preflight_summary"
+    )
+
+    runner.require_scoring_gate(
+        output=tmp_path / "direct.jsonl",
+        preflight_ledger=ledger,
+        candidate_source_commit=source_commit,
+        candidate_image_digest=image_digest,
+        contract_digest=summary["qualification_contract_digests"]["direct"],
+        arm="direct",
+        model="model",
+        run_manifest_sha256=_RUN_MANIFEST_SHA256,
+        scenario_order=["case-1", "case-2"],
+        runtime_attestation=runtime_attestation,
+    )
+
+    document = json.loads(runtime_attestation.read_text(encoding="utf-8"))
+    runtime_attestation.write_text(json.dumps(document, indent=2), encoding="utf-8")
+    with pytest.raises(SystemExit, match="runtime attestation identity"):
+        runner.require_scoring_gate(
+            output=tmp_path / "tampered.jsonl",
+            preflight_ledger=ledger,
+            candidate_source_commit=source_commit,
+            candidate_image_digest=image_digest,
+            contract_digest=summary["qualification_contract_digests"]["direct"],
+            arm="direct",
+            model="model",
+            run_manifest_sha256=_RUN_MANIFEST_SHA256,
+            scenario_order=["case-1", "case-2"],
+            runtime_attestation=runtime_attestation,
+        )
+    assert not (tmp_path / "tampered.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    ("runtime_contract_sha256", "runtime_instance_sha256", "message"),
+    [
+        ("9" * 64, "5" * 64, "runtime contract"),
+        ("3" * 64, "4" * 64, "fresh runtime instance"),
+    ],
+)
+def test_proxy_scoring_requires_same_runtime_contract_and_distinct_instance(
+    monkeypatch, tmp_path, runtime_contract_sha256, runtime_instance_sha256, message
+):
+    runner = load_runner(monkeypatch)
+    source_commit = _source_commit()
+    image_digest = "sha256:" + "0" * 64
+    ledger = tmp_path / "preflight.jsonl"
+    _write_passing_preflight(runner, ledger, source_commit, image_digest)
+    summary = next(
+        json.loads(line)
+        for line in ledger.read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["record_type"] == "paired_preflight_summary"
+    )
+    scored_attestation = _write_runtime_attestation(
+        tmp_path / "scored-proxy-runtime-attestation.json",
+        stage="scored_proxy",
+        source_commit=source_commit,
+        image_digest=image_digest,
+        runtime_contract_sha256=runtime_contract_sha256,
+        runtime_instance_sha256=runtime_instance_sha256,
+    )
+
+    with pytest.raises(SystemExit, match=message):
+        runner.require_scoring_gate(
+            output=tmp_path / "proxy.jsonl",
+            preflight_ledger=ledger,
+            candidate_source_commit=source_commit,
+            candidate_image_digest=image_digest,
+            contract_digest=summary["qualification_contract_digests"]["proxy"],
+            arm="proxy",
+            model="model",
+            run_manifest_sha256=_RUN_MANIFEST_SHA256,
+            scenario_order=["case-1", "case-2"],
+            runtime_attestation=scored_attestation,
+        )
+    assert not (tmp_path / "proxy.jsonl").exists()
+
+
 def test_proxy_scored_fingerprints_come_from_new_observer_records_in_turn_order(monkeypatch, tmp_path):
     runner = load_runner(monkeypatch)
     scenario = runner.scenario_set("expanded")[0]
@@ -800,6 +961,13 @@ def test_scored_proxy_cli_requires_a_new_observer_ledger(monkeypatch, tmp_path):
     image_digest = "sha256:" + "0" * 64
     preflight = tmp_path / "preflight.jsonl"
     _write_passing_preflight(runner, preflight, source_commit, image_digest)
+    runtime_attestation = _write_runtime_attestation(
+        tmp_path / "scored-proxy-runtime-attestation.json",
+        stage="scored_proxy",
+        source_commit=source_commit,
+        image_digest=image_digest,
+        runtime_instance_sha256="5" * 64,
+    )
     monkeypatch.setattr(
         sys,
         "argv",
@@ -824,6 +992,8 @@ def test_scored_proxy_cli_requires_a_new_observer_ledger(monkeypatch, tmp_path):
             image_digest,
             "--run-manifest-sha256",
             _RUN_MANIFEST_SHA256,
+            "--runtime-attestation",
+            str(runtime_attestation),
         ],
     )
 
@@ -839,6 +1009,13 @@ def test_scored_proxy_rows_use_actual_observer_fingerprints_and_failures_keep_sa
     observer_path = tmp_path / "scored-observer.jsonl"
     output = tmp_path / "scored.jsonl"
     _write_passing_preflight(runner, preflight, source_commit, image_digest)
+    runtime_attestation = _write_runtime_attestation(
+        tmp_path / "scored-proxy-runtime-attestation.json",
+        stage="scored_proxy",
+        source_commit=source_commit,
+        image_digest=image_digest,
+        runtime_instance_sha256="5" * 64,
+    )
     planner = runner.PhasePlanner()
 
     class ObservingProxy:
@@ -888,6 +1065,8 @@ def test_scored_proxy_rows_use_actual_observer_fingerprints_and_failures_keep_sa
             image_digest,
             "--run-manifest-sha256",
             _RUN_MANIFEST_SHA256,
+            "--runtime-attestation",
+            str(runtime_attestation),
             "--proxy-observer-ledger",
             str(observer_path),
         ],
@@ -918,6 +1097,13 @@ def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_re
     observer_path = tmp_path / "scored-observer.jsonl"
     output = tmp_path / "scored.jsonl"
     _write_passing_preflight(runner, preflight, source_commit, image_digest)
+    runtime_attestation = _write_runtime_attestation(
+        tmp_path / "scored-proxy-runtime-attestation.json",
+        stage="scored_proxy",
+        source_commit=source_commit,
+        image_digest=image_digest,
+        runtime_instance_sha256="5" * 64,
+    )
 
     def complete(self, _payload, *, stream=False):
         assert stream is False
@@ -959,6 +1145,8 @@ def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_re
             image_digest,
             "--run-manifest-sha256",
             _RUN_MANIFEST_SHA256,
+            "--runtime-attestation",
+            str(runtime_attestation),
             "--proxy-observer-ledger",
             str(observer_path),
         ],
@@ -1063,7 +1251,57 @@ def test_metrics_preflight_failure_is_retained_as_categorical_unscored_evidence(
     assert summary["status"] == "failed"
     assert summary["scored"] is False
     assert summary["failure"] == "proxy_phase_metrics_unavailable"
+    assert summary["runtime_attestation_sha256"] == hashlib.sha256(
+        args.runtime_attestation.read_bytes()
+    ).hexdigest()
+    assert summary["runtime_contract_sha256"] == "3" * 64
+    assert summary["runtime_instance_sha256"] == "4" * 64
     assert "metrics.invalid" not in args.output.read_text()
+
+
+def test_missing_runtime_attestation_retains_only_safe_failed_preflight_before_network(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    args = _preflight_args(tmp_path)
+    args.runtime_attestation = None
+
+    def unexpected_network(*_args, **_kwargs):
+        raise AssertionError("runtime attestation must be checked before network")
+
+    monkeypatch.setattr(runner, "_phase_metrics", unexpected_network)
+    monkeypatch.setattr(runner, "ProjectionAwareOpenAIClient", unexpected_network)
+
+    with pytest.raises(SystemExit, match="runtime_attestation_invalid"):
+        runner._run_paired_preflight(args, [runner.scenario_set("expanded")[0]])
+
+    rows = [json.loads(line) for line in args.output.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["record_type"] == "paired_preflight_summary"
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["failure"] == "runtime_attestation_invalid"
+    assert rows[0]["runtime_attestation_sha256"] is None
+    assert rows[0]["runtime_contract_sha256"] is None
+    assert rows[0]["runtime_instance_sha256"] is None
+
+
+def test_tampered_runtime_attestation_never_copies_raw_fields_into_failed_preflight(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    args = _preflight_args(tmp_path)
+    document = json.loads(args.runtime_attestation.read_text(encoding="utf-8"))
+    document["private_prompt"] = "must not enter retained evidence"
+    args.runtime_attestation.write_text(json.dumps(document), encoding="utf-8")
+
+    def unexpected_network(*_args, **_kwargs):
+        raise AssertionError("tampered runtime attestation must be checked before network")
+
+    monkeypatch.setattr(runner, "_phase_metrics", unexpected_network)
+    with pytest.raises(SystemExit, match="runtime_attestation_invalid"):
+        runner._run_paired_preflight(args, [runner.scenario_set("expanded")[0]])
+
+    serialized = args.output.read_text(encoding="utf-8")
+    rows = [json.loads(line) for line in serialized.splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["failure"] == "runtime_attestation_invalid"
+    assert "must not enter retained evidence" not in serialized
 
 
 def test_network_preflight_failure_retains_partial_safe_observation_without_exception_text(monkeypatch, tmp_path):
@@ -1183,19 +1421,78 @@ def _append_observer_record(runner, path, payload, sequence):
 
 
 def _preflight_args(tmp_path):
+    source_commit = _source_commit()
+    image_digest = "sha256:" + "0" * 64
+    runtime_attestation = tmp_path / "preflight-runtime-attestation.json"
+    _write_runtime_attestation(
+        runtime_attestation,
+        stage="preflight",
+        source_commit=source_commit,
+        image_digest=image_digest,
+        model="model",
+        scenario_order=["case-1"],
+        runtime_contract_sha256="3" * 64,
+        runtime_instance_sha256="4" * 64,
+    )
     return SimpleNamespace(
         direct_base_url="http://direct.invalid/v1",
         proxy_base_url="http://proxy.invalid/v1",
         proxy_metrics_url="http://metrics.invalid",
         proxy_observer_ledger=tmp_path / "observer.jsonl",
-        candidate_source_commit=_source_commit(),
-        candidate_image_digest="sha256:" + "0" * 64,
+        candidate_source_commit=source_commit,
+        candidate_image_digest=image_digest,
         model="model",
         run_manifest_sha256=_RUN_MANIFEST_SHA256,
         direct_api_key_file=None,
         proxy_api_key_file=None,
+        runtime_attestation=runtime_attestation,
         output=tmp_path / "preflight.jsonl",
     )
+
+
+def _write_runtime_attestation(
+    path,
+    *,
+    stage,
+    source_commit,
+    image_digest,
+    model="model",
+    scenario_order=("case-1", "case-2"),
+    runtime_contract_sha256="3" * 64,
+    runtime_instance_sha256="4" * 64,
+):
+    canonical_model = json.dumps(model, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    canonical_order = json.dumps(
+        list(scenario_order), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    document = {
+        "schema_version": "1.0",
+        "record_type": "qualification_runtime_attestation",
+        "status": "passed",
+        "stage": stage,
+        "source_commit": source_commit,
+        "image_digest": image_digest,
+        "run_manifest_sha256": _RUN_MANIFEST_SHA256,
+        "model_id_sha256": hashlib.sha256(canonical_model.encode()).hexdigest(),
+        "benchmark_revision": BENCHMARK_REVISION,
+        "scenario_order": {
+            "sha256": hashlib.sha256(canonical_order.encode()).hexdigest(),
+            "count": len(scenario_order),
+        },
+        "runtime_contract_sha256": runtime_contract_sha256,
+        "runtime_instance_sha256": runtime_instance_sha256,
+        "checks": {
+            "exact_image": True,
+            "settings": True,
+            "resources": True,
+            "bind": True,
+            "observer": True,
+            "ready": True,
+            "secret_roles_distinct": True,
+        },
+    }
+    path.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    return path
 
 
 def _write_passing_preflight(runner, output, source_commit, image_digest, contract_digests=None):
@@ -1256,6 +1553,23 @@ def _write_passing_preflight(runner, output, source_commit, image_digest, contra
             )
             for arm in ("direct", "proxy")
         }
+    runtime_attestation_path = output.with_name(f"{output.stem}-runtime-attestation.json")
+    _write_runtime_attestation(
+        runtime_attestation_path,
+        stage="preflight",
+        source_commit=source_commit,
+        image_digest=image_digest,
+        scenario_order=scenario_order,
+    )
+    runtime_attestation = runner.load_runtime_attestation(
+        runtime_attestation_path,
+        expected_stage="preflight",
+        source_commit=source_commit,
+        image_digest=image_digest,
+        run_manifest_sha256=_RUN_MANIFEST_SHA256,
+        model="model",
+        scenario_order=scenario_order,
+    )
     runner.write_preflight_ledger(
         output,
         observations,
@@ -1263,4 +1577,6 @@ def _write_passing_preflight(runner, output, source_commit, image_digest, contra
         image_digest=image_digest,
         contract_digests=contract_digests,
         run_manifest_sha256=_RUN_MANIFEST_SHA256,
+        runtime_attestation=runtime_attestation,
     )
+    return runtime_attestation_path
