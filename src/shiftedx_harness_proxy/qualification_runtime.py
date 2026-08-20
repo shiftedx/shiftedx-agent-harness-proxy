@@ -1,0 +1,1625 @@
+"""Fail-closed private runtime supervision for paired qualification.
+
+The public interface is deliberately small: a frozen manifest, a stage, a
+private run directory, and an action which receives only a :class:`RuntimeLease`.
+Docker, observer-process, secret-volume, and cleanup mechanics remain inside
+this module so a benchmark caller cannot accidentally substitute a ready but
+unapproved proxy.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from types import FrameType
+from typing import Any, Literal, Protocol, cast
+from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
+
+import yaml
+from pydantic import SecretStr
+
+from .config import Settings
+from .core import HARNESS_PROFILE
+from .qualification_contract import BENCHMARK_REVISION
+
+RuntimeStage = Literal["preflight", "score-direct", "score-proxy"]
+AttestationStage = Literal["preflight", "scored_proxy"]
+OutcomeStatus = Literal["passed", "failed", "interrupted"]
+
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_SOURCE_COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+_IMAGE_REFERENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]*$")
+_FAILURE_CATEGORY = re.compile(r"^[a-z0-9_]+$")
+_SETTINGS_KEYS = frozenset(
+    {
+        "deployment_profile",
+        "harness_profile",
+        "upstream_tool_response_capability_mode",
+        "upstream_cache_capability_mode",
+        "telemetry_enabled",
+        "metrics_enabled",
+        "max_internal_retries",
+        "max_upstream_calls",
+        "upstream_timeout_seconds",
+        "total_request_deadline_seconds",
+        "server_connection_limit",
+        "admission_limit",
+        "principal_concurrency_limit",
+        "concurrency_limit",
+        "require_receipt_when_tools_present",
+        "allow_harness_opt_out",
+        "log_level",
+    }
+)
+_SECTION_KEYS = frozenset(
+    {
+        "schema_version",
+        "source_commit",
+        "image",
+        "model",
+        "benchmark",
+        "observer",
+        "proxy",
+        "credentials",
+    }
+)
+_CHECK_KEYS = (
+    "exact_image",
+    "settings",
+    "resources",
+    "bind",
+    "observer",
+    "ready",
+    "secret_roles_distinct",
+)
+_LABEL_PREFIX = "io.shiftedx.qualification"
+_CONTAINER_LISTEN_HOST = "0.0.0.0"  # noqa: S104 - proxy is published only on a loopback host binding
+
+
+class QualificationRuntimeFailure(RuntimeError):
+    """A categorical, non-sensitive runtime qualification failure."""
+
+    def __init__(self, category: str) -> None:
+        if _FAILURE_CATEGORY.fullmatch(category) is None:
+            category = "runtime_internal_failure"
+        super().__init__(category)
+        self.category = category
+
+
+class _RuntimeInterrupted(BaseException):
+    """Internal signal marker; normal cleanup still runs in ``finally``."""
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    """Captured command status without requiring callers to expose command output."""
+
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+class ManagedProcess(Protocol):
+    """The small process seam used only by the supervisor implementation/tests."""
+
+    def poll(self) -> int | None: ...
+
+    def terminate(self) -> None: ...
+
+    def wait(self, timeout: float | None = None) -> int: ...
+
+    def kill(self) -> None: ...
+
+
+class RuntimeCommandRunner(Protocol):
+    """Adapter for Docker commands, observer process lifecycle, and health probes."""
+
+    def run(
+        self, argv: tuple[str, ...], *, env: dict[str, str] | None = None, timeout: float | None = None
+    ) -> CommandResult: ...
+
+    def spawn(self, argv: tuple[str, ...], *, env: dict[str, str]) -> ManagedProcess: ...
+
+    def http_status(self, url: str, *, headers: dict[str, str] | None = None, timeout: float = 5.0) -> int: ...
+
+    def http_json(
+        self, url: str, *, headers: dict[str, str] | None = None, timeout: float = 5.0
+    ) -> tuple[int, dict[str, Any] | None]: ...
+
+
+class SubprocessRuntimeCommandRunner:
+    """Production adapter. It never interpolates secret values into command arguments."""
+
+    def run(
+        self, argv: tuple[str, ...], *, env: dict[str, str] | None = None, timeout: float | None = None
+    ) -> CommandResult:
+        try:
+            completed = subprocess.run(  # noqa: S603 - fixed executable vectors are assembled internally
+                list(argv),
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+                timeout=timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return CommandResult(125, "", "")
+        return CommandResult(completed.returncode, completed.stdout, completed.stderr)
+
+    def spawn(self, argv: tuple[str, ...], *, env: dict[str, str]) -> ManagedProcess:
+        return cast(
+            ManagedProcess,
+            subprocess.Popen(  # noqa: S603 - fixed observer module vector assembled internally
+                list(argv), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            ),
+        )
+
+    def http_status(self, url: str, *, headers: dict[str, str] | None = None, timeout: float = 5.0) -> int:
+        request = Request(url, headers=headers or {})  # noqa: S310 - manifest-validated private URL
+        try:
+            with urlopen(request, timeout=timeout) as response:  # noqa: S310 - manifest-validated private URL
+                return int(response.status)
+        except Exception as error:
+            status = getattr(error, "code", None)
+            return status if isinstance(status, int) else 0
+
+    def http_json(
+        self, url: str, *, headers: dict[str, str] | None = None, timeout: float = 5.0
+    ) -> tuple[int, dict[str, Any] | None]:
+        request = Request(url, headers=headers or {})  # noqa: S310 - manifest-validated private URL
+        try:
+            with urlopen(request, timeout=timeout) as response:  # noqa: S310 - manifest-validated private URL
+                document = json.loads(response.read().decode("utf-8"))
+                return response.status, document if isinstance(document, dict) else None
+        except Exception as error:
+            status = getattr(error, "code", None)
+            return (status if isinstance(status, int) else 0), None
+
+
+@dataclass(frozen=True)
+class RuntimeLease:
+    """The runner-facing qualification lease; it intentionally hides Docker/process details."""
+
+    stage: RuntimeStage
+    run_manifest_sha256: str
+    source_commit: str
+    image_digest: str
+    model: str
+    benchmark_revision: str
+    agentic_set: str
+    scenario_order_sha256: str
+    scenario_count: int
+    direct_base_url: str
+    direct_api_key_file: Path | None
+    proxy_base_url: str | None
+    proxy_metrics_url: str | None
+    proxy_api_key_file: Path | None
+    observer_ledger: Path | None
+    preflight_ledger: Path
+    output_ledger: Path
+    attestation_path: Path | None
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """Categorical action/cleanup result; it contains no routes, paths, or secret material."""
+
+    stage: RuntimeStage
+    status: OutcomeStatus
+    action_exit_code: int | None
+    failure_category: str | None
+    attestation_path: Path | None
+    outcome_path: Path | None
+
+
+@dataclass(frozen=True)
+class _ImageSpec:
+    reference: str
+    digest: str
+    uid: int
+    gid: int
+
+
+@dataclass(frozen=True)
+class _ModelSpec:
+    public_id: str
+    upstream_url: str
+    upstream_authenticated: bool
+
+
+@dataclass(frozen=True)
+class _BenchmarkSpec:
+    revision: str
+    agentic_set: str
+    scenario_order_sha256: str
+    scenario_count: int
+
+
+@dataclass(frozen=True)
+class _ObserverSpec:
+    host: str
+    port: int
+    container_url: str
+
+
+@dataclass(frozen=True)
+class _ProxySpec:
+    host: str
+    port: int
+    container_port: int
+    cpus: Decimal
+    memory_bytes: int
+    pids_limit: int
+    stop_timeout_seconds: int
+    settings: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _CredentialSpec:
+    ordinary_proxy_api_key_file: Path
+    qualification_policy_api_key_file: Path
+    upstream_model_api_key_file: Path | None
+
+
+@dataclass(frozen=True)
+class _RuntimeSpec:
+    manifest_sha256: str
+    source_commit: str
+    image: _ImageSpec
+    model: _ModelSpec
+    benchmark: _BenchmarkSpec
+    observer: _ObserverSpec
+    proxy: _ProxySpec
+    credentials: _CredentialSpec
+
+
+def supervise_qualification_runtime(
+    *,
+    manifest: Path,
+    stage: RuntimeStage,
+    private_run_dir: Path,
+    action: Callable[[RuntimeLease], int],
+    command_runner: RuntimeCommandRunner | None = None,
+) -> Outcome:
+    """Lease a manifest-derived qualification runtime, invoke ``action``, then clean it.
+
+    A successful proxy stage writes a fixed, hash-only attestation before the action begins.  The
+    outcome is a separate no-clobber artifact written only after cleanup, so neither the attestation
+    nor benchmark evidence is rewritten on failure.
+    """
+
+    runner = command_runner or SubprocessRuntimeCommandRunner()
+    previous_handlers = _install_interruption_handlers()
+    status: OutcomeStatus = "failed"
+    failure_category: str | None = None
+    action_exit_code: int | None = None
+    attestation_path: Path | None = None
+    outcome_path: Path | None = None
+    observer: ManagedProcess | None = None
+    container_id: str | None = None
+    volume_name: str | None = None
+    spec: _RuntimeSpec | None = None
+    instance: str | None = None
+
+    try:
+        _validate_stage(stage)
+        _validate_private_run_dir(private_run_dir)
+        candidate_outcome_path = _outcome_path(private_run_dir, stage)
+        if candidate_outcome_path.exists() or candidate_outcome_path.is_symlink():
+            raise QualificationRuntimeFailure("runtime_outcome_exists")
+        outcome_path = candidate_outcome_path
+        spec = _load_runtime_spec(manifest)
+        _validate_stage_evidence_absent(private_run_dir, stage)
+        if stage == "score-direct":
+            attestation_path = _validate_existing_preflight_attestation(private_run_dir, spec)
+            lease = _direct_lease(spec, stage, private_run_dir, attestation_path)
+            action_exit_code = _invoke_action(action, lease)
+            if action_exit_code == 0:
+                status = "passed"
+            else:
+                failure_category = "action_failed"
+        else:
+            if stage == "score-proxy":
+                _validate_existing_preflight_attestation(private_run_dir, spec)
+            _validate_credentials(spec.credentials, upstream_authenticated=spec.model.upstream_authenticated)
+            _assert_port_available(spec.proxy.host, spec.proxy.port, "proxy_port_unavailable")
+            _assert_port_available(spec.observer.host, spec.observer.port, "observer_port_unavailable")
+            instance = _instance_token(spec.manifest_sha256, stage)
+            _assert_no_stale_owned_resources(runner, spec.manifest_sha256)
+            image_id = _inspect_exact_image(runner, spec.image)
+            new_volume_name = _volume_name(instance)
+            _create_volume(runner, new_volume_name, spec.manifest_sha256, instance, stage)
+            volume_name = new_volume_name
+            _initialize_secrets(runner, spec, volume_name, instance, stage)
+            observer_ledger = _observer_ledger_path(private_run_dir, stage)
+            observer_identity = _observer_identity(spec.manifest_sha256, instance)
+            observer = _start_observer(runner, spec, observer_ledger, observer_identity)
+            _wait_for_observer(runner, spec.observer, observer_identity)
+            _validate_fresh_observer_ledger(observer_ledger)
+            container_id = _launch_proxy(runner, spec, volume_name, instance, stage)
+            _verify_proxy(
+                runner,
+                spec,
+                image_id=image_id,
+                container_id=container_id,
+                volume_name=volume_name,
+                instance=instance,
+                stage=stage,
+            )
+            _wait_for_proxy(runner, spec.proxy)
+            _verify_proxy_auth_and_metrics(runner, container_id, spec)
+            _ensure_live(observer, runner, container_id, spec, image_id, volume_name, instance, stage)
+            attestation_path = _attestation_path(private_run_dir, stage)
+            _write_attestation(attestation_path, spec, stage, instance, image_id)
+            lease = _proxy_lease(spec, stage, private_run_dir, observer_ledger, attestation_path)
+            action_exit_code = _invoke_action(action, lease)
+            _ensure_live(observer, runner, container_id, spec, image_id, volume_name, instance, stage)
+            if action_exit_code == 0:
+                status = "passed"
+            else:
+                failure_category = "action_failed"
+    except _RuntimeInterrupted:
+        status = "interrupted"
+        failure_category = "runtime_interrupted"
+    except KeyboardInterrupt:
+        status = "interrupted"
+        failure_category = "runtime_interrupted"
+    except QualificationRuntimeFailure as error:
+        failure_category = error.category
+    except Exception:
+        failure_category = "runtime_internal_failure"
+    finally:
+        _restore_interruption_handlers(previous_handlers)
+        if _cleanup_runtime(
+            runner,
+            observer,
+            container_id,
+            volume_name,
+            spec_manifest_sha256=spec.manifest_sha256 if spec is not None else None,
+            instance=instance,
+        ):
+            status = "failed"
+            failure_category = "runtime_cleanup_failed"
+
+    if outcome_path is not None:
+        try:
+            _write_outcome(outcome_path, stage, status, action_exit_code, failure_category, attestation_path)
+        except QualificationRuntimeFailure as error:
+            return Outcome(stage, "failed", action_exit_code, error.category, attestation_path, None)
+    return Outcome(stage, status, action_exit_code, failure_category, attestation_path, outcome_path)
+
+
+def _validate_stage(stage: RuntimeStage) -> None:
+    if stage not in {"preflight", "score-direct", "score-proxy"}:
+        raise QualificationRuntimeFailure("runtime_stage_invalid")
+
+
+def _validate_private_run_dir(path: Path) -> None:
+    try:
+        file_status = path.lstat()
+    except OSError as error:
+        raise QualificationRuntimeFailure("private_run_dir_invalid") from error
+    if not path.is_dir() or path.is_symlink() or stat.S_IMODE(file_status.st_mode) != 0o700:
+        raise QualificationRuntimeFailure("private_run_dir_invalid")
+
+
+def _load_runtime_spec(manifest: Path) -> _RuntimeSpec:
+    try:
+        manifest_bytes = manifest.read_bytes()
+        document = yaml.safe_load(manifest_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as error:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid") from error
+    if not isinstance(document, dict):
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    section = document.get("qualification_runtime")
+    if not isinstance(section, dict) or set(section) != _SECTION_KEYS:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    source_commit = _exact_string(section, "source_commit", _SOURCE_COMMIT)
+    if section.get("schema_version") != "1.0":
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    image = _parse_image(section.get("image"))
+    model = _parse_model(section.get("model"))
+    benchmark = _parse_benchmark(section.get("benchmark"))
+    observer = _parse_observer(section.get("observer"))
+    proxy = _parse_proxy(section.get("proxy"), observer)
+    credentials = _parse_credentials(section.get("credentials"), model.upstream_authenticated)
+    _validate_settings(proxy.settings, observer.container_url, proxy.container_port, model.upstream_authenticated)
+    return _RuntimeSpec(manifest_sha256, source_commit, image, model, benchmark, observer, proxy, credentials)
+
+
+def _parse_image(value: Any) -> _ImageSpec:
+    image = _exact_object(value, {"reference", "digest", "uid", "gid"})
+    reference = _required_text(image.get("reference"))
+    digest = _exact_string(image, "digest", _DIGEST)
+    if (
+        _IMAGE_REFERENCE.fullmatch(reference) is None
+        or reference.count("@") != 1
+        or not reference.endswith("@" + digest)
+    ):
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    uid = _positive_int(image.get("uid"))
+    gid = _positive_int(image.get("gid"))
+    if uid != 10001 or gid != 10001:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    return _ImageSpec(reference, digest, uid, gid)
+
+
+def _parse_model(value: Any) -> _ModelSpec:
+    model = _exact_object(value, {"public_id", "upstream_url", "upstream_authenticated"})
+    public_id = _required_text(model.get("public_id"))
+    upstream_url = _safe_absolute_http_url(_required_text(model.get("upstream_url")))
+    authenticated = model.get("upstream_authenticated")
+    if not isinstance(authenticated, bool):
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    return _ModelSpec(public_id, upstream_url, authenticated)
+
+
+def _parse_benchmark(value: Any) -> _BenchmarkSpec:
+    benchmark = _exact_object(value, {"revision", "agentic_set", "scenario_order_sha256", "scenario_count"})
+    revision = _required_text(benchmark.get("revision"))
+    if revision != BENCHMARK_REVISION:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    agentic_set = _required_text(benchmark.get("agentic_set"))
+    if agentic_set not in {"core", "expanded", "repo"}:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    order_hash = _exact_string(benchmark, "scenario_order_sha256", _SHA256)
+    count = _positive_int(benchmark.get("scenario_count"))
+    return _BenchmarkSpec(revision, agentic_set, order_hash, count)
+
+
+def _parse_observer(value: Any) -> _ObserverSpec:
+    observer = _exact_object(value, {"host", "port", "container_url"})
+    host = _loopback_host(_required_text(observer.get("host")))
+    port = _port(observer.get("port"))
+    container_url = _safe_absolute_http_url(_required_text(observer.get("container_url")))
+    parsed = urlsplit(container_url)
+    if parsed.port != port:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    return _ObserverSpec(host, port, container_url)
+
+
+def _parse_proxy(value: Any, observer: _ObserverSpec) -> _ProxySpec:
+    proxy = _exact_object(
+        value,
+        {
+            "host",
+            "port",
+            "container_port",
+            "cpus",
+            "memory_bytes",
+            "pids_limit",
+            "stop_timeout_seconds",
+            "settings",
+        },
+    )
+    host = _loopback_host(_required_text(proxy.get("host")))
+    port = _port(proxy.get("port"))
+    container_port = _port(proxy.get("container_port"))
+    if host == observer.host and port == observer.port:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    cpus = _positive_decimal(proxy.get("cpus"))
+    memory_bytes = _positive_int(proxy.get("memory_bytes"))
+    pids_limit = _positive_int(proxy.get("pids_limit"))
+    stop_timeout_seconds = _positive_int(proxy.get("stop_timeout_seconds"))
+    settings = _exact_object(proxy.get("settings"), _SETTINGS_KEYS)
+    return _ProxySpec(host, port, container_port, cpus, memory_bytes, pids_limit, stop_timeout_seconds, settings)
+
+
+def _parse_credentials(value: Any, upstream_authenticated: bool) -> _CredentialSpec:
+    credentials = _exact_object(
+        value,
+        {
+            "ordinary_proxy_api_key_file",
+            "qualification_policy_api_key_file",
+            "upstream_model_api_key_file",
+        },
+    )
+    ordinary = _absolute_path(credentials.get("ordinary_proxy_api_key_file"))
+    policy = _absolute_path(credentials.get("qualification_policy_api_key_file"))
+    upstream_value = credentials.get("upstream_model_api_key_file")
+    if upstream_authenticated:
+        upstream = _absolute_path(upstream_value)
+    elif upstream_value is None:
+        upstream = None
+    else:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    return _CredentialSpec(ordinary, policy, upstream)
+
+
+def _validate_settings(
+    settings: dict[str, Any], observer_url: str, container_port: int, upstream_authenticated: bool
+) -> None:
+    if (
+        settings["deployment_profile"] != "production"
+        or settings["harness_profile"] != HARNESS_PROFILE
+        or settings["upstream_tool_response_capability_mode"] != "phase_split"
+        or settings["upstream_cache_capability_mode"] != "disabled"
+        or settings["telemetry_enabled"] is not True
+        or settings["metrics_enabled"] is not True
+    ):
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    try:
+        Settings(
+            upstream_base_url=observer_url,
+            upstream_api_key=SecretStr("runtime-upstream-placeholder") if upstream_authenticated else None,
+            proxy_api_key=SecretStr("runtime-ordinary-placeholder"),
+            trusted_policy_extension_api_keys=SecretStr("runtime-policy-placeholder"),
+            listen_host=_CONTAINER_LISTEN_HOST,
+            listen_port=container_port,
+            **settings,
+        )
+    except Exception as error:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid") from error
+
+
+def _validate_credentials(credentials: _CredentialSpec, *, upstream_authenticated: bool) -> None:
+    paths = [credentials.ordinary_proxy_api_key_file, credentials.qualification_policy_api_key_file]
+    if upstream_authenticated:
+        if credentials.upstream_model_api_key_file is None:
+            raise QualificationRuntimeFailure("runtime_credential_invalid")
+        paths.append(credentials.upstream_model_api_key_file)
+    if len(set(paths)) != len(paths):
+        raise QualificationRuntimeFailure("runtime_credential_invalid")
+    for path in paths:
+        try:
+            file_status = path.lstat()
+        except OSError as error:
+            raise QualificationRuntimeFailure("runtime_credential_invalid") from error
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or stat.S_IMODE(file_status.st_mode) != 0o600
+            or file_status.st_size <= 0
+        ):
+            raise QualificationRuntimeFailure("runtime_credential_invalid")
+
+
+def _assert_port_available(host: str, port: int, category: str) -> None:
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    probe = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        probe.bind((host, port))
+    except OSError as error:
+        raise QualificationRuntimeFailure(category) from error
+    finally:
+        probe.close()
+
+
+def _assert_no_stale_owned_resources(runner: RuntimeCommandRunner, manifest_sha256: str) -> None:
+    """Reject prior supervisor-owned resources; never delete a stale run automatically."""
+
+    manifest_label = f"{_LABEL_PREFIX}.manifest={manifest_sha256}"
+    for argv in (
+        (
+            "docker",
+            "container",
+            "ls",
+            "--all",
+            "--quiet",
+            "--filter",
+            "label=" + manifest_label,
+        ),
+        (
+            "docker",
+            "volume",
+            "ls",
+            "--quiet",
+            "--filter",
+            "label=" + manifest_label,
+        ),
+    ):
+        result = runner.run(argv)
+        if result.returncode != 0:
+            raise QualificationRuntimeFailure("runtime_docker_unavailable")
+        if result.stdout.strip():
+            raise QualificationRuntimeFailure("runtime_stale_resources")
+
+
+def _inspect_exact_image(runner: RuntimeCommandRunner, image: _ImageSpec) -> str:
+    result = runner.run(("docker", "image", "inspect", "--format", "{{json .}}", image.reference))
+    if result.returncode != 0:
+        raise QualificationRuntimeFailure("runtime_image_unavailable")
+    document = _parse_command_json(result.stdout, "runtime_image_unavailable")
+    image_id = document.get("Id")
+    config = document.get("Config")
+    if (
+        not isinstance(image_id, str)
+        or _DIGEST.fullmatch(image_id) is None
+        or document.get("Architecture") != "arm64"
+        or not isinstance(config, dict)
+        or config.get("User") != "10001:10001"
+    ):
+        raise QualificationRuntimeFailure("runtime_image_unavailable")
+    return image_id
+
+
+def _create_volume(
+    runner: RuntimeCommandRunner, volume_name: str, manifest_sha256: str, instance: str, stage: RuntimeStage
+) -> None:
+    result = runner.run(
+        (
+            "docker",
+            "volume",
+            "create",
+            "--label",
+            f"{_LABEL_PREFIX}.manifest={manifest_sha256}",
+            "--label",
+            f"{_LABEL_PREFIX}.instance={instance}",
+            "--label",
+            f"{_LABEL_PREFIX}.stage={_attestation_stage(stage)}",
+            volume_name,
+        )
+    )
+    if result.returncode != 0:
+        raise QualificationRuntimeFailure("runtime_volume_create_failed")
+
+
+def _initialize_secrets(
+    runner: RuntimeCommandRunner,
+    spec: _RuntimeSpec,
+    volume_name: str,
+    instance: str,
+    stage: RuntimeStage,
+) -> None:
+    source_mounts: list[tuple[Path, str]] = [
+        (spec.credentials.ordinary_proxy_api_key_file, "proxy_api_key"),
+        (spec.credentials.qualification_policy_api_key_file, "trusted_policy_extension_api_keys"),
+    ]
+    if spec.model.upstream_authenticated:
+        assert spec.credentials.upstream_model_api_key_file is not None
+        source_mounts.append((spec.credentials.upstream_model_api_key_file, "upstream_api_key"))
+    script = _initializer_script(spec.model.upstream_authenticated)
+    argv: list[str] = [
+        "docker",
+        "run",
+        "--rm",
+        "--pull",
+        "never",
+        "--network",
+        "none",
+        "--read-only",
+        "--user",
+        "0:0",
+        "--cap-drop",
+        "ALL",
+        "--cap-add",
+        "CHOWN",
+        "--cap-add",
+        "DAC_OVERRIDE",
+        "--security-opt",
+        "no-new-privileges:true",
+        "--label",
+        f"{_LABEL_PREFIX}.instance={instance}",
+        "--label",
+        f"{_LABEL_PREFIX}.stage={_attestation_stage(stage)}",
+    ]
+    for path, target_name in source_mounts:
+        argv.extend(("--mount", f"type=bind,src={path},dst=/source/{target_name},readonly"))
+    argv.extend(
+        (
+            "--mount",
+            f"type=volume,src={volume_name},dst=/target",
+            "--entrypoint",
+            "/bin/sh",
+            spec.image.reference,
+            "-ceu",
+            script,
+        )
+    )
+    result = runner.run(tuple(argv))
+    if result.returncode != 0:
+        raise QualificationRuntimeFailure("runtime_secret_initialize_failed")
+
+
+def _initializer_script(upstream_authenticated: bool) -> str:
+    names = ["proxy_api_key", "trusted_policy_extension_api_keys"]
+    if upstream_authenticated:
+        names.append("upstream_api_key")
+    copy_lines = "\n".join(f"cp /source/{name} /target/{name}" for name in names)
+    joined = " ".join(f"/target/{name}" for name in names)
+    comparisons = "\n".join(
+        f"! cmp -s /source/{left} /source/{right}" for index, left in enumerate(names) for right in names[index + 1 :]
+    )
+    ownership_checks = "\n".join(
+        (
+            "python - <<'PY'",
+            "import os",
+            "import stat",
+            f"for name in {names!r}:",
+            "    status = os.stat('/target/' + name)",
+            "    assert status.st_uid == 10001 and status.st_gid == 10001",
+            "    assert stat.S_IMODE(status.st_mode) == 0o400",
+            "PY",
+        )
+    )
+    return "\n".join(
+        (
+            "set -eu",
+            "command -v cp >/dev/null",
+            "command -v chmod >/dev/null",
+            "command -v chown >/dev/null",
+            "command -v cmp >/dev/null",
+            "command -v python >/dev/null",
+            "test -s /source/proxy_api_key",
+            "test -s /source/trusted_policy_extension_api_keys",
+            *( ["test -s /source/upstream_api_key"] if upstream_authenticated else [] ),
+            comparisons,
+            copy_lines,
+            f"chmod 0400 {joined}",
+            f"chown 10001:10001 {joined}",
+            ownership_checks,
+        )
+    )
+
+
+def _start_observer(
+    runner: RuntimeCommandRunner, spec: _RuntimeSpec, ledger: Path, observer_identity: str
+) -> ManagedProcess:
+    env = {
+        "QUALIFICATION_OBSERVER_UPSTREAM": spec.model.upstream_url,
+        "QUALIFICATION_OBSERVER_LEDGER": str(ledger),
+        "QUALIFICATION_OBSERVER_HOST": spec.observer.host,
+        "QUALIFICATION_OBSERVER_PORT": str(spec.observer.port),
+        "QUALIFICATION_OBSERVER_INSTANCE_SHA256": observer_identity,
+    }
+    try:
+        return runner.spawn((sys.executable, "-m", "shiftedx_harness_proxy.qualification_observer"), env=env)
+    except Exception as error:
+        raise QualificationRuntimeFailure("runtime_observer_start_failed") from error
+
+
+def _wait_for_observer(runner: RuntimeCommandRunner, observer: _ObserverSpec, observer_identity: str) -> None:
+    url = f"http://{_url_host(observer.host)}:{observer.port}/healthz"
+    for _ in range(20):
+        status, body = runner.http_json(url, timeout=1.0)
+        if status == 200 and body == {"status": "live", "instance_sha256": observer_identity}:
+            return
+        time.sleep(0.05)
+    raise QualificationRuntimeFailure("runtime_observer_unhealthy")
+
+
+def _validate_fresh_observer_ledger(path: Path) -> None:
+    """Require the owned observer to have atomically reserved a new private ledger."""
+
+    try:
+        file_status = path.lstat()
+    except OSError as error:
+        raise QualificationRuntimeFailure("runtime_observer_ledger_invalid") from error
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(file_status.st_mode)
+        or stat.S_IMODE(file_status.st_mode) != 0o600
+        or file_status.st_size != 0
+    ):
+        raise QualificationRuntimeFailure("runtime_observer_ledger_invalid")
+
+
+def _launch_proxy(
+    runner: RuntimeCommandRunner, spec: _RuntimeSpec, volume_name: str, instance: str, stage: RuntimeStage
+) -> str:
+    name = _container_name(instance, stage)
+    settings = spec.proxy.settings
+    env_values = {
+        "DEPLOYMENT_PROFILE": settings["deployment_profile"],
+        "HARNESS_PROFILE": settings["harness_profile"],
+        "UPSTREAM_BASE_URL": spec.observer.container_url,
+        "UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE": settings["upstream_tool_response_capability_mode"],
+        "UPSTREAM_CACHE_CAPABILITY_MODE": settings["upstream_cache_capability_mode"],
+        "TELEMETRY_ENABLED": _env_bool(settings["telemetry_enabled"]),
+        "METRICS_ENABLED": _env_bool(settings["metrics_enabled"]),
+        "MAX_INTERNAL_RETRIES": str(settings["max_internal_retries"]),
+        "MAX_UPSTREAM_CALLS": str(settings["max_upstream_calls"]),
+        "UPSTREAM_TIMEOUT_SECONDS": str(settings["upstream_timeout_seconds"]),
+        "TOTAL_REQUEST_DEADLINE_SECONDS": str(settings["total_request_deadline_seconds"]),
+        "SERVER_CONNECTION_LIMIT": str(settings["server_connection_limit"]),
+        "ADMISSION_LIMIT": str(settings["admission_limit"]),
+        "PRINCIPAL_CONCURRENCY_LIMIT": str(settings["principal_concurrency_limit"]),
+        "CONCURRENCY_LIMIT": str(settings["concurrency_limit"]),
+        "REQUIRE_RECEIPT_WHEN_TOOLS_PRESENT": _env_bool(settings["require_receipt_when_tools_present"]),
+        "ALLOW_HARNESS_OPT_OUT": _env_bool(settings["allow_harness_opt_out"]),
+        "LOG_LEVEL": settings["log_level"],
+        "LISTEN_HOST": _CONTAINER_LISTEN_HOST,
+        "LISTEN_PORT": str(spec.proxy.container_port),
+    }
+    argv: list[str] = [
+        "docker",
+        "run",
+        "--detach",
+        "--pull",
+        "never",
+        "--name",
+        name,
+        "--init",
+        "--stop-timeout",
+        str(spec.proxy.stop_timeout_seconds),
+        "--user",
+        f"{spec.image.uid}:{spec.image.gid}",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges:true",
+        "--pids-limit",
+        str(spec.proxy.pids_limit),
+        "--cpus",
+        _decimal_text(spec.proxy.cpus),
+        "--memory",
+        str(spec.proxy.memory_bytes),
+        "--publish",
+        f"{spec.proxy.host}:{spec.proxy.port}:{spec.proxy.container_port}",
+        "--mount",
+        f"type=volume,src={volume_name},dst=/run/secrets,readonly",
+        "--label",
+        f"{_LABEL_PREFIX}.manifest={spec.manifest_sha256}",
+        "--label",
+        f"{_LABEL_PREFIX}.instance={instance}",
+        "--label",
+        f"{_LABEL_PREFIX}.stage={_attestation_stage(stage)}",
+    ]
+    for key, value in env_values.items():
+        argv.extend(("--env", f"{key}={value}"))
+    argv.append(spec.image.reference)
+    result = runner.run(tuple(argv))
+    container_id = result.stdout.strip()
+    if result.returncode != 0 or _SHA256.fullmatch(container_id) is None:
+        raise QualificationRuntimeFailure("runtime_proxy_launch_failed")
+    return container_id
+
+
+def _verify_proxy(
+    runner: RuntimeCommandRunner,
+    spec: _RuntimeSpec,
+    *,
+    image_id: str,
+    container_id: str,
+    volume_name: str,
+    instance: str,
+    stage: RuntimeStage,
+) -> None:
+    result = runner.run(("docker", "container", "inspect", "--format", "{{json .}}", container_id))
+    if result.returncode != 0:
+        raise QualificationRuntimeFailure("runtime_inspect_drift")
+    document = _parse_command_json(result.stdout, "runtime_inspect_drift")
+    if document.get("State", {}).get("Running") is not True or document.get("Image") != image_id:
+        raise QualificationRuntimeFailure("runtime_inspect_drift")
+    config = document.get("Config")
+    host_config = document.get("HostConfig")
+    mounts = document.get("Mounts")
+    if not isinstance(config, dict) or not isinstance(host_config, dict) or not isinstance(mounts, list):
+        raise QualificationRuntimeFailure("runtime_inspect_drift")
+    if config.get("User") != f"{spec.image.uid}:{spec.image.gid}":
+        raise QualificationRuntimeFailure("runtime_inspect_drift")
+    labels = config.get("Labels")
+    expected_labels = {
+        f"{_LABEL_PREFIX}.manifest": spec.manifest_sha256,
+        f"{_LABEL_PREFIX}.instance": instance,
+        f"{_LABEL_PREFIX}.stage": _attestation_stage(stage),
+    }
+    if not isinstance(labels, dict) or any(labels.get(key) != value for key, value in expected_labels.items()):
+        raise QualificationRuntimeFailure("runtime_inspect_drift")
+    _verify_resources(host_config, spec.proxy)
+    expected_mount = next(
+        (
+            mount
+            for mount in mounts
+            if isinstance(mount, dict)
+            and mount.get("Type") == "volume"
+            and mount.get("Name") == volume_name
+            and mount.get("Destination") == "/run/secrets"
+        ),
+        None,
+    )
+    if not isinstance(expected_mount, dict) or expected_mount.get("RW") is not False:
+        raise QualificationRuntimeFailure("runtime_inspect_drift")
+    _verify_port_binding(host_config, spec.proxy)
+    _verify_proxy_environment(config.get("Env"), spec)
+    volume_result = runner.run(("docker", "volume", "inspect", "--format", "{{json .}}", volume_name))
+    if volume_result.returncode != 0:
+        raise QualificationRuntimeFailure("runtime_inspect_drift")
+    volume = _parse_command_json(volume_result.stdout, "runtime_inspect_drift")
+    volume_labels = volume.get("Labels")
+    if not isinstance(volume_labels, dict) or any(
+        volume_labels.get(key) != value for key, value in expected_labels.items()
+    ):
+        raise QualificationRuntimeFailure("runtime_inspect_drift")
+
+
+def _verify_resources(host_config: dict[str, Any], proxy: _ProxySpec) -> None:
+    security_options = host_config.get("SecurityOpt")
+    cap_drop = host_config.get("CapDrop")
+    if (
+        host_config.get("ReadonlyRootfs") is not True
+        or not isinstance(cap_drop, list)
+        or "ALL" not in cap_drop
+        or not isinstance(security_options, list)
+        or "no-new-privileges:true" not in security_options
+        or host_config.get("PidsLimit") != proxy.pids_limit
+        or host_config.get("Memory") != proxy.memory_bytes
+        or host_config.get("NanoCpus") != int(proxy.cpus * Decimal("1000000000"))
+        or host_config.get("Init") is not True
+    ):
+        raise QualificationRuntimeFailure("runtime_inspect_drift")
+
+
+def _verify_port_binding(host_config: dict[str, Any], proxy: _ProxySpec) -> None:
+    bindings = host_config.get("PortBindings")
+    if not isinstance(bindings, dict):
+        raise QualificationRuntimeFailure("runtime_inspect_drift")
+    entries = bindings.get(f"{proxy.container_port}/tcp")
+    if not isinstance(entries, list) or len(entries) != 1 or not isinstance(entries[0], dict):
+        raise QualificationRuntimeFailure("runtime_inspect_drift")
+    if entries[0].get("HostIp") != proxy.host or entries[0].get("HostPort") != str(proxy.port):
+        raise QualificationRuntimeFailure("runtime_inspect_drift")
+
+
+def _verify_proxy_environment(value: Any, spec: _RuntimeSpec) -> None:
+    if not isinstance(value, list) or any(not isinstance(item, str) or "=" not in item for item in value):
+        raise QualificationRuntimeFailure("runtime_inspect_drift")
+    environment = dict(item.split("=", 1) for item in value)
+    if any(key in environment for key in {"PROXY_API_KEY", "UPSTREAM_API_KEY", "TRUSTED_POLICY_EXTENSION_API_KEYS"}):
+        raise QualificationRuntimeFailure("runtime_inspect_drift")
+    expected = {
+        "DEPLOYMENT_PROFILE": "production",
+        "HARNESS_PROFILE": HARNESS_PROFILE,
+        "LISTEN_HOST": _CONTAINER_LISTEN_HOST,
+        "LISTEN_PORT": str(spec.proxy.container_port),
+        "UPSTREAM_BASE_URL": spec.observer.container_url,
+        "UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE": "phase_split",
+        "UPSTREAM_CACHE_CAPABILITY_MODE": "disabled",
+        "TELEMETRY_ENABLED": "true",
+        "METRICS_ENABLED": "true",
+    }
+    if any(environment.get(key) != item for key, item in expected.items()):
+        raise QualificationRuntimeFailure("runtime_inspect_drift")
+
+
+def _wait_for_proxy(runner: RuntimeCommandRunner, proxy: _ProxySpec) -> None:
+    health = f"http://{_url_host(proxy.host)}:{proxy.port}/healthz"
+    ready = f"http://{_url_host(proxy.host)}:{proxy.port}/readyz"
+    for _ in range(30):
+        if runner.http_status(health, timeout=1.0) == 200 and runner.http_status(ready, timeout=1.0) == 200:
+            return
+        time.sleep(0.05)
+    raise QualificationRuntimeFailure("runtime_proxy_unready")
+
+
+def _verify_proxy_auth_and_metrics(
+    runner: RuntimeCommandRunner, container_id: str, spec: _RuntimeSpec
+) -> None:
+    """Check effective non-secret settings and trusted metrics access inside the candidate."""
+
+    setting_names = tuple(sorted(_SETTINGS_KEYS))
+    code = "\n".join(
+        (
+            "import json",
+            "import urllib.request",
+            "from shiftedx_harness_proxy.config import Settings",
+            "settings = Settings()",
+            "ordinary = settings.proxy_api_key.get_secret_value() if settings.proxy_api_key else None",
+            "trusted_values = settings.trusted_policy_extension_keys()",
+            "trusted = next(iter(trusted_values)) if len(trusted_values) == 1 else None",
+            "upstream = settings.upstream_api_key.get_secret_value() if settings.upstream_api_key else None",
+            f"metrics_url = 'http://127.0.0.1:{spec.proxy.container_port}/metrics'",
+            "def metric_status(token):",
+            "    if token is None:",
+            "        return 0",
+            "    try:",
+            "        request = urllib.request.Request(metrics_url, headers={'Authorization': 'Bearer ' + token})",
+            "        with urllib.request.urlopen(request, timeout=5) as response:",
+            "            return response.status",
+            "    except Exception:",
+            "        return 0",
+            "result = {",
+            f"    'settings': {{name: getattr(settings, name) for name in {setting_names!r}}},",
+            "    'secret_roles_distinct': ordinary is not None and trusted is not None and ordinary != trusted"
+            " and (upstream is None or (upstream != ordinary and upstream != trusted)),",
+            "    'upstream_authenticated': upstream is not None,",
+            "    'ordinary_authenticated': metric_status(ordinary) == 200,",
+            "    'metrics_authenticated': metric_status(trusted) == 200,",
+            "}",
+            "print(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(',', ':')))",
+        )
+    )
+    # Credentials are read only inside the non-root container. This fixed program emits only booleans
+    # and allowlisted setting values, never a credential, route, or request/response body.
+    result = runner.run(("docker", "exec", "--user", "10001:10001", container_id, "python", "-c", code))
+    if result.returncode != 0:
+        raise QualificationRuntimeFailure("runtime_proxy_auth_failed")
+    document = _parse_command_json(result.stdout, "runtime_proxy_auth_failed")
+    if (
+        set(document)
+        != {
+            "settings",
+            "secret_roles_distinct",
+            "upstream_authenticated",
+            "ordinary_authenticated",
+            "metrics_authenticated",
+        }
+        or document.get("settings") != spec.proxy.settings
+        or document.get("secret_roles_distinct") is not True
+        or document.get("upstream_authenticated") is not spec.model.upstream_authenticated
+        or document.get("ordinary_authenticated") is not True
+        or document.get("metrics_authenticated") is not True
+    ):
+        raise QualificationRuntimeFailure("runtime_proxy_auth_failed")
+
+
+def _ensure_live(
+    observer: ManagedProcess,
+    runner: RuntimeCommandRunner,
+    container_id: str,
+    spec: _RuntimeSpec,
+    image_id: str,
+    volume_name: str,
+    instance: str,
+    stage: RuntimeStage,
+) -> None:
+    if observer.poll() is not None:
+        raise QualificationRuntimeFailure("runtime_observer_stopped")
+    _verify_proxy(
+        runner,
+        spec,
+        image_id=image_id,
+        container_id=container_id,
+        volume_name=volume_name,
+        instance=instance,
+        stage=stage,
+    )
+
+
+def _invoke_action(action: Callable[[RuntimeLease], int], lease: RuntimeLease) -> int:
+    try:
+        result = action(lease)
+    except _RuntimeInterrupted:
+        raise
+    except KeyboardInterrupt:
+        raise
+    except Exception as error:
+        raise QualificationRuntimeFailure("runtime_action_failed") from error
+    if not isinstance(result, int) or isinstance(result, bool):
+        raise QualificationRuntimeFailure("runtime_action_invalid")
+    return result
+
+
+def _install_interruption_handlers() -> dict[int, Any]:
+    previous: dict[int, Any] = {}
+    try:
+        for number in (signal.SIGINT, signal.SIGTERM):
+            previous[number] = signal.getsignal(number)
+
+            def interrupted(_number: int, _frame: FrameType | None) -> None:
+                raise _RuntimeInterrupted()
+
+            signal.signal(number, interrupted)
+    except ValueError:
+        _restore_interruption_handlers(previous)
+        return {}
+    return previous
+
+
+def _restore_interruption_handlers(previous: dict[int, Any]) -> None:
+    for number, handler in previous.items():
+        signal.signal(number, handler)
+
+
+def _proxy_lease(
+    spec: _RuntimeSpec,
+    stage: RuntimeStage,
+    private_run_dir: Path,
+    observer_ledger: Path,
+    attestation_path: Path,
+) -> RuntimeLease:
+    return RuntimeLease(
+        stage=stage,
+        run_manifest_sha256=spec.manifest_sha256,
+        source_commit=spec.source_commit,
+        image_digest=spec.image.digest,
+        model=spec.model.public_id,
+        benchmark_revision=spec.benchmark.revision,
+        agentic_set=spec.benchmark.agentic_set,
+        scenario_order_sha256=spec.benchmark.scenario_order_sha256,
+        scenario_count=spec.benchmark.scenario_count,
+        direct_base_url=spec.model.upstream_url,
+        direct_api_key_file=spec.credentials.upstream_model_api_key_file,
+        proxy_base_url=f"http://{_url_host(spec.proxy.host)}:{spec.proxy.port}/v1",
+        proxy_metrics_url=f"http://{_url_host(spec.proxy.host)}:{spec.proxy.port}/metrics",
+        proxy_api_key_file=spec.credentials.qualification_policy_api_key_file,
+        observer_ledger=observer_ledger,
+        preflight_ledger=private_run_dir / "preflight.jsonl",
+        output_ledger=_scored_ledger_path(private_run_dir, stage),
+        attestation_path=attestation_path,
+    )
+
+
+def _direct_lease(
+    spec: _RuntimeSpec, stage: RuntimeStage, private_run_dir: Path, attestation_path: Path
+) -> RuntimeLease:
+    return RuntimeLease(
+        stage=stage,
+        run_manifest_sha256=spec.manifest_sha256,
+        source_commit=spec.source_commit,
+        image_digest=spec.image.digest,
+        model=spec.model.public_id,
+        benchmark_revision=spec.benchmark.revision,
+        agentic_set=spec.benchmark.agentic_set,
+        scenario_order_sha256=spec.benchmark.scenario_order_sha256,
+        scenario_count=spec.benchmark.scenario_count,
+        direct_base_url=spec.model.upstream_url,
+        direct_api_key_file=spec.credentials.upstream_model_api_key_file,
+        proxy_base_url=None,
+        proxy_metrics_url=None,
+        proxy_api_key_file=None,
+        observer_ledger=None,
+        preflight_ledger=private_run_dir / "preflight.jsonl",
+        output_ledger=_scored_ledger_path(private_run_dir, stage),
+        attestation_path=attestation_path,
+    )
+
+
+def _write_attestation(
+    path: Path, spec: _RuntimeSpec, stage: RuntimeStage, instance: str, image_id: str
+) -> None:
+    record = {
+        "schema_version": "1.0",
+        "record_type": "qualification_runtime_attestation",
+        "status": "passed",
+        "stage": _attestation_stage(stage),
+        "source_commit": spec.source_commit,
+        "image_digest": spec.image.digest,
+        "run_manifest_sha256": spec.manifest_sha256,
+        "model_id_sha256": _canonical_sha256(spec.model.public_id),
+        "benchmark_revision": spec.benchmark.revision,
+        "scenario_order": {
+            "sha256": spec.benchmark.scenario_order_sha256,
+            "count": spec.benchmark.scenario_count,
+        },
+        "runtime_contract_sha256": _runtime_contract_sha256(spec),
+        "runtime_instance_sha256": _runtime_instance_sha256(spec, stage, instance, image_id),
+        "checks": {key: True for key in _CHECK_KEYS},
+    }
+    _atomic_write_no_clobber(path, record)
+
+
+def _write_outcome(
+    path: Path,
+    stage: RuntimeStage,
+    status: OutcomeStatus,
+    action_exit_code: int | None,
+    failure_category: str | None,
+    attestation_path: Path | None,
+) -> None:
+    if failure_category is not None and _FAILURE_CATEGORY.fullmatch(failure_category) is None:
+        failure_category = "runtime_internal_failure"
+    record = {
+        "schema_version": "1.0",
+        "record_type": "qualification_runtime_outcome",
+        "stage": _outcome_stage(stage),
+        "status": status,
+        "action_exit_code": action_exit_code,
+        "failure_category": failure_category,
+        "attestation_written": attestation_path is not None,
+    }
+    _atomic_write_no_clobber(path, record)
+
+
+def _atomic_write_no_clobber(path: Path, record: dict[str, Any]) -> None:
+    if path.exists() or path.is_symlink():
+        raise QualificationRuntimeFailure("runtime_evidence_exists")
+    payload = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        temporary = Path(temporary_name)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.link(temporary, path)
+            temporary.unlink()
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except FileExistsError as error:
+            temporary.unlink(missing_ok=True)
+            raise QualificationRuntimeFailure("runtime_evidence_exists") from error
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+    except OSError as error:
+        raise QualificationRuntimeFailure("runtime_evidence_write_failed") from error
+
+
+def _validate_stage_evidence_absent(private_run_dir: Path, stage: RuntimeStage) -> None:
+    paths = [_outcome_path(private_run_dir, stage), _scored_ledger_path(private_run_dir, stage)]
+    if stage != "score-direct":
+        paths.extend(
+            (
+                _attestation_path(private_run_dir, stage),
+                _observer_ledger_path(private_run_dir, stage),
+            )
+        )
+    if any(path.exists() or path.is_symlink() for path in paths):
+        raise QualificationRuntimeFailure("runtime_evidence_exists")
+
+
+def _validate_existing_preflight_attestation(private_run_dir: Path, spec: _RuntimeSpec) -> Path:
+    path = _attestation_path(private_run_dir, "preflight")
+    try:
+        file_status = path.lstat()
+        if path.is_symlink() or not stat.S_ISREG(file_status.st_mode) or stat.S_IMODE(file_status.st_mode) != 0o600:
+            raise QualificationRuntimeFailure("runtime_preflight_attestation_invalid")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise QualificationRuntimeFailure("runtime_preflight_attestation_invalid")
+            with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                serialized = handle.read()
+        finally:
+            os.close(descriptor)
+        value = json.loads(serialized, object_pairs_hook=_unique_json_object)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise QualificationRuntimeFailure("runtime_preflight_attestation_invalid") from error
+    root_keys = {
+        "schema_version",
+        "record_type",
+        "status",
+        "stage",
+        "source_commit",
+        "image_digest",
+        "run_manifest_sha256",
+        "model_id_sha256",
+        "benchmark_revision",
+        "scenario_order",
+        "runtime_contract_sha256",
+        "runtime_instance_sha256",
+        "checks",
+    }
+    order = value.get("scenario_order") if isinstance(value, dict) else None
+    checks = value.get("checks") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or set(value) != root_keys
+        or value.get("schema_version") != "1.0"
+        or value.get("record_type") != "qualification_runtime_attestation"
+        or value.get("status") != "passed"
+        or value.get("stage") != "preflight"
+        or value.get("source_commit") != spec.source_commit
+        or value.get("image_digest") != spec.image.digest
+        or value.get("run_manifest_sha256") != spec.manifest_sha256
+        or value.get("model_id_sha256") != _canonical_sha256(spec.model.public_id)
+        or value.get("benchmark_revision") != spec.benchmark.revision
+        or not isinstance(order, dict)
+        or order != {"sha256": spec.benchmark.scenario_order_sha256, "count": spec.benchmark.scenario_count}
+        or not isinstance(value.get("runtime_contract_sha256"), str)
+        or _SHA256.fullmatch(value["runtime_contract_sha256"]) is None
+        or not isinstance(value.get("runtime_instance_sha256"), str)
+        or _SHA256.fullmatch(value["runtime_instance_sha256"]) is None
+        or not isinstance(checks, dict)
+        or set(checks) != set(_CHECK_KEYS)
+        or any(item is not True for item in checks.values())
+    ):
+        raise QualificationRuntimeFailure("runtime_preflight_attestation_invalid")
+    return path
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _cleanup_runtime(
+    runner: RuntimeCommandRunner,
+    observer: ManagedProcess | None,
+    container_id: str | None,
+    volume_name: str | None,
+    *,
+    spec_manifest_sha256: str | None,
+    instance: str | None,
+) -> bool:
+    failed = False
+    if observer is not None:
+        try:
+            if observer.poll() is None:
+                observer.terminate()
+                observer.wait(timeout=10)
+        except Exception:
+            try:
+                observer.kill()
+                observer.wait(timeout=5)
+            except Exception:
+                failed = True
+    if container_id is not None:
+        try:
+            if not _owned_container(runner, container_id, spec_manifest_sha256, instance):
+                failed = True
+            else:
+                result = runner.run(("docker", "rm", "--force", container_id))
+                failed = failed or result.returncode != 0
+        except Exception:
+            failed = True
+    if volume_name is not None:
+        try:
+            if not _owned_volume(runner, volume_name, spec_manifest_sha256, instance):
+                failed = True
+            else:
+                result = runner.run(("docker", "volume", "rm", volume_name))
+                failed = failed or result.returncode != 0
+        except Exception:
+            failed = True
+    return failed
+
+
+def _owned_container(
+    runner: RuntimeCommandRunner, container_id: str, manifest_sha256: str | None, instance: str | None
+) -> bool:
+    if manifest_sha256 is None or instance is None:
+        return False
+    result = runner.run(("docker", "container", "inspect", "--format", "{{json .Config.Labels}}", container_id))
+    if result.returncode != 0:
+        return False
+    value = _parse_command_json_or_none(result.stdout)
+    return isinstance(value, dict) and value.get(f"{_LABEL_PREFIX}.manifest") == manifest_sha256 and value.get(
+        f"{_LABEL_PREFIX}.instance"
+    ) == instance
+
+
+def _owned_volume(
+    runner: RuntimeCommandRunner, volume_name: str, manifest_sha256: str | None, instance: str | None
+) -> bool:
+    if manifest_sha256 is None or instance is None:
+        return False
+    result = runner.run(("docker", "volume", "inspect", "--format", "{{json .Labels}}", volume_name))
+    if result.returncode != 0:
+        return False
+    value = _parse_command_json_or_none(result.stdout)
+    return isinstance(value, dict) and value.get(f"{_LABEL_PREFIX}.manifest") == manifest_sha256 and value.get(
+        f"{_LABEL_PREFIX}.instance"
+    ) == instance
+
+
+def _runtime_contract_sha256(spec: _RuntimeSpec) -> str:
+    return _canonical_sha256(
+        {
+            "source_commit": spec.source_commit,
+            "image_digest": spec.image.digest,
+            "run_manifest_sha256": spec.manifest_sha256,
+            "model_id_sha256": _canonical_sha256(spec.model.public_id),
+            "benchmark_revision": spec.benchmark.revision,
+            "scenario_order": {
+                "sha256": spec.benchmark.scenario_order_sha256,
+                "count": spec.benchmark.scenario_count,
+            },
+            "settings_sha256": _canonical_sha256(spec.proxy.settings),
+            "routes_sha256": _canonical_sha256(
+                {
+                    "observer_host": spec.observer.host,
+                    "observer_port": spec.observer.port,
+                    "observer_container_url": spec.observer.container_url,
+                    "proxy_host": spec.proxy.host,
+                    "proxy_port": spec.proxy.port,
+                    "proxy_container_port": spec.proxy.container_port,
+                }
+            ),
+            "resources": {
+                "uid": spec.image.uid,
+                "gid": spec.image.gid,
+                "cpus": _decimal_text(spec.proxy.cpus),
+                "memory_bytes": spec.proxy.memory_bytes,
+                "pids_limit": spec.proxy.pids_limit,
+                "stop_timeout_seconds": spec.proxy.stop_timeout_seconds,
+            },
+            "auth_roles": {
+                "ordinary": True,
+                "qualification": True,
+                "upstream": spec.model.upstream_authenticated,
+            },
+        }
+    )
+
+
+def _runtime_instance_sha256(spec: _RuntimeSpec, stage: RuntimeStage, instance: str, image_id: str) -> str:
+    return _canonical_sha256(
+        {
+            "runtime_contract_sha256": _runtime_contract_sha256(spec),
+            "stage": _attestation_stage(stage),
+            "supervisor_instance": instance,
+            "image_id": image_id,
+            "attestation_schema": "1.0",
+        }
+    )
+
+
+def _attestation_stage(stage: RuntimeStage) -> AttestationStage:
+    if stage == "preflight":
+        return "preflight"
+    if stage == "score-proxy":
+        return "scored_proxy"
+    raise QualificationRuntimeFailure("runtime_stage_invalid")
+
+
+def _outcome_stage(stage: RuntimeStage) -> str:
+    return {"preflight": "preflight", "score-direct": "scored-direct", "score-proxy": "scored-proxy"}[stage]
+
+
+def _attestation_path(private_run_dir: Path, stage: RuntimeStage) -> Path:
+    if stage == "preflight":
+        return private_run_dir / "preflight-runtime-attestation.json"
+    if stage == "score-proxy":
+        return private_run_dir / "scored-proxy-runtime-attestation.json"
+    raise QualificationRuntimeFailure("runtime_stage_invalid")
+
+
+def _outcome_path(private_run_dir: Path, stage: RuntimeStage) -> Path:
+    return private_run_dir / f"{_outcome_stage(stage)}-runtime-outcome.json"
+
+
+def _observer_ledger_path(private_run_dir: Path, stage: RuntimeStage) -> Path:
+    if stage == "preflight":
+        return private_run_dir / "preflight-proxy-model-boundary.jsonl"
+    if stage == "score-proxy":
+        return private_run_dir / "scored-proxy-model-boundary.jsonl"
+    raise QualificationRuntimeFailure("runtime_stage_invalid")
+
+
+def _scored_ledger_path(private_run_dir: Path, stage: RuntimeStage) -> Path:
+    if stage == "preflight":
+        return private_run_dir / "preflight.jsonl"
+    if stage == "score-direct":
+        return private_run_dir / "scored-direct.jsonl"
+    if stage == "score-proxy":
+        return private_run_dir / "scored-proxy.jsonl"
+    raise QualificationRuntimeFailure("runtime_stage_invalid")
+
+
+def _instance_token(manifest_sha256: str, stage: RuntimeStage) -> str:
+    """Return a fresh opaque supervisor instance, never derived from a host path."""
+
+    return _canonical_sha256(
+        {"manifest": manifest_sha256, "stage": _attestation_stage(stage), "nonce": uuid.uuid4().hex}
+    )[:24]
+
+
+def _observer_identity(manifest_sha256: str, instance: str) -> str:
+    """Bind the health endpoint to this supervisor without exposing private routing data."""
+
+    return _canonical_sha256({"manifest": manifest_sha256, "instance": instance, "kind": "observer"})
+
+
+def _volume_name(instance: str) -> str:
+    return f"shiftedx-qualification-secrets-{instance}"
+
+
+def _container_name(instance: str, stage: RuntimeStage) -> str:
+    return f"shiftedx-qualification-{_attestation_stage(stage)}-{instance}"
+
+
+def _parse_command_json(value: str, category: str) -> dict[str, Any]:
+    parsed = _parse_command_json_or_none(value)
+    if not isinstance(parsed, dict):
+        raise QualificationRuntimeFailure(category)
+    return parsed
+
+
+def _parse_command_json_or_none(value: str) -> Any:
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return None
+
+
+def _exact_object(value: Any, keys: set[str] | frozenset[str]) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != set(keys):
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    return cast(dict[str, Any], value)
+
+
+def _exact_string(value: dict[str, Any], key: str, pattern: re.Pattern[str]) -> str:
+    candidate = value.get(key)
+    if not isinstance(candidate, str) or pattern.fullmatch(candidate) is None:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    return candidate
+
+
+def _required_text(value: Any) -> str:
+    if not isinstance(value, str) or not value or "\x00" in value or "\n" in value or "\r" in value:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    return value
+
+
+def _absolute_path(value: Any) -> Path:
+    raw_path = _required_text(value)
+    path = Path(raw_path)
+    if not path.is_absolute() or "," in raw_path:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    return path
+
+
+def _safe_absolute_http_url(value: str) -> str:
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    try:
+        _ = parsed.port
+    except ValueError as error:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid") from error
+    return value.rstrip("/")
+
+
+def _loopback_host(value: str) -> str:
+    if value not in {"127.0.0.1", "::1"}:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    return value
+
+
+def _port(value: Any) -> int:
+    result = _positive_int(value)
+    if result > 65535:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    return result
+
+
+def _positive_int(value: Any) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    return value
+
+
+def _positive_decimal(value: Any) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    try:
+        decimal = Decimal(str(value))
+    except (InvalidOperation, ValueError) as error:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid") from error
+    if not decimal.is_finite() or decimal <= 0:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    return decimal
+
+
+def _decimal_text(value: Decimal) -> str:
+    return format(value.normalize(), "f")
+
+
+def _canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _env_bool(value: Any) -> str:
+    return "true" if value is True else "false"
+
+
+def _url_host(host: str) -> str:
+    return f"[{host}]" if ":" in host else host
