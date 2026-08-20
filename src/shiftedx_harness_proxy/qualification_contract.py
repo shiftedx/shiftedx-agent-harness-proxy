@@ -130,6 +130,7 @@ class PreflightObservation:
     downstream: SafeFingerprint
     model_facing: tuple[SafeFingerprint, ...]
     proxy_phase_counts: dict[str, int] | None = None
+    proxy_correction_count: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -144,6 +145,7 @@ class PreflightObservation:
             "downstream_contract": self.downstream.to_dict(),
             "model_facing_contracts": [item.to_dict() for item in self.model_facing],
             "proxy_phase_counts": self.proxy_phase_counts,
+            "proxy_correction_count": self.proxy_correction_count,
         }
 
 
@@ -1263,15 +1265,77 @@ def assert_preflight(observations: list[PreflightObservation]) -> None:
         mismatch = contract_mismatches(direct.downstream, proxy.downstream)
         if mismatch:
             raise PreflightFailure(f"downstream contract mismatch: {', '.join(mismatch)}")
-        if len(direct.model_facing) != len(proxy.model_facing):
-            raise PreflightFailure("model-facing phase count differed")
-        for direct_fingerprint, proxy_fingerprint in zip(direct.model_facing, proxy.model_facing, strict=True):
-            mismatch = contract_mismatches(direct_fingerprint, proxy_fingerprint)
-            if mismatch:
-                raise PreflightFailure(f"model-facing contract mismatch: {', '.join(mismatch)}")
-    proxy_tool = by_path[("proxy", True)]
-    if proxy_tool.proxy_phase_counts != {"acquisition": 2, "finalization": 1}:
-        raise PreflightFailure("proxy did not record equivalent acquisition/finalization behavior")
+        if tool_required:
+            _assert_tool_phase_order(direct)
+            proxy_phase_counts = _assert_tool_phase_order(proxy)
+            extras = _assert_proxy_run_expansion(direct.model_facing, proxy.model_facing)
+            if (
+                not isinstance(proxy.proxy_correction_count, int)
+                or isinstance(proxy.proxy_correction_count, bool)
+                or proxy.proxy_correction_count < 0
+                or extras != proxy.proxy_correction_count
+            ):
+                raise PreflightFailure("proxy correction count differed from model-facing run expansion")
+            if proxy.proxy_phase_counts != proxy_phase_counts:
+                raise PreflightFailure("proxy phase metrics differed from observed model-facing phases")
+        else:
+            if len(direct.model_facing) != len(proxy.model_facing):
+                raise PreflightFailure("model-facing phase count differed")
+            for direct_fingerprint, proxy_fingerprint in zip(
+                direct.model_facing, proxy.model_facing, strict=True
+            ):
+                mismatch = contract_mismatches(direct_fingerprint, proxy_fingerprint)
+                if mismatch:
+                    raise PreflightFailure(f"model-facing contract mismatch: {', '.join(mismatch)}")
+    if any(
+        observation.proxy_correction_count is not None or observation.proxy_phase_counts is not None
+        for observation in observations
+        if not (observation.arm == "proxy" and observation.tool_required)
+    ):
+        raise PreflightFailure("proxy correction count scope differed")
+
+
+def _assert_tool_phase_order(observation: PreflightObservation) -> dict[str, int]:
+    phases: list[object] = []
+    for fingerprint in observation.model_facing:
+        compatibility = fingerprint.fields.get("compatibility")
+        phase = compatibility.get("phase") if isinstance(compatibility, dict) else None
+        phases.append(phase)
+    if (
+        len(phases) < 2
+        or phases[-1] != "finalization"
+        or any(phase != "acquisition" for phase in phases[:-1])
+    ):
+        raise PreflightFailure(f"{observation.arm} model-facing tool phase behavior differed")
+    return {"acquisition": len(phases) - 1, "finalization": 1}
+
+
+def _assert_proxy_run_expansion(
+    direct: tuple[SafeFingerprint, ...], proxy: tuple[SafeFingerprint, ...]
+) -> int:
+    """Require proxy attempts to be the direct sequence plus contiguous exact repeats."""
+
+    proxy_index = 0
+    extra_count = 0
+    for direct_index, direct_fingerprint in enumerate(direct):
+        if proxy_index >= len(proxy):
+            raise PreflightFailure("model-facing run expansion differed")
+        matched_proxy = proxy[proxy_index]
+        mismatch = contract_mismatches(direct_fingerprint, matched_proxy)
+        if mismatch:
+            raise PreflightFailure(f"model-facing contract mismatch: {', '.join(mismatch)}")
+        proxy_index += 1
+        remaining_direct = len(direct) - direct_index - 1
+        while (
+            proxy_index < len(proxy)
+            and len(proxy) - proxy_index > remaining_direct
+            and proxy[proxy_index] == matched_proxy
+        ):
+            extra_count += 1
+            proxy_index += 1
+    if proxy_index != len(proxy):
+        raise PreflightFailure("model-facing run expansion differed")
+    return extra_count
 
 
 def _assert_harness_system_policy(arm: Literal["direct", "proxy"], fingerprints: tuple[SafeFingerprint, ...]) -> None:

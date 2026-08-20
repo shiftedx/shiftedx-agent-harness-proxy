@@ -1258,10 +1258,20 @@ def _run_paired_preflight(args: argparse.Namespace, selected: list[Any]) -> None
                 cache_mode=getattr(args, "cache_mode", "warm-prefix"),
                 sampler_profile=sampler_profile,
             )
+            tool_request_start = len(proxy_request_accounting.records)
             try:
                 _run_preflight_path(tool_client, tool_payload, tool_required=True)
             finally:
-                observations.append(tool_client.observation(tool_required=True, original_payload=tool_payload))
+                tool_observation = tool_client.observation(tool_required=True, original_payload=tool_payload)
+                if arm == "proxy":
+                    tool_observation = replace(
+                        tool_observation,
+                        proxy_correction_count=sum(
+                            record.correction_count
+                            for record in proxy_request_accounting.records[tool_request_start:]
+                        ),
+                    )
+                observations.append(tool_observation)
                 if arm == "direct":
                     direct_attempt_records.extend(tool_client.attempt_records)
 
