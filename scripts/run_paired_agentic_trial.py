@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import copy
 import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
 import time
 import urllib.error
@@ -17,28 +19,35 @@ import uuid
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeAlias
 
 from shiftedx_bench.agentic import run_agentic_cases, scenario_set
 from shiftedx_bench.api import OpenAIClient
 
+from shiftedx_harness_proxy.core import HARNESS_SYSTEM_SUFFIX
 from shiftedx_harness_proxy.projection_accounting import (
     LOCAL_PROJECTION_EXTENSION,
     public_projection_summary,
 )
 from shiftedx_harness_proxy.qualification_contract import (
     ModelBoundaryObserverCursor,
+    ModelBoundaryRecord,
     PhasePlanner,
     PreflightFailure,
     PreflightObservation,
+    RuntimeAttestation,
+    RuntimeAttestationFailure,
     SafeFingerprint,
+    load_runtime_attestation,
     model_boundary_fingerprint,
+    model_boundary_record,
     qualification_contract_digest,
     request_fingerprints,
     require_candidate_provenance,
     require_scoring_gate,
     terminal_schema_valid,
     validate_run_manifest_sha256,
+    write_model_boundary_attempt_ledger,
     write_preflight_ledger,
 )
 from shiftedx_harness_proxy.qualification_contract import (
@@ -47,16 +56,92 @@ from shiftedx_harness_proxy.qualification_contract import (
 from shiftedx_harness_proxy.qualification_contract import (
     contract_mismatches as _contract_mismatches,
 )
+from shiftedx_harness_proxy.qualification_reconciliation import (
+    RequestAccountingRecord,
+    RequestOutcome,
+    write_request_accounting_ledger,
+)
 
 _SYSTEM_PROMPT = (
     "You are an autonomous coding agent in a deterministic sandbox. Use supplied tools, never invent "
     "results, recover from failures, verify completion, and obey the requested final JSON format."
 )
 _HTTP_STATUS = re.compile(r"\bHTTP ([1-5][0-9]{2})\b")
+_CANONICAL_COUNTER = re.compile(r"^(?:0|[1-9][0-9]{0,19})$")
+_MAX_PROXY_RESPONSE_BYTES = 16 * 1024 * 1024
+PROXY_RESPONSE_ACCOUNTING = "_shiftedx_qualification_proxy_accounting"
+ProxyRequestRecord: TypeAlias = RequestAccountingRecord
+
+
+class _RejectAllRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+_NO_PROXY_HANDLER = urllib.request.ProxyHandler({})
+_NO_PROXY_OPENER = urllib.request.build_opener(
+    _NO_PROXY_HANDLER,
+    _RejectAllRedirects(),
+)
+
+
+class ProxyHTTPFailure(RuntimeError):
+    """A body-free proxy HTTP status used only for categorical accounting."""
+
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+        super().__init__(f"proxy HTTP {status_code}")
 
 
 class ProjectionAwareOpenAIClient(OpenAIClient):
     """Retain only the validated Local Projection marker dropped by the benchmark normalizer."""
+
+    capture_proxy_accounting = False
+
+    def complete(self, payload: dict[str, Any], *, stream: bool = False) -> dict[str, Any]:
+        if not self.capture_proxy_accounting:
+            return super().complete(payload, stream=stream)
+        if stream:
+            raise PreflightFailure("proxy qualification requires non-streaming responses")
+        body = dict(payload)
+        body["stream"] = False
+        request = self._request(body)
+        started = time.perf_counter()
+        try:
+            with _NO_PROXY_OPENER.open(request, timeout=self.timeout_s) as response:  # noqa: S310
+                if response.geturl() != request.full_url:
+                    raise PreflightFailure("proxy qualification final URL differed")
+                value = json.loads(_read_bounded_proxy_response(response).decode("utf-8"))
+                if not isinstance(value, dict):
+                    raise PreflightFailure("proxy response is malformed")
+                accounting = (
+                    {key: 0 for key in ("upstream_calls", "corrections", "blocked_duplicates", "blocked_stalls")}
+                    if _canonical_local_projection_marker(value) is not None
+                    else _proxy_accounting_from_headers(response.headers)
+                )
+        except urllib.error.HTTPError as error:
+            if 300 <= error.code < 400:
+                raise PreflightFailure("proxy qualification redirect rejected") from None
+            raise ProxyHTTPFailure(error.code) from None
+        except PreflightFailure:
+            raise
+        except TimeoutError:
+            raise TimeoutError("proxy request deadline exceeded") from None
+        except urllib.error.URLError as error:
+            if isinstance(error.reason, TimeoutError):
+                raise TimeoutError("proxy request deadline exceeded") from None
+            raise ConnectionError("proxy transport failed") from None
+        except OSError:
+            raise ConnectionError("proxy transport failed") from None
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            raise PreflightFailure("proxy response is malformed") from None
+        wall_s = time.perf_counter() - started
+        try:
+            normalized = self._normalize(value, wall_s=wall_s, ttft_s=value.pop("_ttft_s", None))
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+            raise PreflightFailure("proxy response is malformed") from None
+        normalized[PROXY_RESPONSE_ACCOUNTING] = accounting
+        return normalized
 
     @staticmethod
     def _normalize(value: dict[str, Any], *, wall_s: float, ttft_s: float | None) -> dict[str, Any]:
@@ -67,7 +152,43 @@ class ProjectionAwareOpenAIClient(OpenAIClient):
         return normalized
 
 
-def request_payload(scenario: Any, *, model: str, proxy_policy: bool) -> dict[str, Any]:
+def _proxy_accounting_from_headers(headers: Any) -> dict[str, int]:
+    projected: dict[str, int] = {}
+    names = {
+        "upstream_calls": "X-Shiftedx-Upstream-Calls",
+        "corrections": "X-Shiftedx-Corrections",
+        "blocked_duplicates": "X-Shiftedx-Blocked-Duplicates",
+        "blocked_stalls": "X-Shiftedx-Blocked-Stalls",
+    }
+    for key, name in names.items():
+        get_all = getattr(headers, "get_all", None)
+        if callable(get_all):
+            values = get_all(name) or []
+        else:
+            value = headers.get(name) if hasattr(headers, "get") else None
+            values = [] if value is None else [value]
+        if len(values) != 1 or not isinstance(values[0], str) or _CANONICAL_COUNTER.fullmatch(values[0]) is None:
+            raise PreflightFailure("proxy response accounting is unavailable")
+        projected[key] = int(values[0])
+    return projected
+
+
+def _read_bounded_proxy_response(response: Any) -> bytes:
+    payload = response.read(_MAX_PROXY_RESPONSE_BYTES + 1)
+    if not isinstance(payload, bytes):
+        raise PreflightFailure("proxy response is malformed")
+    if len(payload) > _MAX_PROXY_RESPONSE_BYTES:
+        raise PreflightFailure("proxy response exceeded size limit")
+    return payload
+
+
+def request_payload(
+    scenario: Any,
+    *,
+    model: str,
+    proxy_policy: bool,
+    cache_mode: str = "warm-prefix",
+) -> dict[str, Any]:
     """Build the unchanged standard downstream Chat Completions contract."""
     payload: dict[str, Any] = {
         "model": model,
@@ -87,7 +208,22 @@ def request_payload(scenario: Any, *, model: str, proxy_policy: bool) -> dict[st
     }
     if proxy_policy:
         payload["x-shiftedx-require-receipt"] = scenario.require_receipt
+    if cache_mode == "bypass":
+        payload["metadata"] = {"cache_mode": "bypass"}
     return payload
+
+
+def cache_prime_payload(scenario: Any, *, model: str, arm: str) -> dict[str, Any]:
+    """Build the exact first scored model-facing payload for warm-cache priming."""
+    payload = request_payload(scenario, model=model, proxy_policy=False)
+    if arm == "proxy":
+        system = payload["messages"][0]
+        content = system.get("content")
+        if not isinstance(content, str) or HARNESS_SYSTEM_SUFFIX in content:
+            raise PreflightFailure("cache prime harness system suffix is invalid")
+        system["content"] = content + HARNESS_SYSTEM_SUFFIX
+    phase = "acquisition" if payload.get("tools") else "terminal"
+    return PhasePlanner().plan(payload, phase=phase)
 
 
 def contract_fingerprints(
@@ -116,6 +252,109 @@ def assert_preflight(observations: list[PreflightObservation]) -> None:
     _assert_preflight(observations)
 
 
+class ProxyRequestAccounting:
+    """Accumulate one safe accounting row for each actual downstream proxy call."""
+
+    def __init__(self) -> None:
+        self._records: list[ProxyRequestRecord] = []
+
+    @property
+    def records(self) -> tuple[ProxyRequestRecord, ...]:
+        return tuple(self._records)
+
+    def record_success(
+        self,
+        response: dict[str, Any],
+        observer_records: tuple[ModelBoundaryRecord, ...],
+        *,
+        local_projection: bool,
+    ) -> None:
+        accounting = _take_proxy_response_accounting(response)
+        phases = [record.fields["compatibility"]["phase"] for record in observer_records]
+        retry_count = len(observer_records) - len(set(phases))
+        if (
+            accounting["upstream_calls"] != len(observer_records)
+            or accounting["corrections"] != retry_count
+            or local_projection
+            and (observer_records or any(accounting.values()))
+        ):
+            raise PreflightFailure("proxy response accounting differed")
+        self._append(
+            observer_records,
+            outcome="succeeded",
+            local_projection=local_projection,
+            blocked_duplicates=accounting["blocked_duplicates"],
+            blocked_stalls=accounting["blocked_stalls"],
+        )
+
+    def record_failure(self, observer_records: tuple[ModelBoundaryRecord, ...], error: BaseException) -> None:
+        outcome: RequestOutcome
+        if isinstance(error, asyncio.CancelledError):
+            outcome = "cancelled"
+        elif (
+            isinstance(error, ProxyHTTPFailure)
+            and error.status_code == 504
+            or isinstance(error, TimeoutError)
+            or isinstance(error, urllib.error.URLError)
+            and isinstance(error.reason, TimeoutError)
+        ):
+            outcome = "deadline"
+        else:
+            outcome = "failed"
+        self._append(
+            observer_records,
+            outcome=outcome,
+            local_projection=False,
+            blocked_duplicates=0,
+            blocked_stalls=0,
+        )
+
+    def _append(
+        self,
+        observer_records: tuple[ModelBoundaryRecord, ...],
+        *,
+        outcome: RequestOutcome,
+        local_projection: bool,
+        blocked_duplicates: int,
+        blocked_stalls: int,
+    ) -> None:
+        phases = [record.fields["compatibility"]["phase"] for record in observer_records]
+        phase_counts = {
+            "acquisition": phases.count("acquisition"),
+            "finalization": phases.count("finalization"),
+        }
+        retry_count = len(observer_records) - len(set(phases))
+        self._records.append(
+            ProxyRequestRecord(
+                sequence=len(self._records) + 1,
+                outcome=outcome,
+                local_projection=local_projection,
+                attempt_sequence_start=observer_records[0].sequence if observer_records else None,
+                attempt_sequence_end=observer_records[-1].sequence if observer_records else None,
+                attempt_count=len(observer_records),
+                successful_attempt_count=sum(
+                    record.status_code is not None and 200 <= record.status_code < 300 for record in observer_records
+                ),
+                phase_counts=phase_counts,
+                retry_attempt_count=retry_count,
+                blocked_duplicate_count=blocked_duplicates,
+                blocked_stall_count=blocked_stalls,
+            )
+        )
+
+
+def _take_proxy_response_accounting(response: dict[str, Any]) -> dict[str, int]:
+    value = response.pop(PROXY_RESPONSE_ACCOUNTING, None)
+    keys = {"upstream_calls", "corrections", "blocked_duplicates", "blocked_stalls"}
+    if (
+        not isinstance(value, dict)
+        or set(value) != keys
+        or any(not isinstance(item, int) or isinstance(item, bool) or item < 0 for item in value.values())
+    ):
+        raise PreflightFailure("proxy response accounting is unavailable")
+    return value
+
+
 class CompatibilityClient:
     """Apply the direct phase plan or consume actual proxy-boundary evidence per turn."""
 
@@ -127,17 +366,30 @@ class CompatibilityClient:
         scenario_order: list[str],
         proxy_policy: bool,
         observer: ModelBoundaryObserverCursor | None = None,
+        require_cache_evidence: bool = False,
+        request_accounting: ProxyRequestAccounting | None = None,
     ) -> None:
         self.upstream = upstream
         self.arm = arm
         self.scenario_order = scenario_order
         self.proxy_policy = proxy_policy
         self.observer = observer
+        self.require_cache_evidence = require_cache_evidence
+        self.request_accounting = request_accounting
         self.planner = PhasePlanner()
         self.calls: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
         self.downstream_payloads: list[dict[str, Any]] = []
         self._direct_model_payloads: list[tuple[str, dict[str, Any]]] = []
         self._proxy_model_turns: list[tuple[SafeFingerprint, ...]] = []
+        self._direct_attempt_records: list[ModelBoundaryRecord] = []
+
+    @property
+    def attempt_records(self) -> tuple[ModelBoundaryRecord, ...]:
+        if self.arm == "direct":
+            return tuple(self._direct_attempt_records)
+        if self.observer is None:
+            return ()
+        return tuple(record for turn in self.observer.record_turns for record in turn)
 
     def complete(self, payload: dict[str, Any], *, stream: bool = False) -> dict[str, Any]:
         del stream  # Qualification is intentionally non-streaming.
@@ -154,43 +406,92 @@ class CompatibilityClient:
 
     def _complete_direct(self, phase: str, payload: dict[str, Any]) -> dict[str, Any]:
         self._direct_model_payloads.append((phase, copy.deepcopy(payload)))
-        response = self.upstream.complete(payload, stream=False)
+        sequence = len(self._direct_attempt_records) + 1
+        try:
+            response = self.upstream.complete(payload, stream=False)
+        except Exception:
+            self._direct_attempt_records.append(
+                model_boundary_record(
+                    payload,
+                    sequence=sequence,
+                    status_code=None,
+                    response=None,
+                )
+            )
+            raise
+        record = model_boundary_record(
+            payload,
+            sequence=sequence,
+            status_code=200,
+            response=response,
+        )
+        self._direct_attempt_records.append(record)
         if not isinstance(response, dict):
             raise PreflightFailure("preflight_response_malformed")
+        if self.require_cache_evidence and record.cache is None:
+            raise PreflightFailure("model response cache evidence malformed")
         self.calls.append((phase, payload, response))
         return response
 
     def _complete_proxy(self, payload: dict[str, Any], phases: tuple[str, ...]) -> dict[str, Any]:
+        prior_request_count = len(self.request_accounting.records) if self.request_accounting is not None else 0
+        prior_turn_count = len(self.observer.record_turns) if self.observer is not None else 0
+        records: tuple[ModelBoundaryRecord, ...] = ()
+        call_started = False
         if self.observer is not None:
             self.observer.begin_turn()
         try:
+            call_started = True
             response = self.upstream.complete(payload, stream=False)
-        except Exception:
-            self._consume_proxy_observations(payload, require_records=False)
+            if not isinstance(response, dict):
+                records = self._consume_proxy_observations(payload, require_records=True)
+                raise PreflightFailure("preflight_response_malformed")
+            local_projection = _is_local_projection(response)
+            records = self._consume_proxy_observations(payload, require_records=not local_projection)
+            if self.request_accounting is not None:
+                self.request_accounting.record_success(
+                    response,
+                    records,
+                    local_projection=local_projection,
+                )
+            self.calls.append((phases[-1], payload, response))
+            return response
+        except BaseException as error:
+            if self.observer is not None and len(self.observer.record_turns) > prior_turn_count:
+                records = self.observer.record_turns[-1]
+            elif call_started:
+                try:
+                    records = self._consume_proxy_observations(payload, require_records=False)
+                except BaseException:
+                    if self.observer is not None and len(self.observer.record_turns) > prior_turn_count:
+                        records = self.observer.record_turns[-1]
+            if (
+                call_started
+                and self.request_accounting is not None
+                and len(self.request_accounting.records) == prior_request_count
+            ):
+                self.request_accounting.record_failure(records, error)
             raise
-        if not isinstance(response, dict):
-            self._consume_proxy_observations(payload, require_records=True)
-            raise PreflightFailure("preflight_response_malformed")
-        self._consume_proxy_observations(payload, require_records=not _is_local_projection(response))
-        self.calls.append((phases[-1], payload, response))
-        return response
 
-    def _consume_proxy_observations(self, payload: dict[str, Any], *, require_records: bool) -> None:
+    def _consume_proxy_observations(
+        self, payload: dict[str, Any], *, require_records: bool
+    ) -> tuple[ModelBoundaryRecord, ...]:
         if self.observer is None:
-            return
+            return ()
         records = self.observer.consume_turn(require_records=require_records)
         self._proxy_model_turns.append(records)
+        if self.require_cache_evidence and require_records:
+            raw_records = self.observer.record_turns[-1]
+            if any(record.status_code is None or record.cache is None for record in raw_records):
+                raise PreflightFailure("proxy model-boundary response cache evidence malformed")
         self._validate_proxy_model_turn(payload, records)
+        return self.observer.record_turns[-1]
 
-    def _validate_proxy_model_turn(
-        self, payload: dict[str, Any], records: tuple[SafeFingerprint, ...]
-    ) -> None:
+    def _validate_proxy_model_turn(self, payload: dict[str, Any], records: tuple[SafeFingerprint, ...]) -> None:
         expected = tuple(
             (
                 phase,
-                model_boundary_fingerprint(
-                    self.planner.plan(payload, phase=phase), scenario_order=self.scenario_order
-                ),
+                model_boundary_fingerprint(self.planner.plan(payload, phase=phase), scenario_order=self.scenario_order),
             )
             for phase in self.planner.phases_for(payload)
         )
@@ -286,8 +587,20 @@ def _is_local_projection(response: dict[str, Any]) -> bool:
     return _canonical_local_projection_marker(response) is not None
 
 
-def _preflight_payload(scenario: Any, *, model: str, proxy_policy: bool, no_tools: bool) -> dict[str, Any]:
-    payload = request_payload(scenario, model=model, proxy_policy=proxy_policy and not no_tools)
+def _preflight_payload(
+    scenario: Any,
+    *,
+    model: str,
+    proxy_policy: bool,
+    no_tools: bool,
+    cache_mode: str = "warm-prefix",
+) -> dict[str, Any]:
+    payload = request_payload(
+        scenario,
+        model=model,
+        proxy_policy=proxy_policy and not no_tools,
+        cache_mode=cache_mode,
+    )
     if no_tools:
         payload.pop("tools", None)
         payload.pop("tool_choice", None)
@@ -324,6 +637,7 @@ def failure_row(
     scenario_order: list[str],
     proxy_policy: bool,
     wall_s: float,
+    cache_mode: str = "warm-prefix",
     actual_contract_fingerprints: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a prompt-free benchmark row when the client cannot return a response."""
@@ -400,7 +714,12 @@ def failure_row(
         "contract_fingerprints": actual_contract_fingerprints
         if actual_contract_fingerprints is not None
         else contract_fingerprints(
-            request_payload(scenario, model=model, proxy_policy=proxy_policy),
+            request_payload(
+                scenario,
+                model=model,
+                proxy_policy=proxy_policy,
+                cache_mode=cache_mode,
+            ),
             scenario_order,
             policy_delta={"x-shiftedx-require-receipt": True} if proxy_policy else {},
         ),
@@ -445,8 +764,7 @@ def _atomic_replace_jsonl(output: Path, rows: list[dict[str, Any]]) -> None:
             temporary = Path(handle.name)
             handle.write(
                 "".join(
-                    json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
-                    for item in rows
+                    json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n" for item in rows
                 )
             )
             handle.flush()
@@ -524,6 +842,36 @@ def main() -> None:
         type=Path,
         help="Fresh hash-only ledger from a transparent proxy-to-model qualification observer.",
     )
+    parser.add_argument(
+        "--proxy-request-ledger",
+        type=Path,
+        help="Fresh safe per-downstream-call accounting ledger for proxy reconciliation.",
+    )
+    parser.add_argument(
+        "--runtime-attestation",
+        type=Path,
+        help="Supervisor-issued allowlisted runtime evidence bound to this exact qualification invocation.",
+    )
+    parser.add_argument(
+        "--preflight-runtime-outcome",
+        type=Path,
+        help="Passed supervisor outcome bound to the exact preflight attestation and ledger.",
+    )
+    parser.add_argument(
+        "--direct-runtime-outcome",
+        type=Path,
+        help="Passed direct-treatment outcome required before proxy scoring.",
+    )
+    parser.add_argument(
+        "--cache-mode",
+        choices=("bypass", "warm-prefix"),
+        default="warm-prefix",
+        help="Use deterministic session-cache bypass or the normal primed-prefix lane.",
+    )
+    parser.add_argument("--direct-model-attempt-ledger", type=Path)
+    parser.add_argument("--model-attempt-ledger", type=Path)
+    parser.add_argument("--cache-prime-only", action="store_true")
+    parser.add_argument("--cache-prime-arm", choices=("direct", "proxy"))
     args = parser.parse_args()
 
     selected = scenario_set(args.agentic_set)
@@ -534,7 +882,17 @@ def main() -> None:
     if args.limit is not None:
         selected = selected[: args.limit]
 
+    if args.cache_prime_only:
+        _run_cache_prime(args, selected)
+        return
+
     if args.paired_preflight:
+        if args.direct_model_attempt_ledger is None:
+            raise SystemExit("--paired-preflight requires --direct-model-attempt-ledger")
+        _require_fresh_attempt_path(args.direct_model_attempt_ledger)
+        if args.proxy_request_ledger is None:
+            raise SystemExit("--paired-preflight requires --proxy-request-ledger")
+        _require_fresh_proxy_request_path(args.proxy_request_ledger)
         _run_paired_preflight(args, selected)
         return
     if args.base_url is None:
@@ -544,11 +902,25 @@ def main() -> None:
         or args.candidate_source_commit is None
         or args.candidate_image_digest is None
         or args.run_manifest_sha256 is None
+        or args.runtime_attestation is None
+        or args.preflight_runtime_outcome is None
     ):
         raise SystemExit(
             "scored mode requires --preflight-ledger, --candidate-source-commit, --candidate-image-digest, "
-            "and --run-manifest-sha256"
+            "--run-manifest-sha256, --runtime-attestation, and --preflight-runtime-outcome"
         )
+    if args.proxy_policy and args.direct_runtime_outcome is None:
+        raise SystemExit("scored proxy mode requires --direct-runtime-outcome")
+    if args.proxy_policy and args.proxy_observer_ledger is None:
+        raise SystemExit("scored proxy mode requires --proxy-observer-ledger")
+    if args.proxy_policy and args.proxy_request_ledger is None:
+        raise SystemExit("scored proxy mode requires --proxy-request-ledger")
+    if args.proxy_policy:
+        _require_fresh_proxy_request_path(args.proxy_request_ledger)
+    if not args.proxy_policy and args.direct_model_attempt_ledger is None:
+        raise SystemExit("scored direct mode requires --direct-model-attempt-ledger")
+    if not args.proxy_policy:
+        _require_fresh_attempt_path(args.direct_model_attempt_ledger)
     try:
         validate_run_manifest_sha256(args.run_manifest_sha256)
     except PreflightFailure as error:
@@ -559,30 +931,40 @@ def main() -> None:
         candidate_source_commit=args.candidate_source_commit,
         candidate_image_digest=args.candidate_image_digest,
         contract_digest=qualification_contract_digest(
-            [request_payload(item, model=args.model, proxy_policy=args.proxy_policy) for item in selected],
+            [
+                request_payload(
+                    item,
+                    model=args.model,
+                    proxy_policy=args.proxy_policy,
+                    cache_mode=args.cache_mode,
+                )
+                for item in selected
+            ],
             [item.case_id for item in selected],
             policy_delta={"x-shiftedx-require-receipt": True} if args.proxy_policy else {},
             run_manifest_sha256=args.run_manifest_sha256,
         ),
         arm="proxy" if args.proxy_policy else "direct",
+        cache_lane="cold" if args.cache_mode == "bypass" else "warm-prefix",
         model=args.model,
         run_manifest_sha256=args.run_manifest_sha256,
+        scenario_order=[item.case_id for item in selected],
+        runtime_attestation=args.runtime_attestation,
+        preflight_runtime_outcome=args.preflight_runtime_outcome,
+        direct_runtime_outcome=args.direct_runtime_outcome,
     )
-    api_key = args.api_key_file.read_text().strip() if args.api_key_file is not None else None
-    if args.api_key_file is not None and not api_key:
-        raise SystemExit("--api-key-file must contain a non-empty bearer credential")
+    api_key = _read_key(args.api_key_file)
     client = ProjectionAwareOpenAIClient(args.base_url, api_key=api_key, timeout_s=600.0)
+    client.capture_proxy_accounting = args.proxy_policy
     observer: ModelBoundaryObserverCursor | None = None
     if args.proxy_policy:
-        if args.proxy_observer_ledger is None:
-            raise SystemExit("scored proxy mode requires --proxy-observer-ledger")
         try:
-            observer = ModelBoundaryObserverCursor(
-                args.proxy_observer_ledger, [item.case_id for item in selected]
-            )
+            observer = ModelBoundaryObserverCursor(args.proxy_observer_ledger, [item.case_id for item in selected])
         except PreflightFailure as error:
             raise SystemExit("scored proxy mode requires a fresh proxy model-boundary observer ledger") from error
     run_id = args.run_id or str(uuid.uuid4())
+    direct_attempt_records: list[ModelBoundaryRecord] = []
+    proxy_request_accounting = ProxyRequestAccounting() if args.proxy_policy else None
     for scenario in selected:
         overrides: dict[str, Any] = {
             "temperature": 0.0,
@@ -598,6 +980,8 @@ def main() -> None:
         }
         if args.proxy_policy:
             overrides["x-shiftedx-require-receipt"] = scenario.require_receipt
+        if args.cache_mode == "bypass":
+            overrides["metadata"] = {"cache_mode": "bypass"}
         started = time.perf_counter()
         planned_client: CompatibilityClient | None = None
         try:
@@ -607,6 +991,8 @@ def main() -> None:
                 scenario_order=[item.case_id for item in selected],
                 proxy_policy=args.proxy_policy,
                 observer=observer,
+                require_cache_evidence=True,
+                request_accounting=proxy_request_accounting,
             )
             rows = run_agentic_cases(
                 client=planned_client,
@@ -626,6 +1012,13 @@ def main() -> None:
                 planned_client,
                 {str(row["case_id"]) for row in rows},
             )
+        except asyncio.CancelledError:
+            if proxy_request_accounting is not None:
+                write_request_accounting_ledger(
+                    args.proxy_request_ledger,
+                    proxy_request_accounting.records,
+                )
+            raise
         except Exception as error:  # The failed case is evidence; later cases must still run.
             append_failure(
                 args.output,
@@ -639,19 +1032,85 @@ def main() -> None:
                     scenario_order=[item.case_id for item in selected],
                     proxy_policy=args.proxy_policy,
                     wall_s=time.perf_counter() - started,
+                    cache_mode=args.cache_mode,
                     actual_contract_fingerprints=(
                         planned_client.actual_contract_fingerprints() if planned_client is not None else None
                     ),
                 ),
             )
+        finally:
+            if planned_client is not None and not args.proxy_policy:
+                direct_attempt_records.extend(planned_client.attempt_records)
+    if not args.proxy_policy:
+        write_model_boundary_attempt_ledger(
+            args.direct_model_attempt_ledger,
+            direct_attempt_records,
+        )
+    elif proxy_request_accounting is not None:
+        write_request_accounting_ledger(args.proxy_request_ledger, proxy_request_accounting.records)
+
+
+def _run_cache_prime(args: argparse.Namespace, selected: list[Any]) -> None:
+    if args.cache_mode != "warm-prefix":
+        raise SystemExit("--cache-prime-only requires --cache-mode warm-prefix")
+    if not args.base_url or args.cache_prime_arm is None or args.model_attempt_ledger is None:
+        raise SystemExit("--cache-prime-only requires --base-url, --cache-prime-arm, and --model-attempt-ledger")
+    if not selected:
+        raise SystemExit("--cache-prime-only requires at least one frozen scenario")
+    _require_fresh_attempt_path(args.model_attempt_ledger)
+    api_key = _read_key(args.api_key_file)
+    client = ProjectionAwareOpenAIClient(args.base_url, api_key=api_key, timeout_s=600.0)
+    payload = cache_prime_payload(selected[0], model=args.model, arm=args.cache_prime_arm)
+    try:
+        response = client.complete(payload, stream=False)
+    except Exception as error:
+        write_model_boundary_attempt_ledger(
+            args.model_attempt_ledger,
+            [model_boundary_record(payload, sequence=1, status_code=None, response=None)],
+        )
+        raise SystemExit("cache prime model attempt failed") from error
+    record = model_boundary_record(payload, sequence=1, status_code=200, response=response)
+    write_model_boundary_attempt_ledger(args.model_attempt_ledger, [record])
+    if record.cache is None:
+        raise SystemExit("cache prime response cache evidence is malformed")
+
+
+def _require_fresh_attempt_path(path: Path) -> None:
+    if path.exists() or path.is_symlink():
+        raise SystemExit("refusing to overwrite an existing model-attempt ledger")
+
+
+def _require_fresh_proxy_request_path(path: Path) -> None:
+    if path.exists() or path.is_symlink():
+        raise SystemExit("refusing to overwrite an existing proxy request ledger")
 
 
 def _read_key(path: Path | None) -> str | None:
     if path is None:
         return None
-    value = path.read_text(encoding="utf-8").strip()
+    descriptor: int | None = None
+    try:
+        file_status = path.lstat()
+        if path.is_symlink() or not stat.S_ISREG(file_status.st_mode) or stat.S_IMODE(file_status.st_mode) != 0o600:
+            raise OSError
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened_status = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened_status.st_mode)
+            or stat.S_IMODE(opened_status.st_mode) != 0o600
+            or (opened_status.st_dev, opened_status.st_ino) != (file_status.st_dev, file_status.st_ino)
+        ):
+            raise OSError
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = None
+            value = handle.read().strip()
+    except (OSError, UnicodeDecodeError) as error:
+        raise SystemExit("credential file must be a private mode-0600 regular file") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
     if not value:
-        raise SystemExit(f"{path.name} must contain a non-empty bearer credential")
+        raise SystemExit("credential file must contain a non-empty bearer credential")
     return value
 
 
@@ -683,9 +1142,35 @@ def _run_paired_preflight(args: argparse.Namespace, selected: list[Any]) -> None
         raise SystemExit("selected agentic set has no tool-required scenario for preflight")
     scenario_order = [item.case_id for item in selected]
     contract_digests = _qualification_contract_digests(
-        args.model, selected, scenario_order, args.run_manifest_sha256
+        args.model,
+        selected,
+        scenario_order,
+        args.run_manifest_sha256,
     )
+    runtime_attestation: RuntimeAttestation | None = None
+    try:
+        if args.runtime_attestation is None:
+            raise RuntimeAttestationFailure("runtime_attestation_invalid")
+        runtime_attestation = load_runtime_attestation(
+            args.runtime_attestation,
+            expected_stage="preflight",
+            source_commit=args.candidate_source_commit,
+            image_digest=args.candidate_image_digest,
+            run_manifest_sha256=args.run_manifest_sha256,
+            model=args.model,
+            scenario_order=scenario_order,
+        )
+    except RuntimeAttestationFailure:
+        _record_failed_preflight(
+            args,
+            [],
+            contract_digests,
+            runtime_attestation=None,
+            reason="runtime_attestation_invalid",
+        )
     observations: list[PreflightObservation] = []
+    direct_attempt_records: list[ModelBoundaryRecord] = []
+    proxy_request_accounting = ProxyRequestAccounting()
     try:
         observer = ModelBoundaryObserverCursor(args.proxy_observer_ledger, scenario_order)
         proxy_metrics_key = _read_key(args.proxy_api_key_file)
@@ -694,33 +1179,55 @@ def _run_paired_preflight(args: argparse.Namespace, selected: list[Any]) -> None
             ("direct", args.direct_base_url, _read_key(args.direct_api_key_file), False),
             ("proxy", args.proxy_base_url, proxy_metrics_key, True),
         ):
+            tool_upstream = ProjectionAwareOpenAIClient(base_url, api_key=api_key, timeout_s=600.0)
+            tool_upstream.capture_proxy_accounting = arm == "proxy"
             tool_client = CompatibilityClient(
-                ProjectionAwareOpenAIClient(base_url, api_key=api_key, timeout_s=600.0),
+                tool_upstream,
                 arm=arm,
                 scenario_order=scenario_order,
                 proxy_policy=proxy_policy,
                 observer=observer if arm == "proxy" else None,
+                require_cache_evidence=getattr(args, "direct_model_attempt_ledger", None) is not None or arm == "proxy",
+                request_accounting=proxy_request_accounting if arm == "proxy" else None,
             )
             tool_payload = _preflight_payload(
-                tool_scenario, model=args.model, proxy_policy=proxy_policy, no_tools=False
+                tool_scenario,
+                model=args.model,
+                proxy_policy=proxy_policy,
+                no_tools=False,
+                cache_mode=getattr(args, "cache_mode", "warm-prefix"),
             )
             try:
                 _run_preflight_path(tool_client, tool_payload, tool_required=True)
             finally:
                 observations.append(tool_client.observation(tool_required=True, original_payload=tool_payload))
+                if arm == "direct":
+                    direct_attempt_records.extend(tool_client.attempt_records)
 
+            terminal_upstream = ProjectionAwareOpenAIClient(base_url, api_key=api_key, timeout_s=600.0)
+            terminal_upstream.capture_proxy_accounting = arm == "proxy"
             terminal_client = CompatibilityClient(
-                ProjectionAwareOpenAIClient(base_url, api_key=api_key, timeout_s=600.0),
+                terminal_upstream,
                 arm=arm,
                 scenario_order=scenario_order,
                 proxy_policy=False,
                 observer=observer if arm == "proxy" else None,
+                require_cache_evidence=getattr(args, "direct_model_attempt_ledger", None) is not None or arm == "proxy",
+                request_accounting=proxy_request_accounting if arm == "proxy" else None,
             )
-            terminal_payload = _preflight_payload(tool_scenario, model=args.model, proxy_policy=False, no_tools=True)
+            terminal_payload = _preflight_payload(
+                tool_scenario,
+                model=args.model,
+                proxy_policy=False,
+                no_tools=True,
+                cache_mode=getattr(args, "cache_mode", "warm-prefix"),
+            )
             try:
                 _run_preflight_path(terminal_client, terminal_payload, tool_required=False)
             finally:
                 observations.append(terminal_client.observation(tool_required=False, original_payload=terminal_payload))
+                if arm == "direct":
+                    direct_attempt_records.extend(terminal_client.attempt_records)
         metrics_after = _phase_metrics(args.proxy_metrics_url, proxy_metrics_key)
         proxy_delta = {key: metrics_after[key] - metrics_before[key] for key in metrics_before}
         observer.require_drained()
@@ -732,12 +1239,17 @@ def _run_paired_preflight(args: argparse.Namespace, selected: list[Any]) -> None
         ]
         _assert_preflight(observations)
     except Exception as error:
+        _write_direct_attempt_records(args, direct_attempt_records)
+        _write_proxy_request_records(args, proxy_request_accounting)
         _record_failed_preflight(
             args,
             observations,
             contract_digests,
+            runtime_attestation=runtime_attestation,
             reason=_preflight_failure_reason(error),
         )
+    _write_direct_attempt_records(args, direct_attempt_records)
+    _write_proxy_request_records(args, proxy_request_accounting)
     try:
         write_preflight_ledger(
             args.output,
@@ -746,30 +1258,58 @@ def _run_paired_preflight(args: argparse.Namespace, selected: list[Any]) -> None
             image_digest=args.candidate_image_digest,
             contract_digests=contract_digests,
             run_manifest_sha256=args.run_manifest_sha256,
+            runtime_attestation=runtime_attestation,
         )
     except PreflightFailure as error:
         raise SystemExit("paired preflight failed before scored output: preflight_evidence_write_failed") from error
 
 
 def _qualification_contract_digests(
-    model: str, selected: list[Any], scenario_order: list[str], run_manifest_sha256: str
-) -> dict[str, str]:
+    model: str,
+    selected: list[Any],
+    scenario_order: list[str],
+    run_manifest_sha256: str,
+) -> dict[str, dict[str, str]]:
     return {
-        arm: qualification_contract_digest(
-            [request_payload(item, model=model, proxy_policy=arm == "proxy") for item in selected],
-            scenario_order,
-            policy_delta={"x-shiftedx-require-receipt": True} if arm == "proxy" else {},
-            run_manifest_sha256=run_manifest_sha256,
-        )
-        for arm in ("direct", "proxy")
+        lane: {
+            arm: qualification_contract_digest(
+                [
+                    request_payload(
+                        item,
+                        model=model,
+                        proxy_policy=arm == "proxy",
+                        cache_mode="bypass" if lane == "cold" else "warm-prefix",
+                    )
+                    for item in selected
+                ],
+                scenario_order,
+                policy_delta={"x-shiftedx-require-receipt": True} if arm == "proxy" else {},
+                run_manifest_sha256=run_manifest_sha256,
+            )
+            for arm in ("direct", "proxy")
+        }
+        for lane in ("cold", "warm-prefix")
     }
+
+
+def _write_direct_attempt_records(args: argparse.Namespace, records: list[ModelBoundaryRecord]) -> None:
+    path = getattr(args, "direct_model_attempt_ledger", None)
+    if path is not None:
+        write_model_boundary_attempt_ledger(path, records)
+
+
+def _write_proxy_request_records(args: argparse.Namespace, accounting: ProxyRequestAccounting) -> None:
+    path = getattr(args, "proxy_request_ledger", None)
+    if path is not None:
+        write_request_accounting_ledger(path, accounting.records)
 
 
 def _record_failed_preflight(
     args: argparse.Namespace,
     observations: list[PreflightObservation],
-    contract_digests: dict[str, str],
+    contract_digests: dict[str, dict[str, str]],
     *,
+    runtime_attestation: RuntimeAttestation | None,
     reason: str,
 ) -> None:
     with suppress(PreflightFailure):
@@ -780,12 +1320,15 @@ def _record_failed_preflight(
             image_digest=args.candidate_image_digest,
             contract_digests=contract_digests,
             run_manifest_sha256=args.run_manifest_sha256,
+            runtime_attestation=runtime_attestation,
             failure_reason=reason,
         )
     raise SystemExit(f"paired preflight failed before scored output: {reason}")
 
 
 def _preflight_failure_reason(error: Exception) -> str:
+    if isinstance(error, RuntimeAttestationFailure):
+        return "runtime_attestation_invalid"
     if isinstance(error, PreflightFailure):
         known = {
             "proxy_phase_metrics_unavailable",
