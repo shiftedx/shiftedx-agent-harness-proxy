@@ -23,7 +23,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 
-from .qualification_contract import model_boundary_fingerprint
+from .qualification_contract import model_boundary_record
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -96,11 +96,24 @@ def create_observer_app(config: QualificationObserverConfig) -> FastAPI:
             return Response(status_code=400)
         if not isinstance(payload, dict):
             return Response(status_code=400)
-        _append_observation(state, payload)
-        response = await request.app.state.client.post(
-            f"{state.config.upstream_url}/chat/completions",
-            json=payload,
-            headers=_forwarded_headers(request),
+        try:
+            response = await request.app.state.client.post(
+                f"{state.config.upstream_url}/chat/completions",
+                json=payload,
+                headers=_forwarded_headers(request),
+            )
+        except Exception:
+            _append_observation(state, payload, status_code=None, response_payload=None)
+            raise
+        try:
+            response_payload: Any = response.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            response_payload = None
+        _append_observation(
+            state,
+            payload,
+            status_code=response.status_code,
+            response_payload=response_payload,
         )
         return Response(
             response.content,
@@ -143,14 +156,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-def _append_observation(state: _ObserverState, payload: dict[str, Any]) -> None:
-    fingerprint = model_boundary_fingerprint(payload)
-    record = {
-        "record_type": "qualification_model_boundary",
-        "sequence": state.next_sequence,
-        "digest": fingerprint.digest,
-        "fields": fingerprint.fields,
-    }
+def _append_observation(
+    state: _ObserverState,
+    payload: dict[str, Any],
+    *,
+    status_code: int | None,
+    response_payload: Any,
+) -> None:
+    record = model_boundary_record(
+        payload,
+        sequence=state.next_sequence,
+        status_code=status_code,
+        response=response_payload,
+    ).to_dict()
     serialized = (json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
     descriptor: int | None = None
     try:

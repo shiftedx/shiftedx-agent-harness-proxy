@@ -46,15 +46,48 @@ def test_observer_retains_only_model_boundary_component_hashes(tmp_path) -> None
             "reasoning_effort": "medium",
             "max_tokens": 1024,
         },
+        status_code=200,
+        response_payload={
+            "mtplx_stats": {
+                "prompt_tokens": 17,
+                "cached_tokens": 0,
+                "new_prefill_tokens": 17,
+                "cache_source": "none",
+                "ssd_cache_hit": False,
+                "ssd_cached_tokens": 0,
+                "session_cache_hit": False,
+                "request_session_bank_bypass": True,
+                "session_postcommit_snapshot": {"stored": False},
+            }
+        },
     )
-    _append_observation(app.state.qualification_observer, {"model": "model", "messages": []})
+    _append_observation(
+        app.state.qualification_observer,
+        {"model": "model", "messages": []},
+        status_code=None,
+        response_payload=None,
+    )
 
     rows = [json.loads(line) for line in config.ledger.read_text().splitlines()]
     row = rows[0]
-    assert set(row) == {"record_type", "sequence", "digest", "fields"}
+    assert set(row) == {"record_type", "sequence", "digest", "fields", "response"}
     assert row["record_type"] == "qualification_model_boundary"
     assert row["sequence"] == 1
     assert [item["sequence"] for item in rows] == [1, 2]
+    assert row["response"] == {
+        "status_code": 200,
+        "cache": {
+            "prompt_tokens": 17,
+            "cached_tokens": 0,
+            "new_prefill_tokens": 17,
+            "cache_source": "none",
+            "ssd_cache_hit": False,
+            "ssd_cached_tokens": 0,
+            "session_cache_hit": False,
+            "request_session_bank_bypass": True,
+            "postcommit_stored": False,
+        },
+    }
     assert os.stat(config.ledger).st_mode & 0o777 == 0o600
     serialized = config.ledger.read_text()
     assert "private system marker" not in serialized
@@ -82,7 +115,26 @@ async def test_observer_forwards_only_authorization_and_keeps_chat_payload_out_o
 
     def upstream(request: httpx.Request) -> httpx.Response:
         forwarded.append(request)
-        return httpx.Response(200, json={"object": "list"} if request.url.path.endswith("models") else {"ok": True})
+        return httpx.Response(
+            200,
+            json={"object": "list"}
+            if request.url.path.endswith("models")
+            else {
+                "choices": [{"message": {"content": "private model output"}}],
+                "mtplx_stats": {
+                    "prompt_tokens": 5,
+                    "cached_tokens": 0,
+                    "new_prefill_tokens": 5,
+                    "cache_source": "none",
+                    "ssd_cache_hit": False,
+                    "ssd_cached_tokens": 0,
+                    "session_cache_hit": False,
+                    "request_session_bank_bypass": True,
+                    "session_postcommit_snapshot": {"stored": False},
+                    "private_diagnostic": "do not retain",
+                },
+            },
+        )
 
     async with app.router.lifespan_context(app):
         await app.state.client.aclose()
@@ -103,6 +155,38 @@ async def test_observer_forwards_only_authorization_and_keeps_chat_payload_out_o
     serialized = config.ledger.read_text(encoding="utf-8")
     assert "private prompt" not in serialized
     assert "private-forwarded-token" not in serialized
+    assert "private model output" not in serialized
+    assert "private_diagnostic" not in serialized
+    row = json.loads(serialized)
+    assert row["response"]["status_code"] == 200
+    assert row["response"]["cache"]["request_session_bank_bypass"] is True
+
+
+@pytest.mark.asyncio
+async def test_observer_records_null_response_evidence_before_transport_error(tmp_path) -> None:
+    config = _config(tmp_path)
+    app = create_observer_app(config)
+
+    def unavailable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("private transport detail", request=request)
+
+    async with app.router.lifespan_context(app):
+        await app.state.client.aclose()
+        app.state.client = httpx.AsyncClient(transport=httpx.MockTransport(unavailable))
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=True),
+            base_url="http://observer",
+        ) as client:
+            with pytest.raises(httpx.ConnectError):
+                await client.post(
+                    "/v1/chat/completions",
+                    json={"model": "model", "messages": [{"role": "user", "content": "private"}]},
+                )
+        await app.state.client.aclose()
+
+    row = json.loads(config.ledger.read_text(encoding="utf-8"))
+    assert row["response"] == {"status_code": None, "cache": None}
+    assert "private transport detail" not in config.ledger.read_text(encoding="utf-8")
 
 
 def test_observer_import_is_configuration_isolated_until_explicit_load(monkeypatch) -> None:

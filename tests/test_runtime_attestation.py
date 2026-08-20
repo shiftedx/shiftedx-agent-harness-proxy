@@ -7,13 +7,140 @@ import pytest
 
 from shiftedx_harness_proxy.qualification_contract import (
     BENCHMARK_REVISION,
+    CacheObservation,
+    ModelBoundaryRecord,
+    PreflightFailure,
     RuntimeAttestation,
     RuntimeAttestationFailure,
     RuntimeOutcome,
     RuntimeOutcomeFailure,
     load_runtime_attestation,
     load_runtime_outcome,
+    model_boundary_fingerprint,
+    read_model_boundary_observer_records,
+    write_model_boundary_attempt_ledger,
 )
+
+
+def test_model_boundary_records_load_exact_safe_response_cache_projection(tmp_path) -> None:
+    fingerprint = model_boundary_fingerprint(
+        {
+            "model": "private-model",
+            "messages": [{"role": "user", "content": "private prompt"}],
+            "metadata": {"cache_mode": "bypass"},
+        }
+    )
+    cache = {
+        "prompt_tokens": 31,
+        "cached_tokens": 0,
+        "new_prefill_tokens": 31,
+        "cache_source": "none",
+        "ssd_cache_hit": False,
+        "ssd_cached_tokens": 0,
+        "session_cache_hit": False,
+        "request_session_bank_bypass": True,
+        "postcommit_stored": False,
+    }
+    path = tmp_path / "attempts.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "record_type": "qualification_model_boundary",
+                "sequence": 1,
+                "digest": fingerprint.digest,
+                "fields": fingerprint.fields,
+                "response": {"status_code": 200, "cache": cache},
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+
+    records = read_model_boundary_observer_records(path)
+
+    assert records == (
+        ModelBoundaryRecord(
+            sequence=1,
+            digest=fingerprint.digest,
+            fields=fingerprint.fields,
+            status_code=200,
+            cache=CacheObservation(**cache),
+        ),
+    )
+    assert "private-model" not in path.read_text(encoding="utf-8")
+    assert "private prompt" not in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda row: row.update({"raw_response": {"content": "private output"}}),
+        lambda row: row["response"].update({"diagnostic": "private diagnostic"}),
+        lambda row: row["response"]["cache"].update({"cache_source": "disk"}),
+        lambda row: row["response"]["cache"].update({"prompt_tokens": True}),
+    ],
+)
+def test_model_boundary_records_reject_raw_or_malformed_response_evidence(tmp_path, mutation) -> None:
+    fingerprint = model_boundary_fingerprint({"model": "model", "messages": []})
+    row = {
+        "record_type": "qualification_model_boundary",
+        "sequence": 1,
+        "digest": fingerprint.digest,
+        "fields": fingerprint.fields,
+        "response": {
+            "status_code": 200,
+            "cache": {
+                "prompt_tokens": 1,
+                "cached_tokens": 0,
+                "new_prefill_tokens": 1,
+                "cache_source": "none",
+                "ssd_cache_hit": False,
+                "ssd_cached_tokens": 0,
+                "session_cache_hit": False,
+                "request_session_bank_bypass": True,
+                "postcommit_stored": False,
+            },
+        },
+    }
+    mutation(row)
+    path = tmp_path / "attempts.jsonl"
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+
+    with pytest.raises(PreflightFailure, match="observer ledger is invalid"):
+        read_model_boundary_observer_records(path)
+
+
+def test_model_boundary_attempt_writer_is_mode_0600_no_clobber_and_resequences(tmp_path) -> None:
+    fingerprint = model_boundary_fingerprint({"model": "model", "messages": []})
+    record = ModelBoundaryRecord(9, fingerprint.digest, fingerprint.fields, None, None)
+    output = tmp_path / "attempts.jsonl"
+
+    write_model_boundary_attempt_ledger(output, [record, record])
+
+    assert output.stat().st_mode & 0o777 == 0o600
+    assert [item.sequence for item in read_model_boundary_observer_records(output)] == [1, 2]
+    prior = output.read_bytes()
+    with pytest.raises(PreflightFailure, match="overwrite"):
+        write_model_boundary_attempt_ledger(output, [record])
+    assert output.read_bytes() == prior
+
+
+def test_model_boundary_attempt_writer_rejects_symlink_without_touching_target(tmp_path) -> None:
+    target = tmp_path / "prior.jsonl"
+    target.write_text('{"private":"prior"}\n', encoding="utf-8")
+    output = tmp_path / "attempts.jsonl"
+    output.symlink_to(target)
+    fingerprint = model_boundary_fingerprint({"model": "model", "messages": []})
+    record = ModelBoundaryRecord(1, fingerprint.digest, fingerprint.fields, None, None)
+
+    with pytest.raises(PreflightFailure, match="overwrite"):
+        write_model_boundary_attempt_ledger(output, [record])
+
+    assert target.read_text(encoding="utf-8") == '{"private":"prior"}\n'
 
 
 def test_runtime_attestation_loads_exact_verified_identity(tmp_path) -> None:

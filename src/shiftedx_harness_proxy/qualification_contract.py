@@ -60,6 +60,61 @@ class SafeFingerprint:
 
 
 @dataclass(frozen=True)
+class CacheObservation:
+    """Strict privacy-safe cache evidence from one model response."""
+
+    prompt_tokens: int
+    cached_tokens: int
+    new_prefill_tokens: int
+    cache_source: Literal["none", "ram", "ssd", "unknown"]
+    ssd_cache_hit: bool
+    ssd_cached_tokens: int
+    session_cache_hit: bool
+    request_session_bank_bypass: bool
+    postcommit_stored: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "prompt_tokens": self.prompt_tokens,
+            "cached_tokens": self.cached_tokens,
+            "new_prefill_tokens": self.new_prefill_tokens,
+            "cache_source": self.cache_source,
+            "ssd_cache_hit": self.ssd_cache_hit,
+            "ssd_cached_tokens": self.ssd_cached_tokens,
+            "session_cache_hit": self.session_cache_hit,
+            "request_session_bank_bypass": self.request_session_bank_bypass,
+            "postcommit_stored": self.postcommit_stored,
+        }
+
+
+@dataclass(frozen=True)
+class ModelBoundaryRecord:
+    """One actual model-facing attempt with no request or response content."""
+
+    sequence: int
+    digest: str
+    fields: dict[str, Any]
+    status_code: int | None
+    cache: CacheObservation | None
+
+    @property
+    def fingerprint(self) -> SafeFingerprint:
+        return SafeFingerprint("model_facing_observed", self.digest, self.fields)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "record_type": "qualification_model_boundary",
+            "sequence": self.sequence,
+            "digest": self.digest,
+            "fields": self.fields,
+            "response": {
+                "status_code": self.status_code,
+                "cache": None if self.cache is None else self.cache.to_dict(),
+            },
+        }
+
+
+@dataclass(frozen=True)
 class PreflightObservation:
     """Sanitized outcome of one arm/path preflight execution."""
 
@@ -391,35 +446,155 @@ def model_boundary_fingerprint(
     return SafeFingerprint("model_facing_observed", _sha256(fields), fields)
 
 
+def cache_observation_from_response(response: Any) -> CacheObservation | None:
+    """Project an MTPLX non-stream response to the fixed safe cache contract."""
+    if not isinstance(response, dict):
+        return None
+    stats = response.get("mtplx_stats")
+    if not isinstance(stats, dict):
+        return None
+    postcommit = stats.get("session_postcommit_snapshot")
+    if not isinstance(postcommit, dict):
+        return None
+    return _cache_observation(
+        {
+            "prompt_tokens": stats.get("prompt_tokens"),
+            "cached_tokens": stats.get("cached_tokens"),
+            "new_prefill_tokens": stats.get("new_prefill_tokens"),
+            "cache_source": stats.get("cache_source"),
+            "ssd_cache_hit": stats.get("ssd_cache_hit"),
+            "ssd_cached_tokens": stats.get("ssd_cached_tokens"),
+            "session_cache_hit": stats.get("session_cache_hit"),
+            "request_session_bank_bypass": stats.get("request_session_bank_bypass"),
+            "postcommit_stored": postcommit.get("stored"),
+        }
+    )
+
+
+def model_boundary_record(
+    payload: JsonObject,
+    *,
+    sequence: int,
+    status_code: int | None,
+    response: Any,
+) -> ModelBoundaryRecord:
+    """Build one safe actual-attempt record from ephemeral request/response values."""
+    fingerprint = model_boundary_fingerprint(payload)
+    return ModelBoundaryRecord(
+        sequence=sequence,
+        digest=fingerprint.digest,
+        fields=fingerprint.fields,
+        status_code=status_code,
+        cache=cache_observation_from_response(response),
+    )
+
+
 def read_model_boundary_observer_ledger(
     path: Path, *, allow_missing: bool = False
 ) -> tuple[SafeFingerprint, ...]:
-    """Read a fresh private observer ledger without admitting payload-bearing fields."""
+    """Project strict observer records to the legacy fingerprint-only interface."""
+    return tuple(
+        record.fingerprint
+        for record in read_model_boundary_observer_records(path, allow_missing=allow_missing)
+    )
+
+
+def read_model_boundary_observer_records(
+    path: Path, *, allow_missing: bool = False
+) -> tuple[ModelBoundaryRecord, ...]:
+    """Read strict typed attempt evidence without admitting payload-bearing fields."""
     try:
         if not path.exists() and allow_missing:
             return ()
-        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
-    except (OSError, json.JSONDecodeError) as error:
+        serialized = _read_private_regular_file(path).decode("utf-8")
+        rows = [
+            json.loads(line, object_pairs_hook=_unique_json_object)
+            for line in serialized.splitlines()
+            if line
+        ]
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise PreflightFailure("proxy model-boundary observer ledger is unavailable") from error
     expected_keys = set(_model_boundary_field_keys())
-    fingerprints: list[SafeFingerprint] = []
+    records: list[ModelBoundaryRecord] = []
     for expected_sequence, row in enumerate(rows, start=1):
         fields = row.get("fields") if isinstance(row, dict) else None
         digest = row.get("digest") if isinstance(row, dict) else None
+        response = row.get("response") if isinstance(row, dict) else None
         if (
             not isinstance(row, dict)
-            or set(row) != {"record_type", "sequence", "digest", "fields"}
+            or set(row) != {"record_type", "sequence", "digest", "fields", "response"}
             or row.get("record_type") != "qualification_model_boundary"
             or row.get("sequence") != expected_sequence
+            or isinstance(row.get("sequence"), bool)
             or not isinstance(fields, dict)
             or set(fields) != expected_keys
             or not _safe_model_boundary_fields(fields)
             or not isinstance(digest, str)
             or digest != _sha256(fields)
+            or not isinstance(response, dict)
+            or set(response) != {"status_code", "cache"}
+            or not _safe_status_code(response.get("status_code"))
         ):
             raise PreflightFailure("proxy model-boundary observer ledger is invalid")
-        fingerprints.append(SafeFingerprint("model_facing_observed", digest, fields))
-    return tuple(fingerprints)
+        cache = _cache_observation(response.get("cache"))
+        if response.get("cache") is not None and cache is None:
+            raise PreflightFailure("proxy model-boundary observer ledger is invalid")
+        records.append(
+            ModelBoundaryRecord(
+                sequence=expected_sequence,
+                digest=digest,
+                fields=fields,
+                status_code=response.get("status_code"),
+                cache=cache,
+            )
+        )
+    return tuple(records)
+
+
+def _safe_status_code(value: Any) -> bool:
+    return value is None or (
+        isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599
+    )
+
+
+def _cache_observation(value: Any) -> CacheObservation | None:
+    if value is None:
+        return None
+    keys = {
+        "prompt_tokens",
+        "cached_tokens",
+        "new_prefill_tokens",
+        "cache_source",
+        "ssd_cache_hit",
+        "ssd_cached_tokens",
+        "session_cache_hit",
+        "request_session_bank_bypass",
+        "postcommit_stored",
+    }
+    if not isinstance(value, dict) or set(value) != keys:
+        return None
+    token_fields = (
+        "prompt_tokens",
+        "cached_tokens",
+        "new_prefill_tokens",
+        "ssd_cached_tokens",
+    )
+    if any(
+        not isinstance(value[key], int) or isinstance(value[key], bool) or value[key] < 0
+        for key in token_fields
+    ):
+        return None
+    if value["cache_source"] not in {"none", "ram", "ssd", "unknown"}:
+        return None
+    boolean_fields = (
+        "ssd_cache_hit",
+        "session_cache_hit",
+        "request_session_bank_bypass",
+        "postcommit_stored",
+    )
+    if any(not isinstance(value[key], bool) for key in boolean_fields):
+        return None
+    return CacheObservation(**value)
 
 
 def _safe_model_boundary_fields(fields: dict[str, Any]) -> bool:
@@ -452,6 +627,8 @@ def _safe_model_boundary_fields(fields: dict[str, Any]) -> bool:
     token_budget = fields["token_budget"]
     if token_budget is not None and (not isinstance(token_budget, int) or isinstance(token_budget, bool)):
         return False
+    if fields["cache_mode_policy"] not in {None, "bypass"}:
+        return False
     policy_delta = fields["declared_policy_deltas"]
     return policy_delta in ({}, _expected_harness_policy_delta(), {"harness_system_suffix_sha256": "invalid"})
 
@@ -475,6 +652,7 @@ class ModelBoundaryObserverCursor:
     scenario_order: list[str]
     _cursor: int = 0
     _turns: list[tuple[SafeFingerprint, ...]] = field(default_factory=list)
+    _record_turns: list[tuple[ModelBoundaryRecord, ...]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.path.exists() and self.path.stat().st_size:
@@ -484,28 +662,35 @@ class ModelBoundaryObserverCursor:
     def turns(self) -> tuple[tuple[SafeFingerprint, ...], ...]:
         return tuple(self._turns)
 
+    @property
+    def record_turns(self) -> tuple[tuple[ModelBoundaryRecord, ...], ...]:
+        return tuple(self._record_turns)
+
     def begin_turn(self) -> None:
         """Reject records not consumed by the preceding proxy turn."""
-        observed = read_model_boundary_observer_ledger(self.path, allow_missing=True)
+        observed = read_model_boundary_observer_records(self.path, allow_missing=True)
         if len(observed) != self._cursor:
             raise PreflightFailure("proxy model-boundary observer ledger has stale or missing records")
 
     def consume_turn(self, *, require_records: bool) -> tuple[SafeFingerprint, ...]:
         """Return exactly the records written during the current proxy turn."""
-        observed = read_model_boundary_observer_ledger(self.path, allow_missing=True)
+        observed = read_model_boundary_observer_records(self.path, allow_missing=True)
         if len(observed) < self._cursor:
             raise PreflightFailure("proxy model-boundary observer ledger was truncated")
         records = observed[self._cursor :]
         if require_records and not records:
             raise PreflightFailure("proxy model-boundary observer record count differed")
         self._cursor = len(observed)
-        bound = bind_model_boundary_context(records, self.scenario_order)
+        self._record_turns.append(records)
+        bound = bind_model_boundary_context(
+            tuple(record.fingerprint for record in records), self.scenario_order
+        )
         self._turns.append(bound)
         return bound
 
     def require_drained(self) -> None:
         """Reject observer records that appeared outside the runner's ordered turn sequence."""
-        observed = read_model_boundary_observer_ledger(self.path, allow_missing=True)
+        observed = read_model_boundary_observer_records(self.path, allow_missing=True)
         if len(observed) != self._cursor:
             raise PreflightFailure("proxy model-boundary observer ledger has unconsumed records")
 
@@ -544,6 +729,7 @@ def _model_boundary_fields(payload: JsonObject) -> dict[str, Any]:
             "effort": _safe_policy(payload.get("reasoning_effort")),
         },
         "token_budget": payload.get("max_tokens"),
+        "cache_mode_policy": _cache_mode_policy(payload),
     }
 
 
@@ -558,8 +744,16 @@ def _model_boundary_field_keys() -> tuple[str, ...]:
         "sampler",
         "reasoning",
         "token_budget",
+        "cache_mode_policy",
         "declared_policy_deltas",
     )
+
+
+def _cache_mode_policy(payload: JsonObject) -> Literal["bypass"] | None:
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("cache_mode") == "bypass":
+        return "bypass"
+    return None
 
 
 def _system_prompt(payload: JsonObject) -> Any:
@@ -1003,15 +1197,51 @@ def _ledger_summary(path: Path) -> dict[str, Any] | None:
     )
 
 
+def write_model_boundary_attempt_ledger(
+    output: Path, records: list[ModelBoundaryRecord] | tuple[ModelBoundaryRecord, ...]
+) -> None:
+    """Atomically write fresh, mode-0600, resequenced model-attempt evidence."""
+    serialized: list[dict[str, Any]] = []
+    expected_keys = set(_model_boundary_field_keys())
+    for sequence, record in enumerate(records, start=1):
+        if (
+            not isinstance(record, ModelBoundaryRecord)
+            or set(record.fields) != expected_keys
+            or not _safe_model_boundary_fields(record.fields)
+            or record.digest != _sha256(record.fields)
+            or not _safe_status_code(record.status_code)
+            or (
+                record.cache is not None
+                and _cache_observation(record.cache.to_dict()) != record.cache
+            )
+        ):
+            raise PreflightFailure("model-boundary attempt evidence is invalid")
+        serialized.append(
+            ModelBoundaryRecord(
+                sequence=sequence,
+                digest=record.digest,
+                fields=record.fields,
+                status_code=record.status_code,
+                cache=record.cache,
+            ).to_dict()
+        )
+    _atomic_write_jsonl(output, serialized)
+
+
 def _atomic_write_jsonl(output: Path, records: list[dict[str, Any]]) -> None:
-    if output.exists():
+    if output.exists() or output.is_symlink():
         raise PreflightFailure("refusing to overwrite an existing preflight ledger")
     output.parent.mkdir(parents=True, exist_ok=True)
+    if output.parent.is_symlink():
+        raise PreflightFailure("refusing to overwrite an existing preflight ledger")
     temporary: Path | None = None
     try:
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=output.parent, delete=False) as handle:
             temporary = Path(handle.name)
+            os.fchmod(handle.fileno(), 0o600)
             handle.write("".join(_canonical(record) + "\n" for record in records))
+            handle.flush()
+            os.fsync(handle.fileno())
         try:
             # link(2) gives this immutable evidence writer an atomic no-clobber commit.
             os.link(temporary, output)

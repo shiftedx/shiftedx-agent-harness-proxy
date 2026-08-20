@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -17,7 +18,10 @@ from shiftedx_harness_proxy.projection_accounting import (
     LOCAL_PROJECTION_EXTENSION,
     local_projection_accounting,
 )
-from shiftedx_harness_proxy.qualification_contract import BENCHMARK_REVISION
+from shiftedx_harness_proxy.qualification_contract import (
+    BENCHMARK_REVISION,
+    read_model_boundary_observer_records,
+)
 
 _RUN_MANIFEST_SHA256 = "1" * 64
 
@@ -358,6 +362,21 @@ def test_contract_fingerprint_reports_accidental_sampler_mismatch(monkeypatch):
     assert runner.contract_mismatches(direct, proxy) == ["sampler"]
 
 
+def test_model_boundary_fingerprint_binds_only_safe_cache_mode_policy(monkeypatch):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    normal = runner.request_payload(scenario, model="model", proxy_policy=False)
+    bypass = copy.deepcopy(normal)
+    bypass["metadata"] = {"cache_mode": "bypass"}
+
+    normal_fingerprint = runner.model_boundary_fingerprint(normal)
+    bypass_fingerprint = runner.model_boundary_fingerprint(bypass)
+
+    assert normal_fingerprint.fields["cache_mode_policy"] is None
+    assert bypass_fingerprint.fields["cache_mode_policy"] == "bypass"
+    assert normal_fingerprint.digest != bypass_fingerprint.digest
+
+
 def test_preflight_rejects_invalid_terminal_schema(monkeypatch):
     runner = load_runner(monkeypatch)
     schema = runner.response_format("case", ("status",), {"status": "string"})
@@ -527,6 +546,302 @@ def test_proxy_preflight_counts_native_tool_calls_from_returned_responses(monkey
     assert client.observation(tool_required=True, original_payload=payload).native_acquisition_tool_calls == 1
 
 
+def test_direct_client_records_each_actual_attempt_in_sequence_with_safe_cache(monkeypatch):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+
+    class DirectModel:
+        def complete(self, _payload, *, stream=False):
+            assert stream is False
+            return _cache_response(content='{"status":"passed"}', bypass=True)
+
+    payload = runner._preflight_payload(
+        scenario, model="private-model", proxy_policy=False, no_tools=True
+    )
+    payload["metadata"] = {"cache_mode": "bypass"}
+    client = runner.CompatibilityClient(
+        DirectModel(), arm="direct", scenario_order=[scenario.case_id], proxy_policy=False
+    )
+
+    client.complete(payload)
+    client.complete(payload)
+
+    assert [record.sequence for record in client.attempt_records] == [1, 2]
+    assert all(record.status_code == 200 for record in client.attempt_records)
+    assert all(record.cache is not None for record in client.attempt_records)
+    assert all(record.fields["cache_mode_policy"] == "bypass" for record in client.attempt_records)
+    assert "private-model" not in json.dumps(
+        [record.to_dict() for record in client.attempt_records]
+    )
+
+
+def test_direct_client_records_null_response_before_transport_error(monkeypatch):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+
+    class Unavailable:
+        def complete(self, _payload, *, stream=False):
+            raise ConnectionError("private transport detail")
+
+    client = runner.CompatibilityClient(
+        Unavailable(), arm="direct", scenario_order=[scenario.case_id], proxy_policy=False
+    )
+    payload = runner._preflight_payload(scenario, model="model", proxy_policy=False, no_tools=True)
+
+    with pytest.raises(ConnectionError):
+        client.complete(payload)
+
+    assert len(client.attempt_records) == 1
+    assert client.attempt_records[0].status_code is None
+    assert client.attempt_records[0].cache is None
+
+
+def test_bypass_metadata_reaches_every_direct_phase(monkeypatch):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    sent = []
+
+    class DirectModel:
+        def complete(self, payload, *, stream=False):
+            sent.append(copy.deepcopy(payload))
+            return _cache_response(content='{"status":"passed"}', bypass=True)
+
+    payload = runner.request_payload(scenario, model="model", proxy_policy=False)
+    payload["metadata"] = {"cache_mode": "bypass"}
+    runner.CompatibilityClient(
+        DirectModel(), arm="direct", scenario_order=[scenario.case_id], proxy_policy=False
+    ).complete(payload)
+
+    assert len(sent) == 2
+    assert all(item["metadata"] == {"cache_mode": "bypass"} for item in sent)
+
+
+def test_cache_prime_payload_matches_first_scored_model_facing_digest(monkeypatch):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    scenario_order = [scenario.case_id]
+
+    direct_prime = runner.cache_prime_payload(scenario, model="model", arm="direct")
+    direct_scored = runner.PhasePlanner().plan(
+        runner.request_payload(scenario, model="model", proxy_policy=False),
+        phase="acquisition",
+    )
+    proxy_prime = runner.cache_prime_payload(scenario, model="model", arm="proxy")
+    proxy_scored = runner.PhasePlanner().plan(
+        runner.request_payload(scenario, model="model", proxy_policy=True),
+        phase="acquisition",
+    )
+    proxy_scored["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
+
+    assert runner.model_boundary_fingerprint(
+        direct_prime, scenario_order=scenario_order
+    ).digest == runner.model_boundary_fingerprint(
+        direct_scored, scenario_order=scenario_order
+    ).digest
+    assert runner.model_boundary_fingerprint(
+        proxy_prime, scenario_order=scenario_order
+    ).digest == runner.model_boundary_fingerprint(
+        proxy_scored, scenario_order=scenario_order
+    ).digest
+    assert proxy_prime["messages"][0]["content"].count(HARNESS_SYSTEM_SUFFIX) == 1
+
+
+def test_cache_prime_cli_sends_one_payload_and_writes_only_one_safe_attempt(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    sent = []
+
+    class PrimeClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def complete(self, payload, *, stream=False):
+            sent.append(copy.deepcopy(payload))
+            return _cache_response(content="private model output", bypass=False)
+
+    runner.ProjectionAwareOpenAIClient = PrimeClient
+    attempt_ledger = tmp_path / "prime-attempt.jsonl"
+    scored_output = tmp_path / "must-not-exist.jsonl"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_paired_agentic_trial.py",
+            "--base-url",
+            "http://model.invalid/v1",
+            "--model",
+            "private-model",
+            "--output",
+            str(scored_output),
+            "--variant",
+            "prime",
+            "--cache-mode",
+            "warm-prefix",
+            "--cache-prime-only",
+            "--cache-prime-arm",
+            "proxy",
+            "--model-attempt-ledger",
+            str(attempt_ledger),
+        ],
+    )
+
+    runner.main()
+
+    assert len(sent) == 1
+    assert sent[0]["messages"][0]["content"].count(HARNESS_SYSTEM_SUFFIX) == 1
+    records = read_model_boundary_observer_records(attempt_ledger)
+    assert len(records) == 1
+    assert records[0].cache is not None
+    assert "private-model" not in attempt_ledger.read_text(encoding="utf-8")
+    assert "private model output" not in attempt_ledger.read_text(encoding="utf-8")
+    assert not scored_output.exists()
+
+
+def test_cache_prime_rejects_bypass_before_client_or_output(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+
+    class UnexpectedClient:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("bypass prime must fail before client construction")
+
+    runner.ProjectionAwareOpenAIClient = UnexpectedClient
+    attempt_ledger = tmp_path / "prime-attempt.jsonl"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_paired_agentic_trial.py",
+            "--base-url",
+            "http://model.invalid/v1",
+            "--model",
+            "model",
+            "--output",
+            str(tmp_path / "unused.jsonl"),
+            "--variant",
+            "prime",
+            "--cache-mode",
+            "bypass",
+            "--cache-prime-only",
+            "--cache-prime-arm",
+            "direct",
+            "--model-attempt-ledger",
+            str(attempt_ledger),
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="warm-prefix"):
+        runner.main()
+    assert not attempt_ledger.exists()
+
+
+def test_private_api_key_reader_rejects_symlink_and_non_private_mode(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    target = tmp_path / "key"
+    target.write_text("private credential", encoding="utf-8")
+    target.chmod(0o600)
+    symlink = tmp_path / "key-link"
+    symlink.symlink_to(target)
+
+    with pytest.raises(SystemExit, match="private mode-0600 regular file"):
+        runner._read_key(symlink)
+
+    target.chmod(0o644)
+    with pytest.raises(SystemExit, match="private mode-0600 regular file"):
+        runner._read_key(target)
+
+
+def test_scored_direct_run_writes_actual_attempt_ledger_atomically(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    source_commit = _source_commit()
+    image_digest = "sha256:" + "0" * 64
+    preflight = tmp_path / "preflight.jsonl"
+    preflight_attestation = _write_passing_preflight(
+        runner, preflight, source_commit, image_digest
+    )
+    preflight_outcome, _direct_outcome = _write_passing_scored_prerequisites(
+        tmp_path, preflight, preflight_attestation
+    )
+    output = tmp_path / "direct-live.jsonl"
+    attempts = tmp_path / "direct-attempts.jsonl"
+
+    class DirectClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def complete(self, _payload, *, stream=False):
+            return _cache_response(
+                tool_calls=[{"id": "call-1", "function": {"name": "read_file"}}],
+                bypass=False,
+            )
+
+    def run_cases(*, client, model, output_path, case_id, **_kwargs):
+        scenario = next(
+            item for item in runner.scenario_set("expanded") if item.case_id == case_id
+        )
+        client.complete(runner.request_payload(scenario, model=model, proxy_policy=False))
+        with output_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"case_id": case_id, "passed": True}) + "\n")
+        return [{"case_id": case_id}]
+
+    runner.ProjectionAwareOpenAIClient = DirectClient
+    runner.run_agentic_cases = run_cases
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_paired_agentic_trial.py",
+            "--base-url",
+            "http://model.invalid/v1",
+            "--model",
+            "model",
+            "--output",
+            str(output),
+            "--variant",
+            "direct",
+            "--preflight-ledger",
+            str(preflight),
+            "--candidate-source-commit",
+            source_commit,
+            "--candidate-image-digest",
+            image_digest,
+            "--run-manifest-sha256",
+            _RUN_MANIFEST_SHA256,
+            "--runtime-attestation",
+            str(preflight_attestation),
+            "--preflight-runtime-outcome",
+            str(preflight_outcome),
+            "--direct-model-attempt-ledger",
+            str(attempts),
+        ],
+    )
+
+    runner.main()
+
+    records = read_model_boundary_observer_records(attempts)
+    assert [record.sequence for record in records] == [1, 2]
+    assert all(record.cache is not None for record in records)
+    assert attempts.stat().st_mode & 0o777 == 0o600
+
+
+def _cache_response(*, content="", tool_calls=None, bypass=False):
+    prompt_tokens = 11
+    cached_tokens = 0 if bypass else 5
+    return {
+        "content": content,
+        "tool_calls": tool_calls or [],
+        "mtplx_stats": {
+            "prompt_tokens": prompt_tokens,
+            "cached_tokens": cached_tokens,
+            "new_prefill_tokens": prompt_tokens - cached_tokens,
+            "cache_source": "none" if bypass else "ram",
+            "ssd_cache_hit": False,
+            "ssd_cached_tokens": 0,
+            "session_cache_hit": not bypass,
+            "request_session_bank_bypass": bypass,
+            "session_postcommit_snapshot": {"stored": not bypass},
+        },
+    }
+
+
 def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
     runner = load_runner(monkeypatch)
     scenario = runner.scenario_set("expanded")[0]
@@ -552,29 +867,18 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
                     if payload.get("tools")
                     else (payload,)
                 )
-                with observer.open("a", encoding="utf-8") as handle:
-                    for observed in observed_payloads:
-                        observed["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
-                        fingerprint = runner.model_boundary_fingerprint(observed)
-                        sequence[0] += 1
-                        handle.write(
-                            json.dumps(
-                                {
-                                    "record_type": "qualification_model_boundary",
-                                    "sequence": sequence[0],
-                                    "digest": fingerprint.digest,
-                                    "fields": fingerprint.fields,
-                                },
-                                sort_keys=True,
-                            )
-                            + "\n"
-                        )
+                for observed in observed_payloads:
+                    observed["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
+                    sequence[0] += 1
+                    _append_observer_record(runner, observer, observed, sequence[0])
             if payload.get("tools") and not any(message.get("role") == "tool" for message in payload["messages"]):
-                return {
-                    "content": "",
-                    "tool_calls": [{"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}],
-                }
-            return {"content": '{"status":"passed"}', "tool_calls": []}
+                return _cache_response(
+                    tool_calls=[
+                        {"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}
+                    ],
+                    bypass=True,
+                )
+            return _cache_response(content='{"status":"passed"}', bypass=True)
 
     runner.ProjectionAwareOpenAIClient = FakeClient
     metric_values = iter(({"acquisition": 0, "finalization": 0}, {"acquisition": 2, "finalization": 1}))
@@ -600,12 +904,21 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
         direct_api_key_file=None,
         proxy_api_key_file=None,
         runtime_attestation=runtime_attestation,
+        cache_mode="bypass",
+        direct_model_attempt_ledger=tmp_path / "direct-attempts.jsonl",
         output=tmp_path / "preflight.jsonl",
     )
 
     runner._run_paired_preflight(args, [scenario])
 
     assert '"status":"passed"' in args.output.read_text()
+    direct_attempts = read_model_boundary_observer_records(args.direct_model_attempt_ledger)
+    assert [record.sequence for record in direct_attempts] == [1, 2, 3, 4]
+    assert all(record.fields["cache_mode_policy"] == "bypass" for record in direct_attempts)
+    assert all(record.cache.request_session_bank_bypass for record in direct_attempts if record.cache)
+    proxy_attempts = read_model_boundary_observer_records(observer)
+    assert all(record.fields["cache_mode_policy"] == "bypass" for record in proxy_attempts)
+    assert all(record.cache.request_session_bank_bypass for record in proxy_attempts if record.cache)
 
 
 def test_stale_proxy_observer_ledger_is_rejected_without_overwriting_it(monkeypatch, tmp_path):
@@ -1174,6 +1487,32 @@ def test_proxy_scored_fingerprints_come_from_new_observer_records_in_turn_order(
     ]
 
 
+def test_proxy_success_without_typed_response_cache_evidence_fails_closed(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    observer_path = tmp_path / "observer.jsonl"
+    planner = runner.PhasePlanner()
+
+    class ProxyClient:
+        def complete(self, payload, *, stream=False):
+            observed = planner.plan(payload, phase="acquisition")
+            observed["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
+            _append_observer_record(runner, observer_path, observed, 1, cache=False)
+            return {"content": "", "tool_calls": [{"id": "call-1"}]}
+
+    client = runner.CompatibilityClient(
+        ProxyClient(),
+        arm="proxy",
+        scenario_order=[scenario.case_id],
+        proxy_policy=True,
+        observer=runner.ModelBoundaryObserverCursor(observer_path, [scenario.case_id]),
+        require_cache_evidence=True,
+    )
+
+    with pytest.raises(runner.PreflightFailure, match="response cache evidence"):
+        client.complete(runner.request_payload(scenario, model="model", proxy_policy=True))
+
+
 def test_proxy_observer_missing_stale_or_field_drift_fails_closed_with_safe_partial_evidence(monkeypatch, tmp_path):
     runner = load_runner(monkeypatch)
     scenario = runner.scenario_set("expanded")[0]
@@ -1392,6 +1731,7 @@ def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_re
         image_digest=image_digest,
         runtime_instance_sha256="5" * 64,
     )
+    clients = []
 
     def complete(self, _payload, *, stream=False):
         assert stream is False
@@ -1400,6 +1740,7 @@ def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_re
         )
 
     def run_cases(*, client, model, output_path, case_id, **_kwargs):
+        clients.append(client)
         scenario = next(item for item in runner.scenario_set("expanded") if item.case_id == case_id)
         response = client.complete(runner.request_payload(scenario, model=model, proxy_policy=True))
         assert response[LOCAL_PROJECTION_EXTENSION]["origin"] == "local_projection"
@@ -1456,6 +1797,7 @@ def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_re
         assert fingerprints["model_facing_turns"] == [{"turn_index": 0, "fingerprints": []}]
         assert "error" not in row
     assert not observer_path.exists()
+    assert all(client.attempt_records == () for client in clients)
     assert "private prompt marker" not in output.read_text()
 
 
@@ -1694,8 +2036,9 @@ def _suffix_pair_observations(runner, proxy_system_mutation):
     ]
 
 
-def _append_observer_record(runner, path, payload, sequence):
+def _append_observer_record(runner, path, payload, sequence, *, cache=True):
     fingerprint = runner.model_boundary_fingerprint(payload)
+    bypass = fingerprint.fields["cache_mode_policy"] == "bypass"
     with path.open("a", encoding="utf-8") as handle:
         handle.write(
             json.dumps(
@@ -1704,12 +2047,29 @@ def _append_observer_record(runner, path, payload, sequence):
                     "sequence": sequence,
                     "digest": fingerprint.digest,
                     "fields": fingerprint.fields,
+                    "response": {
+                        "status_code": 200,
+                        "cache": {
+                            "prompt_tokens": 11,
+                            "cached_tokens": 0 if bypass else 5,
+                            "new_prefill_tokens": 11 if bypass else 6,
+                            "cache_source": "none" if bypass else "ram",
+                            "ssd_cache_hit": False,
+                            "ssd_cached_tokens": 0,
+                            "session_cache_hit": not bypass,
+                            "request_session_bank_bypass": bypass,
+                            "postcommit_stored": not bypass,
+                        }
+                        if cache
+                        else None,
+                    },
                 },
                 sort_keys=True,
                 separators=(",", ":"),
             )
             + "\n"
         )
+    path.chmod(0o600)
 
 
 def _preflight_args(tmp_path):
