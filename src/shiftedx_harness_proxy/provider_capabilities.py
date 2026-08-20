@@ -3,11 +3,34 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar, Token
 from typing import Any, Literal
 
 JsonObject = dict[str, Any]
 ToolResponseCapabilityMode = Literal["passthrough", "phase_split"]
 CapabilityPhase = Literal["acquisition", "finalization"]
+
+# This is deliberately process-local accounting context, not request payload metadata.
+# BoundedUpstream reads it only after it owns an upstream slot, immediately before
+# delegating the operation.
+_upstream_phase: ContextVar[CapabilityPhase | None] = ContextVar("upstream_phase", default=None)
+
+
+@contextmanager
+def upstream_phase(phase: CapabilityPhase | None) -> Iterator[None]:
+    """Scope non-serialized phase context to one planned upstream operation."""
+    token: Token[CapabilityPhase | None] = _upstream_phase.set(phase)
+    try:
+        yield
+    finally:
+        _upstream_phase.reset(token)
+
+
+def current_upstream_phase() -> CapabilityPhase | None:
+    """Return phase context for the currently executing upstream operation."""
+    return _upstream_phase.get()
 
 
 def requires_phase_split(

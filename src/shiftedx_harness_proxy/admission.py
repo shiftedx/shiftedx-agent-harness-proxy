@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
 from .config import Settings
 from .errors import ProxyError
+from .provider_capabilities import CapabilityPhase, current_upstream_phase
 from .transport import Upstream
 
 _GLOBAL_BUDGET_KEY = "global"
@@ -184,12 +185,20 @@ class AdmissionController:
 class BoundedUpstream:
     """Apply the upstream-operation budget to every delegated upstream call."""
 
-    def __init__(self, upstream: Upstream, admission: AdmissionController) -> None:
+    def __init__(
+        self,
+        upstream: Upstream,
+        admission: AdmissionController,
+        *,
+        attempt_observer: Callable[[CapabilityPhase | None], None] | None = None,
+    ) -> None:
         self._upstream = upstream
         self._admission = admission
+        self._attempt_observer = attempt_observer or _ignore_attempt
 
     async def chat(self, payload: dict[str, Any], request_headers: dict[str, str]) -> dict[str, Any]:
         async with self._admission.upstream_slot():
+            self._attempt_observer(current_upstream_phase())
             return await self._upstream.chat(payload, request_headers)
 
     async def models(self, request_headers: dict[str, str]) -> dict[str, Any]:
@@ -202,3 +211,7 @@ class BoundedUpstream:
 
     async def close(self) -> None:
         await self._upstream.close()
+
+
+def _ignore_attempt(_phase: CapabilityPhase | None) -> None:
+    return None

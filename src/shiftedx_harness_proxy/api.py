@@ -49,7 +49,13 @@ class Counters:
     phase_finalization: int = 0
     phase_schema_rejections: int = 0
 
-    def observe_phase(self, phase: CapabilityPhase) -> None:
+    def observe_admitted_request(self) -> None:
+        self.downstream_requests += 1
+
+    def observe_upstream_attempt(self, phase: CapabilityPhase | None) -> None:
+        self.upstream_calls += 1
+        if phase is None:
+            return
         if phase == "acquisition":
             self.phase_acquisition += 1
         else:
@@ -57,8 +63,6 @@ class Counters:
 
     def observe(self, result: ChatResult) -> None:
         telemetry = result.telemetry
-        self.downstream_requests += 1
-        self.upstream_calls += telemetry.upstream_calls
         self.blocked_duplicates += telemetry.blocked_duplicates
         self.blocked_stalls += telemetry.blocked_stalls
         self.correction_turns += telemetry.corrections
@@ -107,9 +111,9 @@ class Counters:
 def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
     base_transport = upstream or HttpxUpstream(settings)
     admission = AdmissionController(settings)
-    transport = BoundedUpstream(base_transport, admission)
     counters = Counters()
-    service = ChatService(settings, transport, phase_observer=counters.observe_phase)
+    transport = BoundedUpstream(base_transport, admission, attempt_observer=counters.observe_upstream_attempt)
+    service = ChatService(settings, transport)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -212,6 +216,7 @@ def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
         try:
             async with asyncio.timeout_at(deadline_at):
                 async with admission.admit(principal.budget_key):
+                    counters.observe_admitted_request()
                     payload = await _read_payload(request, settings)
                     harness_header = request.headers.get("x-shiftedx-harness")
                     if harness_header is not None and harness_header.strip().lower() != "off":

@@ -152,7 +152,10 @@ Scrape `/metrics` through the authenticated management path. At minimum alert on
   `shiftedx_proxy_downstream_cancellations_total`;
 - `shiftedx_proxy_downstream_active`, `shiftedx_proxy_downstream_queued`, and
   `shiftedx_proxy_upstream_active`;
-- `shiftedx_proxy_upstream_calls_total`, correction, duplicate/stall, and Local Projection counters;
+- `shiftedx_proxy_downstream_requests_total` and `shiftedx_proxy_upstream_calls_total` together with
+  the authoritative model-server operation ledger; the latter counts every started Chat Completions
+  attempt, including failed and cancelled attempts, while models/readiness traffic is excluded;
+- correction, duplicate/stall, and Local Projection counters;
 - `shiftedx_proxy_phase_acquisition_total`, `shiftedx_proxy_phase_finalization_total`, and
   `shiftedx_proxy_phase_schema_rejections_total` when phase splitting is enabled;
 - ingress accepted/open connections, header/body timeouts, response status, and queue depth;

@@ -6,7 +6,6 @@ import copy
 import json
 import time
 import uuid
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,7 +18,7 @@ from .config import Settings, configured_roles
 from .core import HARNESS_SYSTEM_SUFFIX, AgentHarness, bare_json_issue, normalize_bare_json
 from .errors import ProxyError, UpstreamFailure
 from .projection_accounting import LOCAL_PROJECTION_EXTENSION, local_projection_accounting
-from .provider_capabilities import CapabilityPhase, outbound_payload, requires_phase_split
+from .provider_capabilities import CapabilityPhase, outbound_payload, requires_phase_split, upstream_phase
 from .transcript import (
     PolicyAnnotationError,
     Reconstruction,
@@ -59,14 +58,11 @@ class ChatService:
         self,
         settings: Settings,
         upstream: Upstream,
-        *,
-        phase_observer: Callable[[CapabilityPhase], None] | None = None,
     ) -> None:
         self.settings = settings
         self.upstream = upstream
         self.base_roles = configured_roles(settings)
         self.cache_namespace_fields = settings.cache_namespace_fields()
-        self.phase_observer = phase_observer or _ignore_phase
 
     async def complete(
         self,
@@ -205,9 +201,8 @@ class ChatService:
             attempt_payload = outbound_payload(forwarded, working_messages, phase=phase)
             if harness.force_finalize and not use_phase_split:
                 attempt_payload["tool_choice"] = "none"
-            if phase is not None:
-                self.phase_observer(phase)
-            response = await self.upstream.chat(attempt_payload, request_headers)
+            with upstream_phase(phase):
+                response = await self.upstream.chat(attempt_payload, request_headers)
             upstream_calls += 1
             message = _response_message(response)
             calls = message.get("tool_calls") or []
@@ -309,8 +304,8 @@ class ChatService:
         retries = 0
         while upstream_calls < self.settings.max_upstream_calls:
             attempt_payload = outbound_payload(forwarded, working_messages, phase=phase)
-            self.phase_observer(phase)
-            response = await self.upstream.chat(attempt_payload, request_headers)
+            with upstream_phase(phase):
+                response = await self.upstream.chat(attempt_payload, request_headers)
             upstream_calls += 1
             message = _response_message(response)
             calls = message.get("tool_calls") or []
@@ -343,10 +338,6 @@ def _tool_name(tool: JsonObject) -> str:
     if not isinstance(function, dict) or not isinstance(function.get("name"), str):
         raise ProxyError(400, "invalid_tools", "Every tool must contain function.name.")
     return str(function["name"])
-
-
-def _ignore_phase(_phase: CapabilityPhase) -> None:
-    return None
 
 
 def _off_result(
