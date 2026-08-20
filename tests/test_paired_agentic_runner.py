@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import types
+from dataclasses import replace
 from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
@@ -711,7 +712,8 @@ def test_preflight_ledger_retains_only_hashes_and_allowlisted_outcomes(monkeypat
                 terminal_schema_valid=True,
                 downstream=proxy,
                 model_facing=proxy_phases,
-                proxy_phase_counts={"acquisition": 2, "finalization": 1},
+                proxy_phase_counts={"acquisition": 1, "finalization": 1},
+                proxy_correction_count=0,
             ),
             *[
                 runner.PreflightObservation(
@@ -733,11 +735,128 @@ def test_preflight_ledger_retains_only_hashes_and_allowlisted_outcomes(monkeypat
     )
 
     serialized = output.read_text()
+    rows = [json.loads(line) for line in serialized.splitlines()]
+    proxy_tool_row = next(
+        row for row in rows if row.get("arm") == "proxy" and row.get("path") == "tool_required"
+    )
+    assert proxy_tool_row["proxy_correction_count"] == 0
     assert '"scored":false' in serialized
     assert scenario.prompt not in serialized
     assert "read_file" not in serialized
     assert "private-model" not in serialized
     assert "synthetic preflight tool completed" not in serialized
+
+
+def _run_expansion_observations(runner, proxy_contracts, *, corrections, phase_counts):
+    downstream = runner.SafeFingerprint("downstream", "downstream", {})
+
+    def model(name, phase, tool_choice):
+        return runner.SafeFingerprint(
+            "model_facing",
+            name,
+            {"compatibility": {"phase": phase}, "tool_choice_policy": tool_choice},
+        )
+
+    direct_contracts = (
+        model("direct-auto", "acquisition", "auto"),
+        model("direct-none", "acquisition", "none"),
+        model("direct-final", "finalization", None),
+    )
+    proxy_by_name = {
+        "D1": model("proxy-auto", "acquisition", "auto"),
+        "D2": model("proxy-none", "acquisition", "none"),
+        "D3": model("proxy-final", "finalization", None),
+        "X": model("proxy-drift", "acquisition", "required"),
+    }
+    terminal = model("terminal", "finalization", None)
+    return [
+        runner.PreflightObservation(
+            "direct", True, 2, ("acquisition", "finalization"), True, downstream, direct_contracts
+        ),
+        runner.PreflightObservation(
+            "proxy",
+            True,
+            2,
+            ("acquisition", "finalization"),
+            True,
+            downstream,
+            tuple(proxy_by_name[name] for name in proxy_contracts),
+            phase_counts,
+            corrections,
+        ),
+        runner.PreflightObservation("direct", False, 0, ("terminal",), True, downstream, (terminal,)),
+        runner.PreflightObservation("proxy", False, 0, ("terminal",), True, downstream, (terminal,)),
+    ]
+
+
+def test_preflight_accepts_baseline_equal_runs_without_corrections(monkeypatch):
+    runner = load_runner(monkeypatch)
+
+    runner.assert_preflight(
+        _run_expansion_observations(
+            runner,
+            ("D1", "D2", "D3"),
+            corrections=0,
+            phase_counts={"acquisition": 2, "finalization": 1},
+        )
+    )
+
+
+def test_preflight_accepts_r5_immediate_proxy_correction_run_expansion(monkeypatch):
+    runner = load_runner(monkeypatch)
+
+    runner.assert_preflight(
+        _run_expansion_observations(
+            runner,
+            ("D1", "D2", "D2", "D3"),
+            corrections=1,
+            phase_counts={"acquisition": 3, "finalization": 1},
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("proxy_contracts", "corrections", "phase_counts", "message"),
+    [
+        (("D1", "D3"), 0, {"acquisition": 1, "finalization": 1}, "model-facing"),
+        (("D2", "D1", "D3"), 0, {"acquisition": 2, "finalization": 1}, "model-facing"),
+        (("D1", "X", "D2", "D3"), 1, {"acquisition": 3, "finalization": 1}, "model-facing"),
+        (("D1", "D2", "D3", "D2"), 1, {"acquisition": 3, "finalization": 1}, "model-facing"),
+        (("D1", "D2", "D3", "D3"), 1, {"acquisition": 2, "finalization": 2}, "model-facing"),
+        (("D1", "D2", "D3"), None, {"acquisition": 2, "finalization": 1}, "correction count"),
+        (("D1", "D2", "D2", "D3"), 0, {"acquisition": 3, "finalization": 1}, "correction count"),
+        (("D1", "D2", "D2", "D3"), 2, {"acquisition": 3, "finalization": 1}, "correction count"),
+        (("D1", "D2", "D2", "D3"), 1, {"acquisition": 2, "finalization": 1}, "phase metrics"),
+    ],
+)
+def test_preflight_run_expansion_fails_closed(
+    monkeypatch, proxy_contracts, corrections, phase_counts, message
+):
+    runner = load_runner(monkeypatch)
+
+    with pytest.raises(runner.PreflightFailure, match=message):
+        runner.assert_preflight(
+            _run_expansion_observations(
+                runner,
+                proxy_contracts,
+                corrections=corrections,
+                phase_counts=phase_counts,
+            )
+        )
+
+
+def test_preflight_rejects_proxy_correction_count_outside_the_tool_path(monkeypatch):
+    runner = load_runner(monkeypatch)
+    observations = _run_expansion_observations(
+        runner,
+        ("D1", "D2", "D3"),
+        corrections=0,
+        phase_counts={"acquisition": 2, "finalization": 1},
+    )
+    observations[3] = replace(observations[3], proxy_correction_count=0)
+
+    with pytest.raises(runner.PreflightFailure, match="correction count scope"):
+        runner.assert_preflight(observations)
 
 
 def test_preflight_blocks_collapsed_combined_grammar_before_scored_rows(monkeypatch, tmp_path):
@@ -1678,6 +1797,7 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
                     and (should_call_tool or not finalization_requested)
                     else (
                         planner.plan(payload, phase="acquisition"),
+                        planner.plan(payload, phase="acquisition"),
                         planner.plan(payload, phase="finalization"),
                     )
                     if payload.get("tools")
@@ -1707,7 +1827,7 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
             if self.is_proxy:
                 response[runner.PROXY_RESPONSE_ACCOUNTING] = {
                     "upstream_calls": len(observed_payloads),
-                    "corrections": 0,
+                    "corrections": int(finalization_requested),
                     "blocked_duplicates": 0,
                     "blocked_stalls": 0,
                 }
@@ -1759,6 +1879,7 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
     assert [record.fields["compatibility"]["phase"] for record in proxy_attempts] == [
         "acquisition",
         "acquisition",
+        "acquisition",
         "finalization",
         "finalization",
     ]
@@ -1770,13 +1891,15 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
         "direct": 1,
         "proxy": 1,
     }
-    assert tool_records["proxy"]["proxy_phase_counts"] == {"acquisition": 2, "finalization": 1}
+    assert tool_records["proxy"]["proxy_phase_counts"] == {"acquisition": 3, "finalization": 1}
+    assert tool_records["proxy"]["proxy_correction_count"] == 1
     proxy_requests = read_request_accounting_ledger(args.proxy_request_ledger)
     assert [record.phase_counts for record in proxy_requests] == [
         {"acquisition": 1, "finalization": 0},
-        {"acquisition": 1, "finalization": 1},
+        {"acquisition": 2, "finalization": 1},
         {"acquisition": 0, "finalization": 1},
     ]
+    assert [record.correction_count for record in proxy_requests] == [0, 1, 0]
 
 
 def test_stale_proxy_observer_ledger_is_rejected_without_overwriting_it(monkeypatch, tmp_path):
@@ -1839,10 +1962,14 @@ def test_observed_proxy_model_boundary_drift_is_not_masked_by_matching_plan(monk
     scenario = runner.scenario_set("expanded")[0]
     payload = runner.request_payload(scenario, model="model", proxy_policy=False)
     direct_components = runner.model_boundary_fingerprint(runner.PhasePlanner().plan(payload, phase="acquisition"))
+    direct_final = runner.model_boundary_fingerprint(runner.PhasePlanner().plan(payload, phase="finalization"))
     drifted_payload = runner.PhasePlanner().plan(payload, phase="acquisition")
     drifted_payload["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
     drifted_payload["top_k"] = 99
     proxy_components = runner.model_boundary_fingerprint(drifted_payload)
+    proxy_final_payload = runner.PhasePlanner().plan(payload, phase="finalization")
+    proxy_final_payload["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
+    proxy_final = runner.model_boundary_fingerprint(proxy_final_payload)
     terminal_payload = runner._preflight_payload(scenario, model="model", proxy_policy=False, no_tools=True)
     terminal = runner.model_boundary_fingerprint(terminal_payload)
     proxy_terminal_payload = runner._preflight_payload(scenario, model="model", proxy_policy=False, no_tools=True)
@@ -1851,7 +1978,13 @@ def test_observed_proxy_model_boundary_drift_is_not_masked_by_matching_plan(monk
     fingerprint = runner.SafeFingerprint("downstream", "same", {})
     observations = [
         runner.PreflightObservation(
-            "direct", True, 1, ("acquisition", "finalization"), True, fingerprint, (direct_components,)
+            "direct",
+            True,
+            1,
+            ("acquisition", "finalization"),
+            True,
+            fingerprint,
+            (direct_components, direct_components, direct_final),
         ),
         runner.PreflightObservation(
             "proxy",
@@ -1860,8 +1993,9 @@ def test_observed_proxy_model_boundary_drift_is_not_masked_by_matching_plan(monk
             ("acquisition", "finalization"),
             True,
             fingerprint,
-            (proxy_components,),
+            (proxy_components, proxy_components, proxy_final),
             {"acquisition": 2, "finalization": 1},
+            0,
         ),
         runner.PreflightObservation("direct", False, 0, ("terminal",), True, fingerprint, (terminal,)),
         runner.PreflightObservation("proxy", False, 0, ("terminal",), True, fingerprint, (proxy_terminal,)),
@@ -1998,6 +2132,8 @@ def test_preflight_rejects_proxy_model_identity_drift(monkeypatch):
     proxy_tool = observations[1]
     proxy_model = dict(proxy_tool.model_facing[0].fields)
     proxy_model["model_id_sha256"] = "0" * 64
+    proxy_models = list(proxy_tool.model_facing)
+    proxy_models[0] = runner.SafeFingerprint("model_facing_observed", "identity-drift", proxy_model)
     observations[1] = runner.PreflightObservation(
         proxy_tool.arm,
         proxy_tool.tool_required,
@@ -2005,8 +2141,9 @@ def test_preflight_rejects_proxy_model_identity_drift(monkeypatch):
         proxy_tool.phases,
         proxy_tool.terminal_schema_valid,
         proxy_tool.downstream,
-        (runner.SafeFingerprint("model_facing_observed", "identity-drift", proxy_model),),
+        tuple(proxy_models),
         proxy_tool.proxy_phase_counts,
+        proxy_tool.proxy_correction_count,
     )
 
     with pytest.raises(runner.PreflightFailure, match="model-facing contract mismatch: model_id_sha256"):
@@ -3035,9 +3172,15 @@ def _suffix_pair_observations(runner, proxy_system_mutation):
     direct_tool_model = runner.model_boundary_fingerprint(
         planner.plan(payload, phase="acquisition"), scenario_order=scenario_order
     )
+    direct_tool_final = runner.model_boundary_fingerprint(
+        planner.plan(payload, phase="finalization"), scenario_order=scenario_order
+    )
     proxy_tool_payload = planner.plan(payload, phase="acquisition")
     proxy_tool_payload["messages"][0]["content"] += proxy_system_mutation
     proxy_tool_model = runner.model_boundary_fingerprint(proxy_tool_payload, scenario_order=scenario_order)
+    proxy_tool_final_payload = planner.plan(payload, phase="finalization")
+    proxy_tool_final_payload["messages"][0]["content"] += proxy_system_mutation
+    proxy_tool_final = runner.model_boundary_fingerprint(proxy_tool_final_payload, scenario_order=scenario_order)
     direct_terminal_payload = runner._preflight_payload(scenario, model="model", proxy_policy=False, no_tools=True)
     direct_terminal_model = runner.model_boundary_fingerprint(direct_terminal_payload, scenario_order=scenario_order)
     proxy_terminal_payload = runner._preflight_payload(scenario, model="model", proxy_policy=False, no_tools=True)
@@ -3046,7 +3189,13 @@ def _suffix_pair_observations(runner, proxy_system_mutation):
     downstream = runner.SafeFingerprint("downstream", "same", {})
     return [
         runner.PreflightObservation(
-            "direct", True, 1, ("acquisition", "finalization"), True, downstream, (direct_tool_model,)
+            "direct",
+            True,
+            1,
+            ("acquisition", "finalization"),
+            True,
+            downstream,
+            (direct_tool_model, direct_tool_model, direct_tool_final),
         ),
         runner.PreflightObservation(
             "proxy",
@@ -3055,8 +3204,9 @@ def _suffix_pair_observations(runner, proxy_system_mutation):
             ("acquisition", "finalization"),
             True,
             downstream,
-            (proxy_tool_model,),
+            (proxy_tool_model, proxy_tool_model, proxy_tool_final),
             {"acquisition": 2, "finalization": 1},
+            0,
         ),
         runner.PreflightObservation("direct", False, 0, ("terminal",), True, downstream, (direct_terminal_model,)),
         runner.PreflightObservation("proxy", False, 0, ("terminal",), True, downstream, (proxy_terminal_model,)),
@@ -3360,9 +3510,29 @@ def _write_passing_preflight(runner, output, source_commit, image_digest, contra
     direct_tool_model = runner.model_boundary_fingerprint(
         planner.plan(direct_tool_payload, phase="acquisition"), scenario_order=scenario_order
     )
+    direct_continuation = copy.deepcopy(direct_tool_payload)
+    direct_continuation["tool_choice"] = "none"
+    direct_continuation_acquisition = runner.model_boundary_fingerprint(
+        planner.plan(direct_continuation, phase="acquisition"), scenario_order=scenario_order
+    )
+    direct_continuation_finalization = runner.model_boundary_fingerprint(
+        planner.plan(direct_continuation, phase="finalization"), scenario_order=scenario_order
+    )
     proxy_tool_model_payload = planner.plan(proxy_tool_payload, phase="acquisition")
     proxy_tool_model_payload["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
     proxy_tool_model = runner.model_boundary_fingerprint(proxy_tool_model_payload, scenario_order=scenario_order)
+    proxy_continuation = copy.deepcopy(proxy_tool_payload)
+    proxy_continuation["tool_choice"] = "none"
+    proxy_continuation_acquisition_payload = planner.plan(proxy_continuation, phase="acquisition")
+    proxy_continuation_acquisition_payload["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
+    proxy_continuation_acquisition = runner.model_boundary_fingerprint(
+        proxy_continuation_acquisition_payload, scenario_order=scenario_order
+    )
+    proxy_continuation_finalization_payload = planner.plan(proxy_continuation, phase="finalization")
+    proxy_continuation_finalization_payload["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
+    proxy_continuation_finalization = runner.model_boundary_fingerprint(
+        proxy_continuation_finalization_payload, scenario_order=scenario_order
+    )
     direct_terminal_payload = runner._preflight_payload(scenario, model="model", proxy_policy=False, no_tools=True)
     direct_terminal, _ = runner.request_fingerprints(direct_terminal_payload, scenario_order, policy_delta={})
     direct_terminal_model = runner.model_boundary_fingerprint(direct_terminal_payload, scenario_order=scenario_order)
@@ -3371,7 +3541,13 @@ def _write_passing_preflight(runner, output, source_commit, image_digest, contra
     proxy_terminal_model = runner.model_boundary_fingerprint(proxy_terminal_payload, scenario_order=scenario_order)
     observations = [
         runner.PreflightObservation(
-            "direct", True, 1, ("acquisition", "finalization"), True, direct_tool, (direct_tool_model,)
+            "direct",
+            True,
+            1,
+            ("acquisition", "finalization"),
+            True,
+            direct_tool,
+            (direct_tool_model, direct_continuation_acquisition, direct_continuation_finalization),
         ),
         runner.PreflightObservation(
             "proxy",
@@ -3380,8 +3556,9 @@ def _write_passing_preflight(runner, output, source_commit, image_digest, contra
             ("acquisition", "finalization"),
             True,
             proxy_tool,
-            (proxy_tool_model,),
+            (proxy_tool_model, proxy_continuation_acquisition, proxy_continuation_finalization),
             {"acquisition": 2, "finalization": 1},
+            0,
         ),
         runner.PreflightObservation("direct", False, 0, ("terminal",), True, direct_terminal, (direct_terminal_model,)),
         runner.PreflightObservation("proxy", False, 0, ("terminal",), True, direct_terminal, (proxy_terminal_model,)),
