@@ -71,6 +71,23 @@ _CHECK_KEYS = (
     "errors",
     "model_operations",
 )
+_REQUEST_RECORD_KEYS = frozenset(
+    {
+        "sequence",
+        "outcome",
+        "local_projection",
+        "attempt_sequence_start",
+        "attempt_sequence_end",
+        "attempt_count",
+        "successful_attempt_count",
+        "phase_counts",
+        "retry_attempt_count",
+        "blocked_duplicate_count",
+        "blocked_stall_count",
+    }
+)
+_MAX_PRIVATE_LEDGER_BYTES = 1024 * 1024
+_MAX_REQUEST_RECORDS = 10000
 
 
 class ReconciliationFailure(RuntimeError):
@@ -179,6 +196,126 @@ class ReconciliationResult:
     status: Literal["passed", "failed"]
 
 
+@dataclass(frozen=True)
+class PassedProxyReconciliation:
+    """Validated immutable passed reconciliation artifact identity."""
+
+    path: Path
+    file_sha256: str
+    context: ReconciliationContext
+
+
+def read_request_accounting_ledger(path: Path) -> tuple[RequestAccountingRecord, ...]:
+    """Read one immutable runner request ledger without admitting payload-bearing rows."""
+
+    try:
+        serialized = _read_private_regular_file(path)
+        if not serialized:
+            return ()
+        if not serialized.endswith(b"\n"):
+            raise ValueError
+        lines = serialized.splitlines()
+        if len(lines) > _MAX_REQUEST_RECORDS or any(not line for line in lines):
+            raise ValueError
+        records: list[RequestAccountingRecord] = []
+        for line in lines:
+            value = json.loads(line, object_pairs_hook=_unique_object)
+            if not isinstance(value, dict) or set(value) != _REQUEST_RECORD_KEYS:
+                raise ValueError
+            record = RequestAccountingRecord(
+                sequence=value["sequence"],
+                outcome=value["outcome"],
+                local_projection=value["local_projection"],
+                attempt_sequence_start=value["attempt_sequence_start"],
+                attempt_sequence_end=value["attempt_sequence_end"],
+                attempt_count=value["attempt_count"],
+                successful_attempt_count=value["successful_attempt_count"],
+                phase_counts=value["phase_counts"],
+                retry_attempt_count=value["retry_attempt_count"],
+                blocked_duplicate_count=value["blocked_duplicate_count"],
+                blocked_stall_count=value["blocked_stall_count"],
+            )
+            if not _valid_request_scalars(record):
+                raise ValueError
+            records.append(record)
+        if not _request_sequences_match(records):
+            raise ValueError
+        return tuple(records)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
+        raise ReconciliationFailure("reconciliation_request_ledger_invalid") from None
+
+
+def write_request_accounting_ledger(
+    path: Path, records: Sequence[RequestAccountingRecord]
+) -> None:
+    """Atomically retain the runner's exact payload-free request accounting ledger.
+
+    This is deliberately the sole serialization seam for these records.  The
+    paired runner and runtime both use the same typed validation and private
+    no-clobber writer as the reconciliation reader, so a writer/reader schema
+    cannot drift into admitting a request body or another high-cardinality
+    field.
+    """
+
+    values = tuple(records)
+    if (
+        len(values) > _MAX_REQUEST_RECORDS
+        or not _request_sequences_match(values)
+        or not all(_valid_request_scalars(value) for value in values)
+    ):
+        raise ReconciliationFailure("reconciliation_request_ledger_invalid")
+    payload = b"".join(
+        (
+            _canonical(
+                {
+                    "sequence": record.sequence,
+                    "outcome": record.outcome,
+                    "local_projection": record.local_projection,
+                    "attempt_sequence_start": record.attempt_sequence_start,
+                    "attempt_sequence_end": record.attempt_sequence_end,
+                    "attempt_count": record.attempt_count,
+                    "successful_attempt_count": record.successful_attempt_count,
+                    "phase_counts": dict(record.phase_counts),
+                    "retry_attempt_count": record.retry_attempt_count,
+                    "blocked_duplicate_count": record.blocked_duplicate_count,
+                    "blocked_stall_count": record.blocked_stall_count,
+                }
+            ).encode("utf-8")
+            + b"\n"
+        )
+        for record in values
+    )
+    if len(payload) > _MAX_PRIVATE_LEDGER_BYTES:
+        raise ReconciliationFailure("reconciliation_request_ledger_invalid")
+    _atomic_write_private_payload(
+        path,
+        payload,
+        exists_category="reconciliation_request_ledger_exists",
+        parent_category="reconciliation_request_ledger_parent_invalid",
+        write_category="reconciliation_request_ledger_write_failed",
+    )
+
+
+def load_passed_proxy_reconciliation(
+    path: Path, *, context: ReconciliationContext | None = None
+) -> PassedProxyReconciliation:
+    """Load exactly one passed reconciliation artifact bound to its full final context."""
+
+    try:
+        if context is not None:
+            _validate_context(context)
+        serialized = _read_private_regular_file(path)
+        document = json.loads(serialized, object_pairs_hook=_unique_object)
+    except (ReconciliationFailure, OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise ReconciliationFailure("reconciliation_artifact_invalid") from None
+    actual_context = _artifact_context(document)
+    if actual_context is None or not _valid_passed_artifact(document, actual_context):
+        raise ReconciliationFailure("reconciliation_artifact_invalid")
+    if context is not None and actual_context != context:
+        raise ReconciliationFailure("reconciliation_artifact_invalid")
+    return PassedProxyReconciliation(path, hashlib.sha256(serialized).hexdigest(), actual_context)
+
+
 class ProxyReconciliationSession:
     """One begin/complete reconciliation transaction for a dedicated proxy."""
 
@@ -238,6 +375,17 @@ class ProxyReconciliationSession:
         after_values = after.to_dict()
         deltas = {key: after_values[key] - before_values[key] for key in _METRIC_KEYS}
         if any(value < 0 for value in deltas.values()):
+            record = _artifact_record(
+                context,
+                status="failed",
+                failure_category="reconciliation_metrics_decreased",
+                before=self._before,
+                after=after,
+                deltas=deltas,
+                derived=_derive_or_empty(observer_records, request_records, model_summary),
+                checks={key: key in {"identity", "zero_before"} for key in _CHECK_KEYS},
+            )
+            _write_artifact(artifact_path, record)
             raise ReconciliationFailure("reconciliation_metrics_decreased")
         input_failure = _input_failure_category(observer_records, request_records, model_summary)
         if input_failure is not None:
@@ -330,6 +478,126 @@ def _context_matches_identity(context: ReconciliationContext, identity: Reconcil
         and context.pair_index == identity.pair_index
         and context.attestation_sha256 == identity.attestation_sha256
     )
+
+
+def _valid_passed_artifact(value: object, context: ReconciliationContext) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "record_type",
+        "status",
+        "failure_category",
+        "run_manifest_sha256",
+        "campaign_id_sha256",
+        "slot_ordinal",
+        "cache_lane",
+        "pair_index",
+        "attestation_sha256",
+        "model_evidence_sha256",
+        "observer_ledger_sha256",
+        "request_ledger_sha256",
+        "before_metrics_sha256",
+        "after_metrics_sha256",
+        "deltas",
+        "derived",
+        "checks",
+    }:
+        return False
+    if (
+        value.get("schema_version") != "1.0"
+        or value.get("record_type") != "qualification_proxy_reconciliation"
+        or value.get("status") != "passed"
+        or value.get("failure_category") is not None
+        or value.get("run_manifest_sha256") != context.run_manifest_sha256
+        or value.get("campaign_id_sha256") != context.campaign_id_sha256
+        or value.get("slot_ordinal") != context.slot_ordinal
+        or value.get("cache_lane") != context.cache_lane
+        or value.get("pair_index") != context.pair_index
+        or value.get("attestation_sha256") != context.attestation_sha256
+        or value.get("model_evidence_sha256") != context.model_evidence_sha256
+        or value.get("observer_ledger_sha256") != context.observer_ledger_sha256
+        or value.get("request_ledger_sha256") != context.request_ledger_sha256
+        or not _sha256(value.get("before_metrics_sha256"))
+        or not _sha256(value.get("after_metrics_sha256"))
+    ):
+        return False
+    deltas = value.get("deltas")
+    derived = value.get("derived")
+    checks = value.get("checks")
+    return (
+        isinstance(deltas, dict)
+        and set(deltas) == set(_METRIC_KEYS)
+        and all(_nonnegative_int(item) for item in deltas.values())
+        and isinstance(derived, dict)
+        and set(derived) == set(_DERIVED_KEYS)
+        and all(_nonnegative_int(item) for item in derived.values())
+        and isinstance(checks, dict)
+        and set(checks) == set(_CHECK_KEYS)
+        and all(item is True for item in checks.values())
+    )
+
+
+def _artifact_context(value: object) -> ReconciliationContext | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        context = ReconciliationContext(
+            run_manifest_sha256=value["run_manifest_sha256"],
+            campaign_id_sha256=value["campaign_id_sha256"],
+            slot_ordinal=value["slot_ordinal"],
+            cache_lane=value["cache_lane"],
+            pair_index=value["pair_index"],
+            attestation_sha256=value["attestation_sha256"],
+            model_evidence_sha256=value["model_evidence_sha256"],
+            observer_ledger_sha256=value["observer_ledger_sha256"],
+            request_ledger_sha256=value["request_ledger_sha256"],
+        )
+        _validate_context(context)
+    except (KeyError, ReconciliationFailure, TypeError):
+        return None
+    return context
+
+
+def _read_private_regular_file(path: Path) -> bytes:
+    """Read one bounded mode-0600 file through a stable nofollow descriptor."""
+
+    descriptor: int | None = None
+    try:
+        if not path.is_absolute():
+            raise OSError
+        listed = path.lstat()
+        if path.is_symlink() or not stat.S_ISREG(listed.st_mode) or stat.S_IMODE(listed.st_mode) != 0o600:
+            raise OSError
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or (opened.st_dev, opened.st_ino) != (listed.st_dev, listed.st_ino)
+            or opened.st_size < 0
+            or opened.st_size > _MAX_PRIVATE_LEDGER_BYTES
+        ):
+            raise OSError
+        chunks: list[bytes] = []
+        remaining = opened.st_size + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        value = b"".join(chunks)
+        if len(value) != opened.st_size:
+            raise OSError
+        return value
+    except OSError:
+        raise
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _sha256(value: object) -> bool:
+    return isinstance(value, str) and _SHA256.fullmatch(value) is not None
 
 
 def _snapshot(reader: MetricsReader) -> MetricsSnapshot:
@@ -535,6 +803,12 @@ def _valid_request_scalars(record: object) -> bool:
             record.outcome not in {"succeeded", "failed", "cancelled", "deadline"}
             or not isinstance(record.local_projection, bool)
             or set(record.phase_counts) != {"acquisition", "finalization"}
+            or not _positive_int(record.sequence)
+            or (record.attempt_sequence_start is None) != (record.attempt_sequence_end is None)
+            or record.attempt_sequence_start is not None
+            and not _positive_int(record.attempt_sequence_start)
+            or record.attempt_sequence_end is not None
+            and not _positive_int(record.attempt_sequence_end)
         )
         phase_values = tuple(record.phase_counts.values())
     except (AttributeError, TypeError):
@@ -653,8 +927,32 @@ def _artifact_record(
 
 def _write_artifact(path: Path, record: Mapping[str, object]) -> bytes:
     payload = (_canonical(record) + "\n").encode("utf-8")
-    if path.exists() or path.is_symlink():
-        raise ReconciliationFailure("reconciliation_artifact_exists")
+    return _atomic_write_private_payload(
+        path,
+        payload,
+        exists_category="reconciliation_artifact_exists",
+        parent_category="reconciliation_artifact_parent_invalid",
+        write_category="reconciliation_artifact_write_failed",
+    )
+
+
+def _atomic_write_private_payload(
+    path: Path,
+    payload: bytes,
+    *,
+    exists_category: str,
+    parent_category: str,
+    write_category: str,
+) -> bytes:
+    """Create exactly one descriptor-bound mode-0600 private file.
+
+    A hard-link commit preserves immutable/no-clobber semantics on the opened
+    parent directory.  The descriptor and inode comparisons close rename and
+    symlink races without trusting a pathname after it has been checked.
+    """
+
+    if len(payload) > _MAX_PRIVATE_LEDGER_BYTES:
+        raise ReconciliationFailure(write_category)
     directory: int | None = None
     temporary: int | None = None
     target: int | None = None
@@ -667,13 +965,13 @@ def _write_artifact(path: Path, record: Mapping[str, object]) -> bytes:
             or not stat.S_ISDIR(parent_status.st_mode)
             or stat.S_IMODE(parent_status.st_mode) != 0o700
         ):
-            raise ReconciliationFailure("reconciliation_artifact_parent_invalid")
+            raise ReconciliationFailure(parent_category)
         directory = os.open(
             path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         )
         opened_parent = os.fstat(directory)
         if (opened_parent.st_dev, opened_parent.st_ino) != (parent_status.st_dev, parent_status.st_ino):
-            raise ReconciliationFailure("reconciliation_artifact_parent_invalid")
+            raise ReconciliationFailure(parent_category)
         for nonce in range(128):
             candidate = f".{path.name}.{os.getpid()}.{nonce}"
             try:
@@ -688,7 +986,7 @@ def _write_artifact(path: Path, record: Mapping[str, object]) -> bytes:
             except FileExistsError:
                 continue
         if temporary is None or temporary_name is None:
-            raise ReconciliationFailure("reconciliation_artifact_write_failed")
+            raise ReconciliationFailure(write_category)
         os.fchmod(temporary, 0o600)
         _write_all(temporary, payload)
         os.fsync(temporary)
@@ -702,17 +1000,17 @@ def _write_artifact(path: Path, record: Mapping[str, object]) -> bytes:
             or (target_status.st_dev, target_status.st_ino) != (source_status.st_dev, source_status.st_ino)
             or _read_all(target) != payload
         ):
-            raise ReconciliationFailure("reconciliation_artifact_write_failed")
+            raise ReconciliationFailure(write_category)
         os.unlink(temporary_name, dir_fd=directory)
         temporary_name = None
         os.fsync(directory)
         return payload
     except FileExistsError:
-        raise ReconciliationFailure("reconciliation_artifact_exists") from None
+        raise ReconciliationFailure(exists_category) from None
     except ReconciliationFailure:
         raise
     except OSError:
-        raise ReconciliationFailure("reconciliation_artifact_write_failed") from None
+        raise ReconciliationFailure(write_category) from None
     finally:
         if target is not None:
             os.close(target)
@@ -745,6 +1043,15 @@ def _canonical(value: object) -> str:
 
 def _canonical_sha256(value: object) -> str:
     return hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
 
 
 def _nonnegative_int(value: object) -> bool:

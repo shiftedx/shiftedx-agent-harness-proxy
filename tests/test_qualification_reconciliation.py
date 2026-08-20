@@ -19,6 +19,9 @@ from shiftedx_harness_proxy.qualification_reconciliation import (
     ReconciliationFailure,
     ReconciliationIdentity,
     RequestAccountingRecord,
+    load_passed_proxy_reconciliation,
+    read_request_accounting_ledger,
+    write_request_accounting_ledger,
 )
 
 _ZERO_METRICS = MetricsSnapshot(
@@ -123,6 +126,95 @@ def _request(
     )
 
 
+def _write_request_ledger(path: Path, records: list[RequestAccountingRecord]) -> None:
+    path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "sequence": record.sequence,
+                    "outcome": record.outcome,
+                    "local_projection": record.local_projection,
+                    "attempt_sequence_start": record.attempt_sequence_start,
+                    "attempt_sequence_end": record.attempt_sequence_end,
+                    "attempt_count": record.attempt_count,
+                    "successful_attempt_count": record.successful_attempt_count,
+                    "phase_counts": dict(record.phase_counts),
+                    "retry_attempt_count": record.retry_attempt_count,
+                    "blocked_duplicate_count": record.blocked_duplicate_count,
+                    "blocked_stall_count": record.blocked_stall_count,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+            for record in records
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+
+
+def test_request_ledger_reader_returns_only_contiguous_typed_safe_records(tmp_path: Path) -> None:
+    path = tmp_path / "proxy-requests.jsonl"
+    expected = [
+        _request(1, start=1, end=1, attempts=1, successful=1, acquisition=1),
+        _request(
+            2,
+            start=None,
+            end=None,
+            attempts=0,
+            successful=0,
+            acquisition=0,
+            local_projection=True,
+        ),
+    ]
+    _write_request_ledger(path, expected)
+
+    assert read_request_accounting_ledger(path) == tuple(expected)
+
+
+def test_request_ledger_writer_commits_exact_private_jsonl_once(tmp_path: Path) -> None:
+    path = tmp_path / "proxy-requests.jsonl"
+    records = [_request(1, start=1, end=1, attempts=1, successful=1, acquisition=1)]
+
+    write_request_accounting_ledger(path, records)
+
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert read_request_accounting_ledger(path) == tuple(records)
+    prior = path.read_bytes()
+    with pytest.raises(ReconciliationFailure, match="^reconciliation_request_ledger_exists$"):
+        write_request_accounting_ledger(path, records)
+    assert path.read_bytes() == prior
+
+
+@pytest.mark.parametrize("mutation", ["symlink", "duplicate", "sequence", "raw"])
+def test_request_ledger_reader_rejects_untrusted_or_payload_bearing_rows(tmp_path: Path, mutation: str) -> None:
+    path = tmp_path / "proxy-requests.jsonl"
+    _write_request_ledger(path, [_request(1, start=1, end=1, attempts=1, successful=1, acquisition=1)])
+    if mutation == "symlink":
+        target = tmp_path / "target.jsonl"
+        path.replace(target)
+        path.symlink_to(target)
+    elif mutation == "duplicate":
+        path.write_text('{"sequence":1,"sequence":2}\n', encoding="utf-8")
+        path.chmod(0o600)
+    elif mutation == "sequence":
+        row = json.loads(path.read_text(encoding="utf-8"))
+        row["sequence"] = 2
+        path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+        path.chmod(0o600)
+    else:
+        row = json.loads(path.read_text(encoding="utf-8"))
+        row["private_prompt"] = "must-not-survive"
+        path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+        path.chmod(0o600)
+
+    with pytest.raises(ReconciliationFailure, match="^reconciliation_request_ledger_invalid$") as raised:
+        read_request_accounting_ledger(path)
+
+    assert "must-not-survive" not in str(raised.value)
+
+
 def test_begin_snapshots_zero_metrics_before_action_and_complete_binds_post_action_evidence(
     tmp_path: Path,
 ) -> None:
@@ -142,6 +234,31 @@ def test_begin_snapshots_zero_metrics_before_action_and_complete_binds_post_acti
     document = json.loads(artifact.read_text(encoding="utf-8"))
     assert document["observer_ledger_sha256"] == "5" * 64
     assert document["request_ledger_sha256"] == "6" * 64
+    loaded = load_passed_proxy_reconciliation(artifact, context=_context())
+    assert loaded.file_sha256 == result.file_sha256
+
+
+def test_decreased_post_action_metrics_retain_a_categorical_failed_artifact(tmp_path: Path) -> None:
+    before = replace(_ZERO_METRICS, upstream_calls=2)
+    after = replace(_ZERO_METRICS, upstream_calls=1)
+    # A provider reset between the authenticated begin snapshot and completion
+    # is represented as a lower aggregate counter at this boundary.
+    session = ProxyReconciliationSession(_identity(), FakeMetricsReader(after), before)
+    artifact = tmp_path / "reconciliation.json"
+
+    with pytest.raises(ReconciliationFailure, match="^reconciliation_metrics_decreased$"):
+        session.complete(
+            _context(),
+            [],
+            [],
+            ModelOperationSummary(requests_completed_delta=0, prime_count=0),
+            artifact,
+        )
+
+    document = json.loads(artifact.read_text(encoding="utf-8"))
+    assert document["status"] == "failed"
+    assert document["failure_category"] == "reconciliation_metrics_decreased"
+    assert document["after_metrics_sha256"] is not None
 
 
 def test_complete_rejects_post_action_evidence_context_that_drifts_from_pre_action_identity(
