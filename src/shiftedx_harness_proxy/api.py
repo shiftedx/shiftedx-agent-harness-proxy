@@ -22,6 +22,7 @@ from .admission import AdmissionController, BoundedUpstream
 from .cache_policy import ServerCacheNamespace
 from .config import Settings
 from .errors import ProxyError
+from .provider_capabilities import CapabilityPhase
 from .service import ChatResult, ChatService
 from .transport import HttpxUpstream, Upstream
 
@@ -44,6 +45,15 @@ class Counters:
     cache_namespace_rejections: int = 0
     deadline_expiries: int = 0
     cancellations: int = 0
+    phase_acquisition: int = 0
+    phase_finalization: int = 0
+    phase_schema_rejections: int = 0
+
+    def observe_phase(self, phase: CapabilityPhase) -> None:
+        if phase == "acquisition":
+            self.phase_acquisition += 1
+        else:
+            self.phase_finalization += 1
 
     def observe(self, result: ChatResult) -> None:
         telemetry = result.telemetry
@@ -73,6 +83,9 @@ class Counters:
             "shiftedx_proxy_cache_namespace_rejections_total": self.cache_namespace_rejections,
             "shiftedx_proxy_request_deadline_expiries_total": self.deadline_expiries,
             "shiftedx_proxy_downstream_cancellations_total": self.cancellations,
+            "shiftedx_proxy_phase_acquisition_total": self.phase_acquisition,
+            "shiftedx_proxy_phase_finalization_total": self.phase_finalization,
+            "shiftedx_proxy_phase_schema_rejections_total": self.phase_schema_rejections,
         }
         snapshot = admission.snapshot()
         counters.update(
@@ -95,8 +108,8 @@ def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
     base_transport = upstream or HttpxUpstream(settings)
     admission = AdmissionController(settings)
     transport = BoundedUpstream(base_transport, admission)
-    service = ChatService(settings, transport)
     counters = Counters()
+    service = ChatService(settings, transport, phase_observer=counters.observe_phase)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -135,6 +148,8 @@ def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
             counters.policy_extension_denials += 1
         if exc.code == "untrusted_cache_namespace":
             counters.cache_namespace_rejections += 1
+        if exc.code == "unsupported_phase_split_schema":
+            counters.phase_schema_rejections += 1
         if exc.code == "request_deadline_exceeded":
             counters.deadline_expiries += 1
         if exc.code == "downstream_disconnected":

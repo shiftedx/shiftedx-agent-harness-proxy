@@ -19,6 +19,7 @@ _ANNOTATION_MISSING = object()
 class SchemaContract:
     keys: tuple[str, ...] | None
     types: dict[str, str]
+    strict_primitive_object: bool = False
 
 
 @dataclass(frozen=True)
@@ -115,7 +116,9 @@ def response_schema_contract(response_format: Any) -> SchemaContract:
     if not isinstance(response_format, dict) or response_format.get("type") != "json_schema":
         return SchemaContract(None, {})
     wrapper = response_format.get("json_schema")
-    schema = wrapper.get("schema") if isinstance(wrapper, dict) else None
+    if not isinstance(wrapper, dict):
+        return SchemaContract(None, {})
+    schema = wrapper.get("schema")
     if not isinstance(schema, dict) or schema.get("type") != "object":
         return SchemaContract(None, {})
     properties = schema.get("properties")
@@ -129,7 +132,34 @@ def response_schema_contract(response_format: Any) -> SchemaContract:
         if type_name not in _PRIMITIVE_TYPES:
             return SchemaContract(None, {})
         types[key] = type_name
-    return SchemaContract(tuple(properties), types)
+    return SchemaContract(
+        tuple(properties),
+        types,
+        _is_strict_primitive_object_schema(wrapper, schema, properties),
+    )
+
+
+def _is_strict_primitive_object_schema(
+    wrapper: dict[str, Any], schema: dict[str, Any], properties: dict[str, Any]
+) -> bool:
+    """Accept only contracts whose terminal semantics are fully checked locally."""
+    if wrapper.get("strict") is not True or schema.get("additionalProperties") is not False:
+        return False
+    required = schema.get("required")
+    if not isinstance(required, list) or len(required) != len(properties):
+        return False
+    if any(not isinstance(key, str) for key in required) or set(required) != set(properties):
+        return False
+    allowed_schema_keys = {"type", "properties", "required", "additionalProperties", "title", "description"}
+    if set(schema) - allowed_schema_keys:
+        return False
+    allowed_property_keys = {"type", "title", "description"}
+    return all(
+        isinstance(definition, dict)
+        and set(definition) <= allowed_property_keys
+        and definition.get("type") in _PRIMITIVE_TYPES
+        for definition in properties.values()
+    )
 
 
 def _arguments(call: JsonObject) -> dict[str, Any]:

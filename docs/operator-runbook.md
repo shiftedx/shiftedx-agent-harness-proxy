@@ -26,6 +26,8 @@ Record and retain:
 - release manifest, OCI archive checksum, SBOM, provenance, and green CI URL;
 - `uv.lock`, base-image, Compose files, and configuration digests;
 - fixed upstream URL and model/runtime identity;
+- the process-fixed `UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE`; use `phase_split` only after a
+  synthetic strict primitive-object tool/schema preflight confirms the upstream cannot combine both grammars;
 - ingress limits, host/container profile, monitoring destination, and rollback image;
 - secret owner and rotation procedure without copying secret values into the record.
 
@@ -151,6 +153,8 @@ Scrape `/metrics` through the authenticated management path. At minimum alert on
 - `shiftedx_proxy_downstream_active`, `shiftedx_proxy_downstream_queued`, and
   `shiftedx_proxy_upstream_active`;
 - `shiftedx_proxy_upstream_calls_total`, correction, duplicate/stall, and Local Projection counters;
+- `shiftedx_proxy_phase_acquisition_total`, `shiftedx_proxy_phase_finalization_total`, and
+  `shiftedx_proxy_phase_schema_rejections_total` when phase splitting is enabled;
 - ingress accepted/open connections, header/body timeouts, response status, and queue depth;
 - container RSS/CPU/PIDs/restarts and Upstream Server latency, TTFT, throughput, errors, and cache
   state.

@@ -161,6 +161,34 @@ The proxy reads standard `response_format.json_schema`. Version 1 supports exact
 values, override failed verification, or project nested schemas. The narrow successful verifier
 receipt `N passed` can project into exactly `{status: string, tests: integer}`.
 
+### Tool and response-grammar capability mode
+
+`UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE=passthrough` is the compatibility default: a request keeps
+its compatible `tools`, `tool_choice`, and `response_format` fields unchanged. Set the process-fixed
+mode to `phase_split` only for an upstream such as MTPLX that cannot enforce tool-call and strict
+JSON-schema grammars in one request. In that mode, a combined request is accepted only when its
+`response_format.json_schema` has `strict: true` and is a fully required primitive object with
+`additionalProperties: false`; no nested, array, union, reference, enum, or constrained property is
+accepted for splitting. Any other combined contract fails before an upstream call with
+`unsupported_phase_split_schema`. The public error never echoes schema content.
+
+For an accepted split request, acquisition sends tools without `response_format`. An allowed tool
+call is released unchanged. Once a terminal answer is policy-permitted, the proxy makes a separate
+finalization attempt with the preserved `response_format` but without `tools`, `tool_choice`, or
+`parallel_tool_calls`; it validates and normalizes that final response locally before release.
+Receipt-rejected or invalid acquisition terminals stay in acquisition under the existing correction
+bounds. A finalization tool call is never released.
+
+This translation is independent of Harness policy. A trusted `X-Shiftedx-Harness: off` request in
+`phase_split` mode receives the same acquisition/finalization grammar separation and strict local
+terminal validation, but no harness suffix, receipt policy, or synthetic tool-result state is added.
+Its native acquisition tool calls remain unchanged. In `passthrough` mode, opt-out behavior remains
+an ordinary single upstream request.
+
+`/metrics` exposes only aggregate counters:
+`shiftedx_proxy_phase_acquisition_total`, `shiftedx_proxy_phase_finalization_total`, and
+`shiftedx_proxy_phase_schema_rejections_total`. They have no request-derived labels or content.
+
 ### Local projection accounting
 
 A locally projected completion is a standard `chat.completion` response with an always-present
