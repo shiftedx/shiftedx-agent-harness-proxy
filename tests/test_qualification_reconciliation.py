@@ -108,6 +108,7 @@ def _request(
     retries: int = 0,
     outcome: str = "succeeded",
     local_projection: bool = False,
+    corrections: int = 0,
     blocked_duplicates: int = 0,
     blocked_stalls: int = 0,
 ) -> RequestAccountingRecord:
@@ -123,6 +124,7 @@ def _request(
         retry_attempt_count=retries,
         blocked_duplicate_count=blocked_duplicates,
         blocked_stall_count=blocked_stalls,
+        correction_count=corrections,
     )
 
 
@@ -140,6 +142,7 @@ def _write_request_ledger(path: Path, records: list[RequestAccountingRecord]) ->
                     "successful_attempt_count": record.successful_attempt_count,
                     "phase_counts": dict(record.phase_counts),
                     "retry_attempt_count": record.retry_attempt_count,
+                    "correction_count": record.correction_count,
                     "blocked_duplicate_count": record.blocked_duplicate_count,
                     "blocked_stall_count": record.blocked_stall_count,
                 },
@@ -187,7 +190,7 @@ def test_request_ledger_writer_commits_exact_private_jsonl_once(tmp_path: Path) 
     assert path.read_bytes() == prior
 
 
-@pytest.mark.parametrize("mutation", ["symlink", "duplicate", "sequence", "raw"])
+@pytest.mark.parametrize("mutation", ["symlink", "duplicate", "sequence", "missing-correction", "raw"])
 def test_request_ledger_reader_rejects_untrusted_or_payload_bearing_rows(tmp_path: Path, mutation: str) -> None:
     path = tmp_path / "proxy-requests.jsonl"
     _write_request_ledger(path, [_request(1, start=1, end=1, attempts=1, successful=1, acquisition=1)])
@@ -203,6 +206,11 @@ def test_request_ledger_reader_rejects_untrusted_or_payload_bearing_rows(tmp_pat
         row["sequence"] = 2
         path.write_text(json.dumps(row) + "\n", encoding="utf-8")
         path.chmod(0o600)
+    elif mutation == "missing-correction":
+        row = json.loads(path.read_text(encoding="utf-8"))
+        del row["correction_count"]
+        path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+        path.chmod(0o600)
     else:
         row = json.loads(path.read_text(encoding="utf-8"))
         row["private_prompt"] = "must-not-survive"
@@ -213,6 +221,75 @@ def test_request_ledger_reader_rejects_untrusted_or_payload_bearing_rows(tmp_pat
         read_request_accounting_ledger(path)
 
     assert "must-not-survive" not in str(raised.value)
+
+
+@pytest.mark.parametrize("outcome", ["failed", "cancelled", "deadline"])
+@pytest.mark.parametrize(
+    "count_field", ["correction_count", "blocked_duplicate_count", "blocked_stall_count"]
+)
+def test_request_ledger_reader_rejects_response_telemetry_without_a_successful_response(
+    tmp_path: Path, outcome: str, count_field: str
+) -> None:
+    path = tmp_path / "proxy-requests.jsonl"
+    record = replace(
+        _request(1, start=1, end=1, attempts=1, successful=0, acquisition=1, outcome=outcome),
+        **{count_field: 1},
+    )
+    _write_request_ledger(path, [record])
+
+    with pytest.raises(ReconciliationFailure, match="^reconciliation_request_ledger_invalid$"):
+        read_request_accounting_ledger(path)
+
+
+@pytest.mark.parametrize("outcome", ["failed", "cancelled", "deadline"])
+@pytest.mark.parametrize(
+    "count_field", ["correction_count", "blocked_duplicate_count", "blocked_stall_count"]
+)
+def test_request_ledger_writer_rejects_response_telemetry_without_a_successful_response(
+    tmp_path: Path, outcome: str, count_field: str
+) -> None:
+    path = tmp_path / "proxy-requests.jsonl"
+    record = replace(
+        _request(1, start=1, end=1, attempts=1, successful=0, acquisition=1, outcome=outcome),
+        **{count_field: 1},
+    )
+
+    with pytest.raises(ReconciliationFailure, match="^reconciliation_request_ledger_invalid$"):
+        write_request_accounting_ledger(path, [record])
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("outcome", ["failed", "cancelled", "deadline"])
+@pytest.mark.parametrize(
+    "count_field", ["correction_count", "blocked_duplicate_count", "blocked_stall_count"]
+)
+def test_reconciliation_rejects_response_telemetry_without_a_successful_response(
+    tmp_path: Path, outcome: str, count_field: str
+) -> None:
+    after = replace(
+        _ZERO_METRICS,
+        downstream_requests=1,
+        upstream_calls=1,
+        phase_acquisition=1,
+        errors=1,
+        cancellations=int(outcome == "cancelled"),
+        deadline_expiries=int(outcome == "deadline"),
+    )
+    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, after))
+    record = replace(
+        _request(1, start=1, end=1, attempts=1, successful=0, acquisition=1, outcome=outcome),
+        **{count_field: 1},
+    )
+    artifact = tmp_path / "reconciliation.json"
+
+    with pytest.raises(ReconciliationFailure, match="^reconciliation_request_record_invalid$"):
+        session.complete(
+            _context(),
+            [_observer(1, status_code=500)],
+            [record],
+            ModelOperationSummary(requests_completed_delta=0, prime_count=0),
+            artifact,
+        )
 
 
 def test_begin_snapshots_zero_metrics_before_action_and_complete_binds_post_action_evidence(
@@ -514,6 +591,7 @@ def test_warm_prime_retry_and_local_projection_reconcile_without_counting_prime_
                 acquisition=2,
                 finalization=1,
                 retries=1,
+                corrections=1,
                 blocked_duplicates=2,
                 blocked_stalls=1,
             ),
@@ -696,7 +774,7 @@ def test_metrics_snapshot_rejects_negative_and_boolean_counter_values(value: int
         ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(before))
 
 
-def test_retry_exhaustion_counts_attempts_but_not_success_only_correction_or_block_metrics(tmp_path: Path) -> None:
+def test_retry_exhaustion_counts_attempts_and_has_zero_response_telemetry(tmp_path: Path) -> None:
     after = replace(
         _ZERO_METRICS,
         downstream_requests=1,
@@ -720,8 +798,6 @@ def test_retry_exhaustion_counts_attempts_but_not_success_only_correction_or_blo
                 acquisition=3,
                 retries=2,
                 outcome="failed",
-                blocked_duplicates=2,
-                blocked_stalls=1,
             )
         ],
         ModelOperationSummary(requests_completed_delta=3, prime_count=0),
@@ -733,6 +809,58 @@ def test_retry_exhaustion_counts_attempts_but_not_success_only_correction_or_blo
     assert document["derived"]["total_retry_attempts"] == 2
     assert document["derived"]["successful_corrections"] == 0
     assert document["deltas"]["blocked_duplicates"] == 0
+
+
+def test_response_corrections_reconcile_independently_from_phase_retries_and_one_real_error(
+    tmp_path: Path,
+) -> None:
+    after = replace(
+        _ZERO_METRICS,
+        downstream_requests=2,
+        upstream_calls=8,
+        blocked_stalls=2,
+        correction_turns=1,
+        errors=1,
+        phase_acquisition=8,
+    )
+    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, after))
+    artifact = tmp_path / "reconciliation.json"
+
+    session.complete(
+        _context(),
+        [_observer(sequence) for sequence in range(1, 9)],
+        [
+            _request(
+                1,
+                start=1,
+                end=3,
+                attempts=3,
+                successful=3,
+                acquisition=3,
+                retries=2,
+                corrections=1,
+                blocked_stalls=2,
+            ),
+            _request(
+                2,
+                start=4,
+                end=8,
+                attempts=5,
+                successful=5,
+                acquisition=5,
+                retries=4,
+                outcome="failed",
+            ),
+        ],
+        ModelOperationSummary(requests_completed_delta=8, prime_count=0),
+        artifact,
+    )
+
+    document = json.loads(artifact.read_text(encoding="utf-8"))
+    assert document["status"] == "passed"
+    assert document["derived"]["successful_corrections"] == 1
+    assert document["derived"]["total_retry_attempts"] == 6
+    assert document["derived"]["failed_request_count"] == document["deltas"]["errors"] == 1
 
 
 def test_cancelled_and_deadline_requests_reconcile_exact_error_subcounters(tmp_path: Path) -> None:
@@ -929,6 +1057,20 @@ def test_untyped_observer_is_rejected_without_retaining_raw_fields(tmp_path: Pat
             replace(
                 _request(1, start=1, end=1, attempts=1, successful=1, acquisition=1),
                 blocked_duplicate_count=-1,
+            ),
+            "reconciliation_request_record_invalid",
+        ),
+        (
+            replace(
+                _request(1, start=1, end=1, attempts=1, successful=1, acquisition=1),
+                correction_count=-1,
+            ),
+            "reconciliation_request_record_invalid",
+        ),
+        (
+            replace(
+                _request(1, start=1, end=1, attempts=1, successful=1, acquisition=1),
+                correction_count=cast(Any, True),
             ),
             "reconciliation_request_record_invalid",
         ),

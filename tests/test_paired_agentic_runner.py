@@ -837,7 +837,7 @@ def test_proxy_preflight_counts_native_tool_calls_from_returned_responses(monkey
     assert client.observation(tool_required=True, original_payload=payload).native_acquisition_tool_calls == 1
 
 
-def test_proxy_request_accounting_records_one_safe_row_for_the_actual_downstream_call(monkeypatch, tmp_path):
+def test_proxy_request_accounting_keeps_terminal_corrections_distinct_from_phase_retries(monkeypatch, tmp_path):
     runner = load_runner(monkeypatch)
     scenario = runner.scenario_set("expanded")[0]
     observer_path = tmp_path / "observer.jsonl"
@@ -847,7 +847,7 @@ def test_proxy_request_accounting_records_one_safe_row_for_the_actual_downstream
     class ProxyModel:
         def complete(self, _payload, *, stream=False):
             assert stream is False
-            for sequence, phase in enumerate(("acquisition", "acquisition", "finalization"), start=1):
+            for sequence, phase in enumerate(("acquisition", "acquisition", "acquisition"), start=1):
                 observed = planner.plan(payload, phase=phase)
                 observed["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
                 _append_observer_record(runner, observer_path, observed, sequence)
@@ -857,8 +857,8 @@ def test_proxy_request_accounting_records_one_safe_row_for_the_actual_downstream
                 runner.PROXY_RESPONSE_ACCOUNTING: {
                     "upstream_calls": 3,
                     "corrections": 1,
-                    "blocked_duplicates": 2,
-                    "blocked_stalls": 1,
+                    "blocked_duplicates": 0,
+                    "blocked_stalls": 2,
                 },
             }
 
@@ -884,10 +884,11 @@ def test_proxy_request_accounting_records_one_safe_row_for_the_actual_downstream
             attempt_sequence_end=3,
             attempt_count=3,
             successful_attempt_count=3,
-            phase_counts={"acquisition": 2, "finalization": 1},
-            retry_attempt_count=1,
-            blocked_duplicate_count=2,
-            blocked_stall_count=1,
+            phase_counts={"acquisition": 3, "finalization": 0},
+            retry_attempt_count=2,
+            correction_count=1,
+            blocked_duplicate_count=0,
+            blocked_stall_count=2,
         ),
     )
 
@@ -932,6 +933,7 @@ def test_proxy_request_accounting_records_local_projection_with_exactly_zero_att
         successful_attempt_count=0,
         phase_counts={"acquisition": 0, "finalization": 0},
         retry_attempt_count=0,
+        correction_count=0,
         blocked_duplicate_count=0,
         blocked_stall_count=0,
     )
@@ -983,6 +985,7 @@ def test_proxy_request_accounting_classifies_failed_deadline_and_cancelled_calls
         successful_attempt_count=0,
         phase_counts={"acquisition": 1, "finalization": 0},
         retry_attempt_count=0,
+        correction_count=0,
         blocked_duplicate_count=0,
         blocked_stall_count=0,
     )
@@ -1016,9 +1019,9 @@ def test_proxy_request_accounting_is_exactly_once_after_post_response_validation
                 "tool_calls": [],
                 runner.PROXY_RESPONSE_ACCOUNTING: {
                     "upstream_calls": 1,
-                    "corrections": 0,
+                    "corrections": 1,
                     "blocked_duplicates": 0,
-                    "blocked_stalls": 0,
+                    "blocked_stalls": 2,
                 },
             }
 
@@ -1037,10 +1040,12 @@ def test_proxy_request_accounting_is_exactly_once_after_post_response_validation
         client.complete(payload)
 
     assert len(accounting.records) == 1
-    assert accounting.records[0].outcome == "failed"
+    assert accounting.records[0].outcome == "succeeded"
     assert accounting.records[0].attempt_sequence_start == 1
     assert accounting.records[0].attempt_sequence_end == 1
     assert accounting.records[0].attempt_count == 1
+    assert accounting.records[0].correction_count == 1
+    assert accounting.records[0].blocked_stall_count == 2
 
 
 def test_proxy_http_client_projects_only_exact_safe_telemetry_headers(monkeypatch) -> None:
@@ -1315,6 +1320,7 @@ def test_proxy_request_ledger_is_exact_private_atomic_and_no_clobber(monkeypatch
             "successful_attempt_count": 2,
             "phase_counts": {"acquisition": 1, "finalization": 1},
             "retry_attempt_count": 0,
+            "correction_count": 0,
             "blocked_duplicate_count": 1,
             "blocked_stall_count": 0,
         },
@@ -1328,6 +1334,7 @@ def test_proxy_request_ledger_is_exact_private_atomic_and_no_clobber(monkeypatch
             "successful_attempt_count": 0,
             "phase_counts": {"acquisition": 0, "finalization": 0},
             "retry_attempt_count": 0,
+            "correction_count": 0,
             "blocked_duplicate_count": 0,
             "blocked_stall_count": 0,
         },
