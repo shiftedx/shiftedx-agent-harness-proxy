@@ -223,6 +223,75 @@ def test_request_ledger_reader_rejects_untrusted_or_payload_bearing_rows(tmp_pat
     assert "must-not-survive" not in str(raised.value)
 
 
+@pytest.mark.parametrize("outcome", ["failed", "cancelled", "deadline"])
+@pytest.mark.parametrize(
+    "count_field", ["correction_count", "blocked_duplicate_count", "blocked_stall_count"]
+)
+def test_request_ledger_reader_rejects_response_telemetry_without_a_successful_response(
+    tmp_path: Path, outcome: str, count_field: str
+) -> None:
+    path = tmp_path / "proxy-requests.jsonl"
+    record = replace(
+        _request(1, start=1, end=1, attempts=1, successful=0, acquisition=1, outcome=outcome),
+        **{count_field: 1},
+    )
+    _write_request_ledger(path, [record])
+
+    with pytest.raises(ReconciliationFailure, match="^reconciliation_request_ledger_invalid$"):
+        read_request_accounting_ledger(path)
+
+
+@pytest.mark.parametrize("outcome", ["failed", "cancelled", "deadline"])
+@pytest.mark.parametrize(
+    "count_field", ["correction_count", "blocked_duplicate_count", "blocked_stall_count"]
+)
+def test_request_ledger_writer_rejects_response_telemetry_without_a_successful_response(
+    tmp_path: Path, outcome: str, count_field: str
+) -> None:
+    path = tmp_path / "proxy-requests.jsonl"
+    record = replace(
+        _request(1, start=1, end=1, attempts=1, successful=0, acquisition=1, outcome=outcome),
+        **{count_field: 1},
+    )
+
+    with pytest.raises(ReconciliationFailure, match="^reconciliation_request_ledger_invalid$"):
+        write_request_accounting_ledger(path, [record])
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("outcome", ["failed", "cancelled", "deadline"])
+@pytest.mark.parametrize(
+    "count_field", ["correction_count", "blocked_duplicate_count", "blocked_stall_count"]
+)
+def test_reconciliation_rejects_response_telemetry_without_a_successful_response(
+    tmp_path: Path, outcome: str, count_field: str
+) -> None:
+    after = replace(
+        _ZERO_METRICS,
+        downstream_requests=1,
+        upstream_calls=1,
+        phase_acquisition=1,
+        errors=1,
+        cancellations=int(outcome == "cancelled"),
+        deadline_expiries=int(outcome == "deadline"),
+    )
+    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, after))
+    record = replace(
+        _request(1, start=1, end=1, attempts=1, successful=0, acquisition=1, outcome=outcome),
+        **{count_field: 1},
+    )
+    artifact = tmp_path / "reconciliation.json"
+
+    with pytest.raises(ReconciliationFailure, match="^reconciliation_request_record_invalid$"):
+        session.complete(
+            _context(),
+            [_observer(1, status_code=500)],
+            [record],
+            ModelOperationSummary(requests_completed_delta=0, prime_count=0),
+            artifact,
+        )
+
+
 def test_begin_snapshots_zero_metrics_before_action_and_complete_binds_post_action_evidence(
     tmp_path: Path,
 ) -> None:
@@ -705,7 +774,7 @@ def test_metrics_snapshot_rejects_negative_and_boolean_counter_values(value: int
         ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(before))
 
 
-def test_retry_exhaustion_counts_attempts_but_not_success_only_correction_or_block_metrics(tmp_path: Path) -> None:
+def test_retry_exhaustion_counts_attempts_and_has_zero_response_telemetry(tmp_path: Path) -> None:
     after = replace(
         _ZERO_METRICS,
         downstream_requests=1,
@@ -729,8 +798,6 @@ def test_retry_exhaustion_counts_attempts_but_not_success_only_correction_or_blo
                 acquisition=3,
                 retries=2,
                 outcome="failed",
-                blocked_duplicates=2,
-                blocked_stalls=1,
             )
         ],
         ModelOperationSummary(requests_completed_delta=3, prime_count=0),

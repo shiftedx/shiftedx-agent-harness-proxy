@@ -814,6 +814,14 @@ def _valid_request_scalars(record: object) -> bool:
             and not _positive_int(record.attempt_sequence_start)
             or record.attempt_sequence_end is not None
             and not _positive_int(record.attempt_sequence_end)
+            or record.outcome != "succeeded"
+            and any(
+                (
+                    record.correction_count,
+                    record.blocked_duplicate_count,
+                    record.blocked_stall_count,
+                )
+            )
         )
         phase_values = tuple(record.phase_counts.values())
     except (AttributeError, TypeError):
