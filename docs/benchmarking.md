@@ -63,8 +63,9 @@ Every evidence writer is no-clobber and atomic.
 
 ```bash
 umask 077
-install -d -m 700 benchmark-reports/private
-CAMPAIGN_DIR="$(mktemp -d benchmark-reports/private/qualification.XXXXXX)"
+PRIVATE_ROOT="$(pwd -P)/benchmark-reports/private"
+install -d -m 700 "$PRIVATE_ROOT"
+CAMPAIGN_DIR="$(mktemp -d "$PRIVATE_ROOT"/qualification.XXXXXX)"
 RUN_MANIFEST="/absolute/private/path/approved-qualification-manifest.json"
 
 uv run python scripts/run_qualification_runtime.py \

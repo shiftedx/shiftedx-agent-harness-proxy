@@ -3139,8 +3139,36 @@ def test_campaign_cli_advances_only_the_manifest_derived_next_stage(tmp_path) ->
         )
 
 
+def test_campaign_cli_rejects_relative_campaign_dir_before_creating_campaign_state(tmp_path) -> None:
+    """A relative run root would later produce rejected relative evidence paths."""
+
+    cli = _load_runtime_cli()
+    called = False
+
+    def campaign_advancer(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("relative campaign paths must not reach the advancer")
+
+    with pytest.raises(SystemExit) as raised:
+        cli.main(
+            [
+                "--manifest",
+                str(tmp_path / "approved-manifest.json"),
+                "--private-campaign-dir",
+                "benchmark-reports/private/qualification.relative",
+            ],
+            campaign_advancer=campaign_advancer,
+        )
+
+    assert raised.value.code == 2
+    assert called is False
+
+
 def test_benchmarking_manifest_example_is_duplicate_rejecting_json_with_c1_model_contract() -> None:
     document = (Path(__file__).parents[1] / "docs" / "benchmarking.md").read_text(encoding="utf-8")
+    assert 'PRIVATE_ROOT="$(pwd -P)/benchmark-reports/private"' in document
+    assert 'CAMPAIGN_DIR="$(mktemp -d "$PRIVATE_ROOT"/qualification.XXXXXX)"' in document
     manifest_section = document.split("### Private manifest v1", 1)[1]
     encoded = manifest_section.split("```json\n", 1)[1].split("\n```", 1)[0]
 

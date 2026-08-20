@@ -215,6 +215,10 @@ def main(
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--private-campaign-dir", type=Path, required=True)
     args = parser.parse_args(argv)
+    if not args.manifest.is_absolute():
+        parser.error("--manifest must be an absolute path")
+    if not args.private_campaign_dir.is_absolute():
+        parser.error("--private-campaign-dir must be an absolute path")
     advance = campaign_advancer(
         args.manifest,
         args.private_campaign_dir,
