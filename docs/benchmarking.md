@@ -84,10 +84,13 @@ Run that same command again only after it reports the prior stage complete. It a
 at a time in this fixed order: the sole preflight, then direct/proxy for cold pairs 1–3, then
 direct/proxy for warm-prefix pairs 1–3. An exit status of `2` means the next scored stage requires
 the independently operated MTPLX restart; this includes an intentionally stopped model listener.
-The supervisor recognizes only the hardened transport's categorical no-response sentinel as
-offline, and returns `2` before reserving a slot directory, evidence file, or terminal campaign
-event. Restart the exact frozen model process, then repeat the same command. Any responding but
-malformed, unauthorized, wrong, non-fresh, or otherwise drifted model remains fail-closed. A
+The supervisor recognizes only a typed connection-refused result from its dedicated loopback
+listener probe as offline, and returns `2` before reserving a slot directory, evidence file, or
+terminal campaign event. A timeout or other socket error is indeterminate and fails closed; a live
+listener still proceeds through the hardened no-proxy, no-redirect, bounded HTTP and model-identity
+checks. Restart the exact frozen model process, then repeat the same command. Any responding but
+redirecting, oversized, malformed, unauthorized, wrong, non-fresh, or otherwise drifted model
+remains fail-closed. A
 failure retains its safe outcome after scoped cleanup, appends a terminal campaign event, and never
 authorizes a rerun. A stale labelled container or volume is a failure, never an automatic deletion
 target.

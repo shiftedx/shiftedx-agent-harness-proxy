@@ -624,6 +624,10 @@ class _FakeRuntimeRunner:
     def prepare_model_evidence_contract(self, contract) -> None:
         self.model_contract = contract
 
+    def loopback_listener_state(self, host, port, *, timeout=1.0):
+        del host, port, timeout
+        return "listening"
+
     def _labels(self, argv: tuple[str, ...]) -> dict[str, str]:
         labels: dict[str, str] = {}
         for index, value in enumerate(argv[:-1]):
@@ -1172,6 +1176,40 @@ def test_subprocess_runtime_command_runner_fails_closed_when_no_pinned_tool_exis
 
     assert result.returncode == 125
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [(ConnectionRefusedError(), "refused"), (TimeoutError(), "indeterminate"), (OSError(), "indeterminate")],
+)
+def test_loopback_listener_probe_distinguishes_only_connection_refused(monkeypatch, failure, expected) -> None:
+    def fail_connection(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(runtime_module.socket, "create_connection", fail_connection)
+
+    state = runtime_module.SubprocessRuntimeCommandRunner().loopback_listener_state(
+        "127.0.0.1", 19999
+    )
+
+    assert state == expected
+
+
+def test_loopback_listener_probe_closes_a_live_connection(monkeypatch) -> None:
+    connection = SimpleNamespace(closed=False)
+
+    def close():
+        connection.closed = True
+
+    connection.close = close
+    monkeypatch.setattr(runtime_module.socket, "create_connection", lambda *_args, **_kwargs: connection)
+
+    state = runtime_module.SubprocessRuntimeCommandRunner().loopback_listener_state(
+        "127.0.0.1", 19999
+    )
+
+    assert state == "listening"
+    assert connection.closed is True
 
 
 def test_subprocess_runtime_command_runner_rejects_an_unallowlisted_absolute_tool(monkeypatch, tmp_path) -> None:
@@ -2382,10 +2420,9 @@ def test_campaign_readiness_returns_restart_required_for_a_stopped_model_without
     assert first.kind == "stage_completed"
 
     class OfflineRunner(_FakeRuntimeRunner):
-        def http_json(self, url, *, headers=None, timeout=5.0):
-            if url.startswith("http://127.0.0.1:19999/"):
-                return 0, None
-            return super().http_json(url, headers=headers, timeout=timeout)
+        def loopback_listener_state(self, host, port, *, timeout=1.0):
+            del host, port, timeout
+            return "refused"
 
     offline = OfflineRunner()
     advance = advance_qualification_campaign(
@@ -2436,6 +2473,53 @@ def test_campaign_readiness_does_not_treat_a_responding_wrong_model_as_offline(t
                 command_runner=wrong,
             ),
             readiness_probe=runtime_module.QualificationCampaignReadinessProbe(command_runner=wrong),
+        )
+
+    assert not (private_campaign_dir / "slots" / "01-cold-pair1").exists()
+    assert len(list((private_campaign_dir / "campaign-events").glob("*.json"))) == 1
+
+
+@pytest.mark.parametrize("live_failure", ["redirect", "oversized"])
+def test_campaign_readiness_does_not_treat_a_live_invalid_http_endpoint_as_offline(
+    tmp_path, live_failure
+) -> None:
+    """Redirect and oversize rejection are live-protocol failures, not stopped listeners."""
+
+    manifest = _manifest(tmp_path)
+    private_campaign_dir = _private_run(tmp_path, f"{live_failure}-private-campaign")
+    first = advance_qualification_campaign(
+        manifest,
+        private_campaign_dir,
+        stage_runner=runtime_module.QualificationCampaignStageRunner(
+            action=_write_complete_ledger,
+            command_runner=_FakeRuntimeRunner(),
+        ),
+        readiness_probe=runtime_module.QualificationCampaignReadinessProbe(command_runner=_FakeRuntimeRunner()),
+    )
+    assert first.kind == "stage_completed"
+
+    class LiveInvalidRunner(_FakeRuntimeRunner):
+        def http_json(self, url, *, headers=None, timeout=5.0):
+            if url.startswith("http://127.0.0.1:19999/"):
+                # The hardened HTTP layer rejects both conditions with its
+                # generic status-zero sentinel even though TCP is listening.
+                return 0, None
+            return super().http_json(url, headers=headers, timeout=timeout)
+
+        def loopback_listener_state(self, host, port, *, timeout=1.0):
+            del host, port, timeout
+            return "listening"
+
+    live_invalid = LiveInvalidRunner()
+    with pytest.raises(CampaignFailure, match="campaign_readiness_probe_failed"):
+        advance_qualification_campaign(
+            manifest,
+            private_campaign_dir,
+            stage_runner=runtime_module.QualificationCampaignStageRunner(
+                action=lambda _lease: pytest.fail("a live invalid endpoint must not start a scored stage"),
+                command_runner=live_invalid,
+            ),
+            readiness_probe=runtime_module.QualificationCampaignReadinessProbe(command_runner=live_invalid),
         )
 
     assert not (private_campaign_dir / "slots" / "01-cold-pair1").exists()

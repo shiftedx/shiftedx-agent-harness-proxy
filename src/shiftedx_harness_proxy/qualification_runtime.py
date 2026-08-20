@@ -79,6 +79,7 @@ AttestationStage = Literal["preflight", "scored_proxy"]
 OutcomeStage = Literal["preflight", "scored-direct", "scored-proxy"]
 OutcomeStatus = Literal["passed", "failed", "interrupted"]
 CampaignLane = Literal["preflight", "cold", "warm-prefix"]
+LoopbackListenerState = Literal["listening", "refused", "indeterminate"]
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SOURCE_COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -283,6 +284,10 @@ class RuntimeCommandRunner(Protocol):
         self, url: str, *, headers: dict[str, str] | None = None, timeout: float = 5.0
     ) -> tuple[int, dict[str, Any] | None]: ...
 
+    def loopback_listener_state(
+        self, host: str, port: int, *, timeout: float = 1.0
+    ) -> LoopbackListenerState: ...
+
 
 class _ContainerMetricsReader:
     """Read one authenticated, exact metrics snapshot from the owned proxy only."""
@@ -448,6 +453,20 @@ class SubprocessRuntimeCommandRunner:
         except (UnicodeDecodeError, json.JSONDecodeError):
             return status, None
         return status, document if isinstance(document, dict) else None
+
+    def loopback_listener_state(
+        self, host: str, port: int, *, timeout: float = 1.0
+    ) -> LoopbackListenerState:
+        """Distinguish a refused loopback connection from all ambiguous failures."""
+
+        try:
+            connection = socket.create_connection((host, port), timeout=timeout)
+        except ConnectionRefusedError:
+            return "refused"
+        except (OSError, ValueError):
+            return "indeterminate"
+        connection.close()
+        return "listening"
 
 
 class _RuntimeModelEvidenceProbe:
@@ -1057,7 +1076,7 @@ class QualificationCampaignReadinessProbe:
             # never-written sentinel under the already-owned ``slots`` parent.
             _validate_private_run_dir(request.private_run_dir.parent)
             _validate_credentials(spec.credentials, upstream_authenticated=spec.model.upstream_authenticated)
-            if _model_readiness_state(runner, spec, request.stage, binding) == "offline":
+            if _model_readiness_state(runner, spec) == "offline":
                 return ReadinessResult("restart_required", None)
             session = _begin_model_evidence(
                 runner,
@@ -1078,17 +1097,8 @@ class QualificationCampaignReadinessProbe:
 def _model_readiness_state(
     runner: RuntimeCommandRunner,
     spec: _RuntimeSpec,
-    stage: RuntimeStage,
-    binding: _StageBinding,
 ) -> Literal["offline", "responding"]:
-    """Classify only the hardened transport's no-response sentinel as retryable.
-
-    ``RuntimeCommandRunner.http_json`` uses the same no-proxy, no-redirect,
-    bounded transport as the rest of the runtime.  A zero status is its typed
-    no-listener/transport sentinel; every HTTP response, including malformed,
-    unauthorized, or wrong-model responses, must continue into C1 and fail
-    closed there rather than being mistaken for a planned restart.
-    """
+    """Classify only a typed refused loopback connection as retryable."""
 
     parsed = urlsplit(spec.model.upstream_url)
     host = parsed.hostname
@@ -1096,16 +1106,14 @@ def _model_readiness_state(
     if host is None or port is None:
         raise QualificationRuntimeFailure("runtime_manifest_invalid")
     try:
-        # The injected test seam needs the same immutable contract as its C1
-        # adapter. Production does not expose this hook and stays entirely on
-        # the hardened HTTP path below.
-        prepare = getattr(runner, "prepare_model_evidence_contract", None)
-        if callable(prepare):
-            prepare(_model_evidence_contract(spec, stage, binding))
-        status, _document = runner.http_json(f"http://{_url_host(host)}:{port}/health", timeout=5.0)
+        state = runner.loopback_listener_state(host, port, timeout=1.0)
     except Exception as error:
-        raise QualificationRuntimeFailure("model_probe_failed") from error
-    return "offline" if status == 0 else "responding"
+        raise QualificationRuntimeFailure("model_listener_probe_failed") from error
+    if state == "refused":
+        return "offline"
+    if state == "listening":
+        return "responding"
+    raise QualificationRuntimeFailure("model_listener_probe_failed")
 
 
 def _reserved_stage_paths(
