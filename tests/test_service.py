@@ -376,6 +376,43 @@ async def test_phase_split_terminal_correction_exhaustion_remains_bounded() -> N
 
 
 @pytest.mark.asyncio
+async def test_phase_split_harness_opt_out_keeps_allowed_acquisition_calls_unchanged() -> None:
+    allowed = call("new", "read_file", '{"path":"b.py"}')
+    upstream = ScriptedUpstream([completion(calls=[allowed])])
+    payload = request([{"role": "user", "content": "inspect"}])
+    payload["response_format"] = strict_schema()
+
+    result = await ChatService(
+        Settings(upstream_base_url="http://upstream/v1", upstream_tool_response_capability_mode="phase_split"),
+        upstream,
+    ).complete(payload, {}, harness_enabled=False)
+
+    assert result.body["choices"][0]["message"]["tool_calls"] == [allowed]
+    assert upstream.requests[0]["messages"] == payload["messages"]
+    assert upstream.requests[0]["tools"] == payload["tools"]
+    assert "response_format" not in upstream.requests[0]
+
+
+@pytest.mark.asyncio
+async def test_phase_split_harness_opt_out_rejects_unsupported_combined_schema_before_upstream() -> None:
+    upstream = ScriptedUpstream([])
+    payload = request([{"role": "user", "content": "answer"}])
+    payload["response_format"] = {
+        "type": "json_schema",
+        "json_schema": {"name": "result", "strict": True, "schema": {"type": "array"}},
+    }
+
+    with pytest.raises(ProxyError) as raised:
+        await ChatService(
+            Settings(upstream_base_url="http://upstream/v1", upstream_tool_response_capability_mode="phase_split"),
+            upstream,
+        ).complete(payload, {}, harness_enabled=False)
+
+    assert raised.value.code == "unsupported_phase_split_schema"
+    assert upstream.requests == []
+
+
+@pytest.mark.asyncio
 async def test_phase_split_rejects_complex_combined_schema_without_an_upstream_call() -> None:
     upstream = ScriptedUpstream([])
     payload = request([{"role": "user", "content": "answer"}])

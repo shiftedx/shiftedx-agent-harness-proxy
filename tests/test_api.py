@@ -65,6 +65,13 @@ class PhaseSplitUpstream(EchoUpstream):
         }
 
 
+class OptOutPhaseSplitUpstream(EchoUpstream):
+    async def chat(self, payload: dict[str, Any], request_headers: dict[str, str]) -> dict[str, Any]:
+        self.requests.append(payload)
+        content = "acquisition terminal" if "tools" in payload else '```json\n{"status":"done"}\n```'
+        return {"id": "chatcmpl", "choices": [{"message": {"role": "assistant", "content": content}}]}
+
+
 @pytest.mark.asyncio
 async def test_http_surface_auth_health_streaming_and_unknown_request_passthrough() -> None:
     upstream = EchoUpstream()
@@ -238,6 +245,72 @@ async def test_http_phase_split_complex_schema_fails_closed_without_echoing_or_u
     assert response.json()["error"]["code"] == "unsupported_phase_split_schema"
     assert "items" not in response.text
     assert upstream.requests == []
+    assert "shiftedx_proxy_phase_schema_rejections_total 1" in metrics.text
+
+
+@pytest.mark.asyncio
+async def test_http_phase_split_harness_opt_out_still_uses_safe_two_phase_translation() -> None:
+    upstream = OptOutPhaseSplitUpstream()
+    settings = Settings(
+        upstream_base_url="http://upstream/v1",
+        allow_harness_opt_out=True,
+        trusted_policy_extension_api_keys=SecretStr("trusted-extension"),
+        upstream_tool_response_capability_mode="phase_split",
+    )
+    app = create_app(settings, upstream)
+    schema = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "result",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"status": {"type": "string"}},
+                "required": ["status"],
+                "additionalProperties": False,
+            },
+        },
+    }
+    payload = {
+        "model": "model",
+        "messages": [{"role": "user", "content": "answer"}],
+        "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+        "response_format": schema,
+    }
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer trusted-extension", "X-Shiftedx-Harness": "off"},
+                json=payload,
+            )
+            rejected = await client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer trusted-extension", "X-Shiftedx-Harness": "off"},
+                json={
+                    "model": "model",
+                    "messages": [{"role": "user", "content": "answer"}],
+                    "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {"name": "result", "strict": True, "schema": {"type": "array"}},
+                    },
+                },
+            )
+            metrics = await client.get("/metrics", headers={"Authorization": "Bearer trusted-extension"})
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == '{"status":"done"}'
+    assert upstream.requests[0]["messages"] == payload["messages"]
+    assert upstream.requests[0]["tools"] == payload["tools"]
+    assert "response_format" not in upstream.requests[0]
+    assert upstream.requests[1]["response_format"] == schema
+    assert "tools" not in upstream.requests[1]
+    assert "tool_choice" not in upstream.requests[1]
+    assert rejected.status_code == 400
+    assert rejected.json()["error"]["code"] == "unsupported_phase_split_schema"
+    assert len(upstream.requests) == 2
+    assert "shiftedx_proxy_phase_acquisition_total 1" in metrics.text
+    assert "shiftedx_proxy_phase_finalization_total 1" in metrics.text
     assert "shiftedx_proxy_phase_schema_rejections_total 1" in metrics.text
 
 

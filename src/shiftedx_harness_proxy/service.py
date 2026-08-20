@@ -16,13 +16,14 @@ from .cache_policy import (
     reject_client_cache_namespaces,
 )
 from .config import Settings, configured_roles
-from .core import HARNESS_SYSTEM_SUFFIX, AgentHarness, normalize_bare_json
+from .core import HARNESS_SYSTEM_SUFFIX, AgentHarness, bare_json_issue, normalize_bare_json
 from .errors import ProxyError, UpstreamFailure
 from .projection_accounting import LOCAL_PROJECTION_EXTENSION, local_projection_accounting
 from .provider_capabilities import CapabilityPhase, outbound_payload, requires_phase_split
 from .transcript import (
     PolicyAnnotationError,
     Reconstruction,
+    SchemaContract,
     prepare_tools,
     reconstruct,
     response_schema_contract,
@@ -126,20 +127,6 @@ class ChatService:
             trusted_policy_extension_used or role_extension_used or require_receipt_override is False
         )
 
-        if not harness_enabled:
-            body = _without_reserved_projection_marker(await self.upstream.chat(forwarded, request_headers))
-            return ChatResult(
-                body,
-                PolicyTelemetry(
-                    "off",
-                    0,
-                    0,
-                    0,
-                    1,
-                    (time.perf_counter() - started) * 1000,
-                    policy_extensions_used=int(policy_extension_used),
-                ),
-            )
         contract = response_schema_contract(forwarded.get("response_format"))
         if (
             self.settings.upstream_tool_response_capability_mode == "phase_split"
@@ -158,6 +145,28 @@ class ChatService:
             has_response_format="response_format" in forwarded,
             strict_schema_supported=contract.strict_primitive_object,
         )
+        if not harness_enabled:
+            if use_phase_split:
+                return await self._complete_phase_split_without_harness(
+                    forwarded,
+                    request_headers,
+                    started=started,
+                    contract=contract,
+                    policy_extension_used=policy_extension_used,
+                )
+            body = _without_reserved_projection_marker(await self.upstream.chat(forwarded, request_headers))
+            return ChatResult(
+                body,
+                PolicyTelemetry(
+                    "off",
+                    0,
+                    0,
+                    0,
+                    1,
+                    (time.perf_counter() - started) * 1000,
+                    policy_extensions_used=int(policy_extension_used),
+                ),
+            )
         available = {_tool_name(tool) for tool in tools}
         require_receipt = (
             self.settings.require_receipt_when_tools_present
@@ -291,6 +300,50 @@ class ChatService:
             "The harness could not obtain a safe response within configured bounds.",
         )
 
+    async def _complete_phase_split_without_harness(
+        self,
+        forwarded: JsonObject,
+        request_headers: dict[str, str],
+        *,
+        started: float,
+        contract: SchemaContract,
+        policy_extension_used: bool,
+    ) -> ChatResult:
+        """Translate grammar phases without injecting harness state into opt-out traffic."""
+        working_messages = copy.deepcopy(forwarded["messages"])
+        phase: CapabilityPhase = "acquisition"
+        upstream_calls = 0
+        retries = 0
+        while upstream_calls < self.settings.max_upstream_calls:
+            attempt_payload = outbound_payload(forwarded, working_messages, phase=phase)
+            self.phase_observer(phase)
+            response = await self.upstream.chat(attempt_payload, request_headers)
+            upstream_calls += 1
+            message = _response_message(response)
+            calls = message.get("tool_calls") or []
+            if calls:
+                if not isinstance(calls, list):
+                    raise UpstreamFailure("upstream_malformed_tool_calls")
+                if phase == "acquisition":
+                    return _off_result(response, started, upstream_calls, policy_extension_used)
+                if retries >= self.settings.max_internal_retries:
+                    break
+                retries += 1
+                continue
+            if phase == "acquisition":
+                phase = "finalization"
+                continue
+            if _terminal_schema_issue(message, contract) is None:
+                return _off_result(response, started, upstream_calls, policy_extension_used)
+            if retries >= self.settings.max_internal_retries:
+                break
+            retries += 1
+        raise ProxyError(
+            502,
+            "harness_retry_exhausted",
+            "The harness could not obtain a safe response within configured bounds.",
+        )
+
 
 def _tool_name(tool: JsonObject) -> str:
     function = tool.get("function")
@@ -301,6 +354,34 @@ def _tool_name(tool: JsonObject) -> str:
 
 def _ignore_phase(_phase: CapabilityPhase) -> None:
     return None
+
+
+def _off_result(
+    response: JsonObject, started: float, upstream_calls: int, policy_extension_used: bool
+) -> ChatResult:
+    return ChatResult(
+        _without_reserved_projection_marker(response),
+        PolicyTelemetry(
+            "off",
+            0,
+            0,
+            0,
+            upstream_calls,
+            (time.perf_counter() - started) * 1000,
+            policy_extensions_used=int(policy_extension_used),
+        ),
+    )
+
+
+def _terminal_schema_issue(message: JsonObject, contract: SchemaContract) -> str | None:
+    content = message.get("content")
+    if not isinstance(content, str):
+        content = "" if content is None else json.dumps(content, separators=(",", ":"))
+    normalized, changed = normalize_bare_json(content)
+    if changed:
+        message["content"] = normalized
+        content = normalized
+    return bare_json_issue(content, contract.keys, contract.types)
 
 
 def _validate_chat_payload(payload: JsonObject, *, harness_enabled: bool) -> None:

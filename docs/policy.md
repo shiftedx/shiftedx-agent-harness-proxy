@@ -179,6 +179,12 @@ finalization attempt with the preserved `response_format` but without `tools`, `
 Receipt-rejected or invalid acquisition terminals stay in acquisition under the existing correction
 bounds. A finalization tool call is never released.
 
+This translation is independent of Harness policy. A trusted `X-Shiftedx-Harness: off` request in
+`phase_split` mode receives the same acquisition/finalization grammar separation and strict local
+terminal validation, but no harness suffix, receipt policy, or synthetic tool-result state is added.
+Its native acquisition tool calls remain unchanged. In `passthrough` mode, opt-out behavior remains
+an ordinary single upstream request.
+
 `/metrics` exposes only aggregate counters:
 `shiftedx_proxy_phase_acquisition_total`, `shiftedx_proxy_phase_finalization_total`, and
 `shiftedx_proxy_phase_schema_rejections_total`. They have no request-derived labels or content.
