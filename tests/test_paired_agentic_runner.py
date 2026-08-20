@@ -2066,6 +2066,79 @@ def test_proxy_scoring_requires_a_passed_direct_runtime_outcome(monkeypatch, tmp
     assert not (tmp_path / "proxy.jsonl").exists()
 
 
+def test_proxy_scoring_resolves_direct_evidence_from_the_direct_outcome_slot(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    source_commit = _source_commit()
+    image_digest = "sha256:" + "0" * 64
+    preflight_dir = tmp_path / "slots" / "00-preflight"
+    scored_dir = tmp_path / "slots" / "01-cold-pair1"
+    wrong_dir = tmp_path / "slots" / "02-cold-pair2"
+    for directory in (preflight_dir, scored_dir, wrong_dir):
+        directory.mkdir(parents=True)
+        directory.chmod(0o700)
+
+    ledger = preflight_dir / "preflight.jsonl"
+    preflight_attestation = _write_passing_preflight(runner, ledger, source_commit, image_digest)
+    preflight_outcome = _write_runtime_outcome(
+        preflight_dir / "preflight-runtime-outcome.json",
+        stage="preflight",
+        attestation=preflight_attestation,
+        output=ledger,
+        output_record_count=5,
+    )
+    direct_output = scored_dir / "scored-direct.jsonl"
+    direct_output.write_text('{"case_id":"case-1"}\n{"case_id":"case-2"}\n', encoding="utf-8")
+    direct_output.chmod(0o600)
+    direct_outcome = _write_runtime_outcome(
+        scored_dir / "scored-direct-runtime-outcome.json",
+        stage="scored-direct",
+        attestation=preflight_attestation,
+        output=direct_output,
+        output_record_count=2,
+    )
+    scored_attestation = _write_runtime_attestation(
+        scored_dir / "scored-proxy-runtime-attestation.json",
+        stage="scored_proxy",
+        source_commit=source_commit,
+        image_digest=image_digest,
+        runtime_instance_sha256="5" * 64,
+    )
+    summary = json.loads(ledger.read_text(encoding="utf-8").splitlines()[-1])
+    common = {
+        "preflight_ledger": ledger,
+        "candidate_source_commit": source_commit,
+        "candidate_image_digest": image_digest,
+        "contract_digest": summary["qualification_contract_digests"]["warm-prefix"]["proxy"],
+        "cache_lane": "warm-prefix",
+        "arm": "proxy",
+        "model": "model",
+        "run_manifest_sha256": _RUN_MANIFEST_SHA256,
+        "scenario_order": ["case-1", "case-2"],
+        "runtime_attestation": scored_attestation,
+        "preflight_runtime_outcome": preflight_outcome,
+    }
+
+    runner.require_scoring_gate(
+        output=scored_dir / "proxy.jsonl",
+        direct_runtime_outcome=direct_outcome,
+        **common,
+    )
+
+    wrong_outcome = wrong_dir / direct_outcome.name
+    wrong_outcome.write_bytes(direct_outcome.read_bytes())
+    wrong_outcome.chmod(0o600)
+    for name, invalid_outcome in (
+        ("wrong-slot", wrong_outcome),
+        ("missing-slot", wrong_dir / "missing-runtime-outcome.json"),
+    ):
+        with pytest.raises(SystemExit, match="passed matching direct runtime outcome"):
+            runner.require_scoring_gate(
+                output=scored_dir / f"proxy-{name}.jsonl",
+                direct_runtime_outcome=invalid_outcome,
+                **common,
+            )
+
+
 def test_proxy_scoring_rejects_coordinated_preflight_attestation_and_outcome_replacement(monkeypatch, tmp_path):
     runner = load_runner(monkeypatch)
     source_commit = _source_commit()

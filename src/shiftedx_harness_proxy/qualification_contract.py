@@ -1486,9 +1486,9 @@ def require_scoring_gate(
                 expected_stage="scored-direct",
                 run_manifest_sha256=run_manifest_sha256,
                 attestation=preflight_attestation_path,
-                model_evidence=_model_evidence_path(preflight_ledger, "score-direct"),
+                model_evidence=_model_evidence_path(direct_runtime_outcome, "score-direct"),
                 model_identity_sha256=preflight_attestation.model_identity_sha256,
-                output_ledger=preflight_ledger.with_name("scored-direct.jsonl"),
+                output_ledger=direct_runtime_outcome.with_name("scored-direct.jsonl"),
                 expected_output_record_count=len(scenario_order),
             )
         except RuntimeOutcomeFailure as error:
