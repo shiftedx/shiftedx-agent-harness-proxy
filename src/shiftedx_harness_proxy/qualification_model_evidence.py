@@ -92,6 +92,65 @@ _PROCESS_KEYS = frozenset(
         "command_flags",
     }
 )
+_MTPLX_SETTINGS_KEYS = frozenset(
+    {
+        "ok",
+        "reasoning",
+        "enable_thinking",
+        "preserve_thinking",
+        "preserve_thinking_effective",
+        "reasoning_history_mode",
+        "reasoning_parser",
+        "reasoning_effort",
+        "generation_mode",
+        "depth",
+        "depth_max",
+        "backend_id",
+        "architecture_id",
+        "model_family",
+        "support_level",
+        "model_controls",
+        "reasoning_policy",
+        "kv_quant_policy",
+        "tune_policy",
+        "context_window_policy",
+        "sampling_defaults",
+        "temperature",
+        "top_p",
+        "top_k",
+        "presence_penalty",
+        "frequency_penalty",
+        "max_response_tokens",
+        "stream_interval",
+        "draft_control",
+        "draft_temperature",
+        "draft_top_p",
+        "draft_top_k",
+        "prefill_chunk_tokens",
+        "api_key_required",
+        "api_key_source",
+        "tool_prompt_mode",
+        "tool_contract_active",
+        "tool_contract_policy_version",
+        "chat_template_profile",
+        "chat_template_hash",
+        "metal_memory_caps",
+        "ssd_session_cache",
+        "ssd_session_cache_max_size",
+        "ssd_session_cache_min_prefix_tokens",
+        "paged_kv_quantization",
+        "restart_required_settings",
+        "ram_session_cache_policy",
+        "ram_session_block_prefix_restore",
+        "ram_session_cache_max_entries",
+        "ram_session_cache_max_size",
+        "ram_session_cache_per_session_max_size",
+    }
+)
+_SENSITIVE_SETTING_KEY = re.compile(r"(?:^model$|path|directory|(?:^|_)dir$|error|diagnostic|hardware|serial)")
+_SENSITIVE_LAUNCH_MATERIAL = re.compile(
+    r"(?:api[_-]?key|token|password|secret|credential|authorization|bearer)", re.IGNORECASE
+)
 
 
 class ModelEvidenceFailure(RuntimeError):
@@ -209,7 +268,7 @@ class ModelEvidenceProbe(Protocol):
         *,
         host: str,
         port: int,
-        api_key: str,
+        api_key: str | None,
         contract: ModelEvidenceContract,
     ) -> ProbeSnapshot: ...
 
@@ -221,6 +280,22 @@ class ModelEvidenceResult:
     path: Path
     file_sha256: str
     status: Literal["passed", "failed"]
+
+
+def model_endpoint_contract_hashes(
+    health: Mapping[str, Any], settings: Mapping[str, Any]
+) -> tuple[str, str]:
+    """Return reproducible hashes of the exact safe MTPLX endpoint projections.
+
+    This narrow helper is the manifest-freezing seam: callers may pass raw
+    endpoint objects, but only two hashes leave it.  The dynamic startup and
+    request counters are validated by the live session instead of becoming
+    part of the health contract hash.
+    """
+
+    projected_health = _project_mtplx_health(health)
+    projected_settings = _project_mtplx_settings(settings)
+    return _canonical_sha256({"status": projected_health["status"]}), _canonical_sha256(projected_settings)
 
 
 @dataclass(frozen=True)
@@ -247,10 +322,10 @@ class ModelEvidenceSession:
         stage: EvidenceStage,
         run_manifest_sha256: str,
         evidence_path: Path,
-        credential_file: Path,
+        credential_file: Path | None,
         probe: ModelEvidenceProbe,
         validated_contract: _ValidatedContract,
-        api_key: str,
+        api_key: str | None,
         before: _LiveIdentity,
     ) -> None:
         self._contract = contract
@@ -272,7 +347,7 @@ class ModelEvidenceSession:
         stage: EvidenceStage,
         run_manifest_sha256: str,
         evidence_path: Path,
-        credential_file: Path,
+        credential_file: Path | None,
         probe: ModelEvidenceProbe | None = None,
     ) -> ModelEvidenceSession:
         """Validate the private contract and capture the immutable before state.
@@ -283,8 +358,11 @@ class ModelEvidenceSession:
         categorical failed artifact for post-action failures.
         """
 
-        if not isinstance(contract, ModelEvidenceContract) or not isinstance(evidence_path, Path) or not isinstance(
-            credential_file, Path
+        if (
+            not isinstance(contract, ModelEvidenceContract)
+            or not isinstance(evidence_path, Path)
+            or credential_file is not None
+            and not isinstance(credential_file, Path)
         ):
             raise ModelEvidenceFailure("model_contract_invalid")
         if evidence_path.exists() or evidence_path.is_symlink():
@@ -297,7 +375,7 @@ class ModelEvidenceSession:
         ):
             raise ModelEvidenceFailure("model_contract_invalid")
         validated = _validate_contract(contract)
-        api_key = _read_credential(credential_file)
+        api_key = _read_credential(credential_file) if credential_file is not None else None
         active_probe = probe or SystemModelEvidenceProbe()
         before = _probe_live(active_probe, contract, api_key, validated)
         return cls(
@@ -340,9 +418,10 @@ class ModelEvidenceSession:
         # Re-read the file without following it before the after probe.  This
         # detects a credential swap while never retaining it in an artifact.
         try:
-            refreshed_key = _read_credential(self._credential_file)
-            if refreshed_key != self._api_key:
-                raise ModelEvidenceFailure("model_credential_invalid")
+            if self._credential_file is not None:
+                refreshed_key = _read_credential(self._credential_file)
+                if refreshed_key != self._api_key:
+                    raise ModelEvidenceFailure("model_credential_invalid")
         except ModelEvidenceFailure as error:
             if failure is None:
                 failure = error
@@ -419,7 +498,7 @@ class SystemModelEvidenceProbe:
     def __init__(
         self,
         *,
-        http_get: Callable[[str, str], Mapping[str, Any]] | None = None,
+        http_get: Callable[[str, Mapping[str, str]], Mapping[str, Any]] | None = None,
         command_runner: ModelEvidenceCommandRunner | None = None,
     ) -> None:
         self._http_get = http_get or _http_get_json
@@ -430,14 +509,15 @@ class SystemModelEvidenceProbe:
         *,
         host: str,
         port: int,
-        api_key: str,
+        api_key: str | None,
         contract: ModelEvidenceContract,
     ) -> ProbeSnapshot:
         base = f"http://{_url_host(host)}:{port}"
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key is not None else {}
         try:
-            health = self._http_get(f"{base}/health", api_key)
-            models = self._http_get(f"{base}/v1/models", api_key)
-            settings = self._http_get(f"{base}/v1/mtplx/settings", api_key)
+            health = _project_mtplx_health(self._http_get(f"{base}/health", headers))
+            models = _project_mtplx_models(self._http_get(f"{base}/v1/models", headers), contract.public_model_id)
+            settings = _project_mtplx_settings(self._http_get(f"{base}/v1/mtplx/settings", headers))
             owners = self._listener_owners(host, port, contract)
         except ModelEvidenceFailure:
             raise
@@ -485,6 +565,131 @@ class SystemModelEvidenceProbe:
                 "command_flags": _semantic_flags(argv),
             },
         )
+
+
+def _project_mtplx_health(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Reduce the raw 2.7.1 health object to its safe identity/accounting core."""
+
+    try:
+        health = dict(value)
+        startup_value = health.get("startup")
+        if not isinstance(startup_value, Mapping):
+            raise ModelEvidenceFailure("model_live_invalid")
+        startup = dict(startup_value)
+        pid = startup.get("pid")
+        started_at = _normalize_started_at(startup.get("started_at"))
+        if (
+            health.get("ok") is not True
+            or not _positive_int(pid)
+            or not _nonnegative_int(health.get("active_requests"))
+            or not _nonnegative_int(health.get("foreground_active"))
+            or not _nonnegative_int(health.get("requests_completed"))
+        ):
+            raise ModelEvidenceFailure("model_live_invalid")
+        launch_id = startup.get("launch_id")
+        if launch_id is None:
+            instance_id = _canonical_sha256({"pid": pid, "started_at": started_at})
+        elif isinstance(launch_id, str) and _SAFE_TEXT.fullmatch(launch_id) is not None:
+            instance_id = _canonical_sha256({"launch_id": launch_id})
+        else:
+            raise ModelEvidenceFailure("model_live_invalid")
+        return {
+            "status": "ok",
+            "startup_pid": pid,
+            "started_at": started_at,
+            "instance_id": instance_id,
+            "active_requests": health["active_requests"],
+            "foreground_requests": health["foreground_active"],
+            "requests_completed": health["requests_completed"],
+        }
+    except ModelEvidenceFailure:
+        raise
+    except (TypeError, ValueError) as error:
+        raise ModelEvidenceFailure("model_live_invalid") from error
+
+
+def _normalize_started_at(value: Any) -> str:
+    if isinstance(value, bool):
+        raise ModelEvidenceFailure("model_live_invalid")
+    if isinstance(value, str):
+        if _SAFE_TEXT.fullmatch(value) is None:
+            raise ModelEvidenceFailure("model_live_invalid")
+        return value
+    if isinstance(value, int | float):
+        try:
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError) as error:
+            raise ModelEvidenceFailure("model_live_invalid") from error
+    raise ModelEvidenceFailure("model_live_invalid")
+
+
+def _project_mtplx_models(value: Mapping[str, Any], public_model_id: str) -> dict[str, Any]:
+    """Select exactly the qualified chat model and drop volatile model metadata."""
+
+    try:
+        models = dict(value)
+        data = models.get("data")
+        if models.get("object") != "list" or not isinstance(data, list):
+            raise ModelEvidenceFailure("model_live_invalid")
+        matches = [
+            item
+            for item in data
+            if isinstance(item, Mapping)
+            and item.get("object") == "model"
+            and item.get("id") == public_model_id
+        ]
+        if len(matches) != 1:
+            raise ModelEvidenceFailure("model_live_invalid")
+        return {"data": [{"id": public_model_id}]}
+    except ModelEvidenceFailure:
+        raise
+    except (TypeError, ValueError) as error:
+        raise ModelEvidenceFailure("model_live_invalid") from error
+
+
+def _project_mtplx_settings(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Freeze the reviewed 2.7.1 safe settings surface and ignore raw extras."""
+
+    try:
+        settings = dict(value)
+        if settings.get("ok") is not True or not _MTPLX_SETTINGS_KEYS.issubset(settings):
+            raise ModelEvidenceFailure("model_live_invalid")
+        projected = {key: settings[key] for key in sorted(_MTPLX_SETTINGS_KEYS)}
+        if not _safe_mtplx_settings_value(projected):
+            raise ModelEvidenceFailure("model_live_invalid")
+        return projected
+    except ModelEvidenceFailure:
+        raise
+    except (TypeError, ValueError) as error:
+        raise ModelEvidenceFailure("model_live_invalid") from error
+
+
+def _safe_mtplx_settings_value(value: Any, *, depth: int = 0) -> bool:
+    if depth > 16:
+        return False
+    if value is None or isinstance(value, bool | int):
+        return True
+    if isinstance(value, float):
+        return value == value and value not in {float("inf"), float("-inf")}
+    if isinstance(value, str):
+        return (
+            _SAFE_TEXT.fullmatch(value) is not None
+            and not value.startswith(("/", "~/", "file://"))
+        )
+    if isinstance(value, list):
+        return len(value) <= 128 and all(_safe_mtplx_settings_value(item, depth=depth + 1) for item in value)
+    if isinstance(value, dict):
+        return (
+            len(value) <= 128
+            and all(
+                isinstance(key, str)
+                and _SAFE_TEXT.fullmatch(key) is not None
+                and _SENSITIVE_SETTING_KEY.search(key) is None
+                for key in value
+            )
+            and all(_safe_mtplx_settings_value(item, depth=depth + 1) for item in value.values())
+        )
+    return False
 
 
 def _validate_contract(contract: ModelEvidenceContract) -> _ValidatedContract:
@@ -564,14 +769,25 @@ def _validate_runtime_executable(path: Path, expected_sha256: str) -> None:
 def _validate_launch_semantics(contract: ModelEvidenceContract) -> None:
     flags = contract.required_launch_flags
     if not isinstance(flags, tuple) or not flags or len(set(flags)) != len(flags) or any(
-        not isinstance(value, str) or not value.startswith("--") or "\x00" in value for value in flags
+        not isinstance(value, str)
+        or not value.startswith("--")
+        or "\x00" in value
+        or _unsafe_launch_flag(value)
+        for value in flags
     ):
         raise ModelEvidenceFailure("model_contract_invalid")
-    expected = {f"--host={contract.host}", f"--port={contract.port}", "--foreground"}
+    expected = {f"--host={contract.host}", f"--port={contract.port}"}
     if not expected.issubset(set(flags)):
         raise ModelEvidenceFailure("model_contract_invalid")
-    if any(re.search(r"(?:api[_-]?key|token|password|secret)=", value, flags=re.IGNORECASE) for value in flags):
-        raise ModelEvidenceFailure("model_contract_invalid")
+
+
+def _unsafe_launch_flag(value: str) -> bool:
+    key, separator, flag_value = value.partition("=")
+    if key == "--no-auth" and not separator:
+        return False
+    return key.startswith("--auth") or _SENSITIVE_LAUNCH_MATERIAL.search(key) is not None or (
+        bool(flag_value) and _SENSITIVE_LAUNCH_MATERIAL.search(flag_value) is not None
+    )
 
 
 def _distribution_aggregate(contract: ModelEvidenceContract) -> str:
@@ -671,7 +887,7 @@ def _metadata_fields(value: str) -> dict[str, str]:
 def _probe_live(
     probe: ModelEvidenceProbe,
     contract: ModelEvidenceContract,
-    api_key: str,
+    api_key: str | None,
     validated: _ValidatedContract,
 ) -> _LiveIdentity:
     try:
@@ -743,7 +959,7 @@ def _validate_live_snapshot(
             isinstance(flag, str) and flag.startswith("--") and "\x00" not in flag
             for flag in owner["command_flags"]
         )
-        or not set(contract.required_launch_flags).issubset(set(owner["command_flags"]))
+        or owner["command_flags"] != contract.required_launch_flags
     ):
         raise ModelEvidenceFailure("model_listener_invalid")
     full = {
@@ -866,7 +1082,15 @@ def _validate_cache_invariants(
             raise ModelEvidenceFailure("model_cache_warm_invalid")
         first = attempts[0]
         if (
-            prime.request_digest != first.request_digest
+            prime.request_session_bank_bypass is not False
+            or prime.postcommit_stored is not True
+            or prime.cache_source != "none"
+            or prime.cached_tokens != 0
+            or prime.new_prefill_tokens != prime.prompt_tokens
+            or prime.ssd_cache_hit is not False
+            or prime.ssd_cached_tokens != 0
+            or prime.session_cache_hit is not False
+            or prime.request_digest != first.request_digest
             or first.cached_tokens <= 0
             or first.cache_source not in {"ram", "ssd"}
             or not (first.session_cache_hit or first.ssd_cache_hit)
@@ -1042,8 +1266,8 @@ def _atomic_write_no_clobber(path: Path, record: Mapping[str, Any]) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def _http_get_json(url: str, api_key: str) -> Mapping[str, Any]:
-    request = Request(url, headers={"Authorization": f"Bearer {api_key}"})  # noqa: S310 - validated loopback only
+def _http_get_json(url: str, headers: Mapping[str, str]) -> Mapping[str, Any]:
+    request = Request(url, headers=dict(headers))  # noqa: S310 - validated loopback only
     try:
         with urlopen(request, timeout=5.0) as response:  # noqa: S310 - validated loopback only
             if response.status != 200:
@@ -1084,7 +1308,7 @@ def _semantic_flags(argv: tuple[str, ...]) -> tuple[str, ...]:
         if item.startswith("--"):
             if "=" in item:
                 flags.append(item)
-            elif item in {"--host", "--port"} and index + 1 < len(argv):
+            elif index + 1 < len(argv) and not argv[index + 1].startswith("--"):
                 flags.append(f"{item}={argv[index + 1]}")
                 index += 1
             else:
