@@ -43,39 +43,48 @@ copies prompts, schemas, tool calls or arguments/results, model output, credenti
 or host paths.
 
 For the proxy arm, place `scripts/qualification_model_boundary_observer.py` on the private hop
-between the proxy and model. Start it with `QUALIFICATION_OBSERVER_UPSTREAM` set to the approved
-model URL and `QUALIFICATION_OBSERVER_LEDGER` set to a new empty private file, then configure the
-proxy's fixed upstream URL to the observer. The observer forwards requests and records only hashes
-of the allowlisted model-boundary fields. Pass that same fresh file as `--proxy-observer-ledger`;
-the preflight rejects missing, stale, malformed, raw-field-bearing, or field-drifting observer
-records. Restore the fixed approved model URL after the preflight setup exercise; do not use this
-qualification observer as a production routing layer.
+between the proxy and model. It forwards requests and records only ordered hashes of allowlisted
+model-boundary fields. The runner consumes records immediately after each proxy turn and rejects
+missing, stale, malformed, out-of-order, raw-field-bearing, or field-drifting records. It records
+the full system hash, normalized base-system hash, and only the exact declared harness suffix
+delta; no other system-prompt mutation is accepted.
 
-For a dedicated qualification-only proxy instance, create the ledger before launch and wire its
-fixed upstream to the observer's loopback listener:
+Create a private, unique run directory before either arm starts. Do not pre-create or truncate a
+ledger: a preflight output path must be new, and its atomic writer will never overwrite existing
+evidence. The frozen manifest itself carries the approved exact model revision and runtime; pass
+only its SHA-256 to the runner.
 
 ```bash
-: > benchmark-reports/private/proxy-model-boundary.jsonl
+umask 077
+RUN_DIR="$(mktemp -d benchmark-reports/private/qualification.XXXXXX)"
+PREFLIGHT_OBSERVER_LEDGER="$RUN_DIR/preflight-proxy-model-boundary.jsonl"
+PREFLIGHT_LEDGER="$RUN_DIR/preflight.jsonl"
+SCORED_PROXY_OBSERVER_LEDGER="$RUN_DIR/scored-proxy-model-boundary.jsonl"
+RUN_MANIFEST_SHA256="$(shasum -a 256 "$RUN_MANIFEST" | awk '{print $1}')"
+
 QUALIFICATION_OBSERVER_UPSTREAM="$MODEL_URL" \
-QUALIFICATION_OBSERVER_LEDGER=benchmark-reports/private/proxy-model-boundary.jsonl \
+QUALIFICATION_OBSERVER_LEDGER="$PREFLIGHT_OBSERVER_LEDGER" \
   uv run python scripts/qualification_model_boundary_observer.py &
 UPSTREAM_BASE_URL=http://127.0.0.1:18092/v1 \
   uv run shiftedx-agent-harness-proxy
 ```
 
-The runner requires that observer ledger to be absent or empty before requests and will neither
-delete nor overwrite a non-empty one. Use a new observer and ledger for every preflight.
+The preflight runner requires that observer ledger to be absent or empty before requests and will
+neither delete nor overwrite it. Use a newly launched observer and a distinct new ledger for every
+preflight and every scored proxy treatment. Restore the fixed approved model URL after each
+qualification-only observer exercise; do not use this observer as a production routing layer.
 
 ```bash
 uv run scripts/run_paired_agentic_trial.py \
   --paired-preflight --model "$PUBLIC_MODEL_ID" --agentic-set expanded \
   --direct-base-url "$DIRECT_URL" --proxy-base-url "$PROXY_URL" \
   --proxy-metrics-url "$PRIVATE_PROXY_METRICS_URL" \
-  --proxy-observer-ledger benchmark-reports/private/proxy-model-boundary.jsonl \
+  --proxy-observer-ledger "$PREFLIGHT_OBSERVER_LEDGER" \
   --direct-api-key-file secrets/direct_key --proxy-api-key-file secrets/proxy_key \
-  --output benchmark-reports/private/preflight.jsonl \
+  --output "$PREFLIGHT_LEDGER" \
   --candidate-source-commit "$CANDIDATE_SOURCE_COMMIT" \
-  --candidate-image-digest "$CANDIDATE_IMAGE_DIGEST"
+  --candidate-image-digest "$CANDIDATE_IMAGE_DIGEST" \
+  --run-manifest-sha256 "$RUN_MANIFEST_SHA256"
 ```
 
 The command fails before any scored row when either arm produces zero native acquisition calls,
@@ -90,14 +99,42 @@ binds each arm to its full selected scenario order and request-contract digest, 
 ```bash
 uv run scripts/run_paired_agentic_trial.py \
   --base-url "$DIRECT_URL" --model "$PUBLIC_MODEL_ID" --variant direct \
-  --output benchmark-reports/private/direct.jsonl --agentic-set expanded \
-  --preflight-ledger benchmark-reports/private/preflight.jsonl \
+  --output "$RUN_DIR/direct.jsonl" --agentic-set expanded \
+  --preflight-ledger "$PREFLIGHT_LEDGER" \
   --candidate-source-commit "$CANDIDATE_SOURCE_COMMIT" \
-  --candidate-image-digest "$CANDIDATE_IMAGE_DIGEST"
+  --candidate-image-digest "$CANDIDATE_IMAGE_DIGEST" \
+  --run-manifest-sha256 "$RUN_MANIFEST_SHA256"
 ```
 
-Run the equivalent proxy command with `--proxy-policy`. Never invoke either command without the
-same frozen candidate provenance; the runner refuses to append to an existing scored output.
+Before the equivalent proxy command, stop the preflight-only observer/proxy, then launch a new
+observer wired to the distinct scored ledger and configure the dedicated qualification proxy to
+use its loopback listener:
+
+```bash
+QUALIFICATION_OBSERVER_UPSTREAM="$MODEL_URL" \
+QUALIFICATION_OBSERVER_LEDGER="$SCORED_PROXY_OBSERVER_LEDGER" \
+  uv run python scripts/qualification_model_boundary_observer.py &
+UPSTREAM_BASE_URL=http://127.0.0.1:18092/v1 \
+  uv run shiftedx-agent-harness-proxy
+```
+
+Pass that same new path to the runner:
+
+```bash
+uv run scripts/run_paired_agentic_trial.py \
+  --base-url "$PROXY_URL" --model "$PUBLIC_MODEL_ID" --variant proxy \
+  --output "$RUN_DIR/proxy.jsonl" --agentic-set expanded --proxy-policy \
+  --proxy-observer-ledger "$SCORED_PROXY_OBSERVER_LEDGER" \
+  --preflight-ledger "$PREFLIGHT_LEDGER" \
+  --candidate-source-commit "$CANDIDATE_SOURCE_COMMIT" \
+  --candidate-image-digest "$CANDIDATE_IMAGE_DIGEST" \
+  --run-manifest-sha256 "$RUN_MANIFEST_SHA256"
+```
+
+Never invoke either command without the same frozen candidate provenance, model ID, and manifest
+digest; the runner refuses to append to an existing scored output. Proxy scored rows carry only
+the newly consumed, ordered observer fingerprints for that case/turn; direct rows use their actual
+sent model-facing payload fingerprints.
 
 Pass authenticated proxy credentials with `--api-key-file`; never put a bearer value directly in
 the command line. If the benchmark client cannot obtain a response (for example, a bounded proxy

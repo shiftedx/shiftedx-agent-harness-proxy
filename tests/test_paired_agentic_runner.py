@@ -11,6 +11,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from shiftedx_harness_proxy.core import HARNESS_SYSTEM_SUFFIX
+
+_RUN_MANIFEST_SHA256 = "1" * 64
+
 
 def load_runner(monkeypatch):
     scenarios = [
@@ -85,6 +89,10 @@ def test_client_failure_is_recorded_without_response_body_and_run_continues(monk
             source_commit,
             "--candidate-image-digest",
             image_digest,
+            "--run-manifest-sha256",
+            _RUN_MANIFEST_SHA256,
+            "--proxy-observer-ledger",
+            str(tmp_path / "scored-observer.jsonl"),
         ],
     )
 
@@ -101,7 +109,7 @@ def test_client_failure_is_recorded_without_response_body_and_run_continues(monk
         }
         assert row["metadata"]["runner_failure_stage"] == "benchmark_client"
         assert row["scored"] is True
-        assert set(row["contract_fingerprints"]) == {"downstream", "model_facing"}
+        assert set(row["contract_fingerprints"]) == {"downstream", "model_facing", "model_facing_turns"}
     serialized = json.dumps(rows)
     assert "private prompt marker" not in serialized
     assert "private body marker" not in serialized
@@ -227,6 +235,7 @@ def test_preflight_ledger_retains_only_hashes_and_allowlisted_outcomes(monkeypat
         source_commit="a" * 40,
         image_digest="sha256:" + "0" * 64,
         contract_digests={"direct": "one", "proxy": "two"},
+        run_manifest_sha256=_RUN_MANIFEST_SHA256,
     )
 
     serialized = output.read_text()
@@ -279,6 +288,8 @@ def test_scored_mode_requires_a_successful_paired_preflight_and_exact_provenance
             candidate_image_digest="sha256:" + "0" * 64,
             contract_digest="not-the-current-contract",
             arm="direct",
+            model="model",
+            run_manifest_sha256=_RUN_MANIFEST_SHA256,
         )
     assert not output.exists()
 
@@ -336,6 +347,7 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
     scenario = runner.scenario_set("expanded")[0]
     observer = tmp_path / "observer.jsonl"
     planner = runner.PhasePlanner()
+    sequence = [0]
 
     class FakeClient:
         def __init__(self, base_url, *_args, **_kwargs):
@@ -357,11 +369,14 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
                 )
                 with observer.open("a", encoding="utf-8") as handle:
                     for observed in observed_payloads:
+                        observed["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
                         fingerprint = runner.model_boundary_fingerprint(observed)
+                        sequence[0] += 1
                         handle.write(
                             json.dumps(
                                 {
                                     "record_type": "qualification_model_boundary",
+                                    "sequence": sequence[0],
                                     "digest": fingerprint.digest,
                                     "fields": fingerprint.fields,
                                 },
@@ -387,6 +402,7 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
         candidate_source_commit=_source_commit(),
         candidate_image_digest="sha256:" + "0" * 64,
         model="model",
+        run_manifest_sha256=_RUN_MANIFEST_SHA256,
         direct_api_key_file=None,
         proxy_api_key_file=None,
         output=tmp_path / "preflight.jsonl",
@@ -410,12 +426,13 @@ def test_stale_proxy_observer_ledger_is_rejected_without_overwriting_it(monkeypa
         candidate_source_commit=_source_commit(),
         candidate_image_digest="sha256:" + "0" * 64,
         model="model",
+        run_manifest_sha256=_RUN_MANIFEST_SHA256,
         direct_api_key_file=None,
         proxy_api_key_file=None,
         output=output,
     )
 
-    with pytest.raises(SystemExit, match="new empty"):
+    with pytest.raises(SystemExit, match="proxy_model_boundary_observer_failed"):
         runner._run_paired_preflight(args, [runner.scenario_set("expanded")[0]])
 
     assert observer.read_text() == '{"old":"record"}\n'
@@ -447,12 +464,18 @@ def test_observed_proxy_model_boundary_drift_is_not_masked_by_matching_plan(monk
     payload = runner.request_payload(scenario, model="model", proxy_policy=False)
     direct_components = runner.model_boundary_fingerprint(runner.PhasePlanner().plan(payload, phase="acquisition"))
     drifted_payload = runner.PhasePlanner().plan(payload, phase="acquisition")
+    drifted_payload["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
     drifted_payload["top_k"] = 99
     proxy_components = runner.model_boundary_fingerprint(drifted_payload)
     terminal_payload = runner._preflight_payload(
         scenario, model="model", proxy_policy=False, no_tools=True
     )
     terminal = runner.model_boundary_fingerprint(terminal_payload)
+    proxy_terminal_payload = runner._preflight_payload(
+        scenario, model="model", proxy_policy=False, no_tools=True
+    )
+    proxy_terminal_payload["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
+    proxy_terminal = runner.model_boundary_fingerprint(proxy_terminal_payload)
     fingerprint = runner.SafeFingerprint("downstream", "same", {})
     observations = [
         runner.PreflightObservation(
@@ -468,10 +491,8 @@ def test_observed_proxy_model_boundary_drift_is_not_masked_by_matching_plan(monk
             (proxy_components,),
             {"acquisition": 2, "finalization": 1},
         ),
-        *[
-            runner.PreflightObservation(arm, False, 0, ("terminal",), True, fingerprint, (terminal,))
-            for arm in ("direct", "proxy")
-        ],
+        runner.PreflightObservation("direct", False, 0, ("terminal",), True, fingerprint, (terminal,)),
+        runner.PreflightObservation("proxy", False, 0, ("terminal",), True, fingerprint, (proxy_terminal,)),
     ]
 
     with pytest.raises(runner.PreflightFailure, match="model-facing contract mismatch"):
@@ -496,6 +517,7 @@ def test_failed_preflight_writes_safe_unscored_ledger_and_never_creates_scored_o
             source_commit="a" * 40,
             image_digest="sha256:" + "0" * 64,
             contract_digests={"direct": "one", "proxy": "two"},
+            run_manifest_sha256=_RUN_MANIFEST_SHA256,
         )
 
     serialized = output.read_text()
@@ -523,6 +545,8 @@ def test_scoring_gate_rejects_a_different_scenario_contract(monkeypatch, tmp_pat
             candidate_image_digest=image_digest,
             contract_digest="different",
             arm="direct",
+            model="model",
+            run_manifest_sha256=_RUN_MANIFEST_SHA256,
         )
 
 
@@ -546,6 +570,388 @@ def test_failed_proxy_variant_uses_declared_proxy_policy_not_label_heuristics(mo
     }
 
 
+def test_observed_proxy_harness_suffix_is_the_only_allowed_system_delta(monkeypatch):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    payload = runner.request_payload(scenario, model="model", proxy_policy=False)
+    direct = runner.model_boundary_fingerprint(
+        runner.PhasePlanner().plan(payload, phase="acquisition"), scenario_order=[scenario.case_id]
+    )
+    proxy_payload = runner.PhasePlanner().plan(payload, phase="acquisition")
+    proxy_payload["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
+    proxy = runner.model_boundary_fingerprint(proxy_payload, scenario_order=[scenario.case_id])
+
+    assert direct.fields["system_prompt_sha256"] != proxy.fields["system_prompt_sha256"]
+    assert direct.fields["base_system_prompt_sha256"] == proxy.fields["base_system_prompt_sha256"]
+    assert set(proxy.fields["declared_policy_deltas"]) == {"harness_system_suffix_sha256"}
+    assert runner._contract_mismatches(direct, proxy) == []
+
+
+def test_preflight_ledger_never_overwrites_existing_evidence(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    output = tmp_path / "preflight.jsonl"
+    output.write_text('{"prior":"evidence"}\n')
+
+    with pytest.raises(runner.PreflightFailure, match="overwrite"):
+        runner.write_preflight_ledger(
+            output,
+            [],
+            source_commit="a" * 40,
+            image_digest="sha256:" + "0" * 64,
+            contract_digests={"direct": "one", "proxy": "two"},
+            run_manifest_sha256="1" * 64,
+        )
+
+    assert output.read_text() == '{"prior":"evidence"}\n'
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("", "harness system policy delta"),
+        (HARNESS_SYSTEM_SUFFIX.replace("receipt-grounded", "receipt altered"), "harness system policy delta"),
+        (HARNESS_SYSTEM_SUFFIX + HARNESS_SYSTEM_SUFFIX, "harness system policy delta"),
+        (" extra mutation" + HARNESS_SYSTEM_SUFFIX, "model-facing contract mismatch"),
+    ],
+)
+def test_preflight_rejects_every_proxy_system_mutation_except_the_exact_suffix(
+    monkeypatch, mutation, message
+):
+    runner = load_runner(monkeypatch)
+
+    with pytest.raises(runner.PreflightFailure, match=message):
+        runner.assert_preflight(_suffix_pair_observations(runner, mutation))
+
+
+def test_preflight_rejects_proxy_model_identity_drift(monkeypatch):
+    runner = load_runner(monkeypatch)
+    observations = _suffix_pair_observations(runner, HARNESS_SYSTEM_SUFFIX)
+    proxy_tool = observations[1]
+    proxy_model = dict(proxy_tool.model_facing[0].fields)
+    proxy_model["model_id_sha256"] = "0" * 64
+    observations[1] = runner.PreflightObservation(
+        proxy_tool.arm,
+        proxy_tool.tool_required,
+        proxy_tool.native_acquisition_tool_calls,
+        proxy_tool.phases,
+        proxy_tool.terminal_schema_valid,
+        proxy_tool.downstream,
+        (runner.SafeFingerprint("model_facing_observed", "identity-drift", proxy_model),),
+        proxy_tool.proxy_phase_counts,
+    )
+
+    with pytest.raises(runner.PreflightFailure, match="model-facing contract mismatch: model_id_sha256"):
+        runner.assert_preflight(observations)
+
+
+def test_scoring_gate_rejects_manifest_and_model_identity_mismatch(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    source_commit = _source_commit()
+    image_digest = "sha256:" + "0" * 64
+    ledger = tmp_path / "preflight.jsonl"
+    _write_passing_preflight(runner, ledger, source_commit, image_digest)
+    summary = next(
+        json.loads(line)
+        for line in ledger.read_text().splitlines()
+        if json.loads(line)["record_type"] == "paired_preflight_summary"
+    )
+
+    with pytest.raises(SystemExit, match="run-manifest identity"):
+        runner.require_scoring_gate(
+            output=tmp_path / "manifest-mismatch.jsonl",
+            preflight_ledger=ledger,
+            candidate_source_commit=source_commit,
+            candidate_image_digest=image_digest,
+            contract_digest=summary["qualification_contract_digests"]["direct"],
+            arm="direct",
+            model="model",
+            run_manifest_sha256="2" * 64,
+        )
+    with pytest.raises(SystemExit, match="model identity"):
+        runner.require_scoring_gate(
+            output=tmp_path / "model-mismatch.jsonl",
+            preflight_ledger=ledger,
+            candidate_source_commit=source_commit,
+            candidate_image_digest=image_digest,
+            contract_digest=summary["qualification_contract_digests"]["direct"],
+            arm="direct",
+            model="other-model",
+            run_manifest_sha256=_RUN_MANIFEST_SHA256,
+        )
+
+
+def test_proxy_scored_fingerprints_come_from_new_observer_records_in_turn_order(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    observer_path = tmp_path / "scored-observer.jsonl"
+    planner = runner.PhasePlanner()
+
+    class ProxyClient:
+        def __init__(self):
+            self.sequence = 0
+
+        def complete(self, payload, *, stream=False):
+            assert stream is False
+            observed = planner.plan(payload, phase="acquisition")
+            observed["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
+            self.sequence += 1
+            _append_observer_record(runner, observer_path, observed, self.sequence)
+            return {"content": "", "tool_calls": [{"id": "call-1"}]}
+
+    client = runner.CompatibilityClient(
+        ProxyClient(),
+        arm="proxy",
+        scenario_order=[scenario.case_id],
+        proxy_policy=True,
+        observer=runner.ModelBoundaryObserverCursor(observer_path, [scenario.case_id]),
+    )
+    client.complete(runner.request_payload(scenario, model="model", proxy_policy=True))
+    actual = client.actual_contract_fingerprints()
+
+    assert len(actual["model_facing"]) == 1
+    assert actual["model_facing_turns"] == [
+        {"turn_index": 0, "fingerprints": actual["model_facing"]}
+    ]
+    assert actual["model_facing"][0]["fields"]["declared_policy_deltas"]
+    planned = runner.model_boundary_fingerprint(
+        planner.plan(runner.request_payload(scenario, model="model", proxy_policy=True), phase="acquisition"),
+        scenario_order=[scenario.case_id],
+    )
+    assert actual["model_facing"][0]["fields"]["system_prompt_sha256"] != planned.fields[
+        "system_prompt_sha256"
+    ]
+
+
+def test_proxy_observer_missing_stale_or_field_drift_fails_closed_with_safe_partial_evidence(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    payload = runner.request_payload(scenario, model="model", proxy_policy=True)
+    planner = runner.PhasePlanner()
+
+    stale = tmp_path / "stale.jsonl"
+    observed = planner.plan(payload, phase="acquisition")
+    observed["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
+    _append_observer_record(runner, stale, observed, 1)
+    with pytest.raises(runner.PreflightFailure, match="not fresh"):
+        runner.ModelBoundaryObserverCursor(stale, [scenario.case_id])
+
+    class NoObserverClient:
+        def complete(self, _payload, *, stream=False):
+            assert stream is False
+            return {"content": "", "tool_calls": [{"id": "call-1"}]}
+
+    missing = runner.CompatibilityClient(
+        NoObserverClient(),
+        arm="proxy",
+        scenario_order=[scenario.case_id],
+        proxy_policy=True,
+        observer=runner.ModelBoundaryObserverCursor(tmp_path / "missing.jsonl", [scenario.case_id]),
+    )
+    with pytest.raises(runner.PreflightFailure, match="record count differed"):
+        missing.complete(payload)
+
+    drift_path = tmp_path / "drift.jsonl"
+
+    class DriftClient:
+        def complete(self, _payload, *, stream=False):
+            assert stream is False
+            drifted = planner.plan(payload, phase="acquisition")
+            drifted["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
+            drifted["top_k"] = 99
+            _append_observer_record(runner, drift_path, drifted, 1)
+            return {"content": "", "tool_calls": [{"id": "call-1"}]}
+
+    drift = runner.CompatibilityClient(
+        DriftClient(),
+        arm="proxy",
+        scenario_order=[scenario.case_id],
+        proxy_policy=True,
+        observer=runner.ModelBoundaryObserverCursor(drift_path, [scenario.case_id]),
+    )
+    with pytest.raises(runner.PreflightFailure, match="observer fields differed"):
+        drift.complete(payload)
+    partial = drift.actual_contract_fingerprints()
+    assert partial["model_facing"][0]["fields"]["sampler"]["top_k"] == 99
+
+
+def test_scored_proxy_cli_requires_a_new_observer_ledger(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    source_commit = _source_commit()
+    image_digest = "sha256:" + "0" * 64
+    preflight = tmp_path / "preflight.jsonl"
+    _write_passing_preflight(runner, preflight, source_commit, image_digest)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_paired_agentic_trial.py",
+            "--base-url",
+            "http://proxy.invalid/v1",
+            "--model",
+            "model",
+            "--output",
+            str(tmp_path / "scored.jsonl"),
+            "--agentic-set",
+            "expanded",
+            "--variant",
+            "proxy",
+            "--proxy-policy",
+            "--preflight-ledger",
+            str(preflight),
+            "--candidate-source-commit",
+            source_commit,
+            "--candidate-image-digest",
+            image_digest,
+            "--run-manifest-sha256",
+            _RUN_MANIFEST_SHA256,
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="requires --proxy-observer-ledger"):
+        runner.main()
+
+
+def test_scored_proxy_rows_use_actual_observer_fingerprints_and_failures_keep_safe_subset(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    source_commit = _source_commit()
+    image_digest = "sha256:" + "0" * 64
+    preflight = tmp_path / "preflight.jsonl"
+    observer_path = tmp_path / "scored-observer.jsonl"
+    output = tmp_path / "scored.jsonl"
+    _write_passing_preflight(runner, preflight, source_commit, image_digest)
+    planner = runner.PhasePlanner()
+
+    class ObservingProxy:
+        def __init__(self, *_args, **_kwargs):
+            self.sequence = 0
+
+        def complete(self, payload, *, stream=False):
+            assert stream is False
+            observed = planner.plan(payload, phase="acquisition")
+            observed["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
+            self.sequence += 1
+            _append_observer_record(runner, observer_path, observed, self.sequence)
+            return {"content": "", "tool_calls": [{"id": f"call-{self.sequence}"}]}
+
+    def run_cases(*, client, model, output_path, case_id, **_kwargs):
+        scenario = next(item for item in runner.scenario_set("expanded") if item.case_id == case_id)
+        client.complete(runner.request_payload(scenario, model=model, proxy_policy=True))
+        if case_id == "case-2":
+            raise RuntimeError("HTTP 502 private-scored-body")
+        with output_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"case_id": case_id, "passed": True}) + "\n")
+        return [{"case_id": case_id}]
+
+    runner.OpenAIClient = ObservingProxy
+    runner.run_agentic_cases = run_cases
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_paired_agentic_trial.py",
+            "--base-url",
+            "http://proxy.invalid/v1",
+            "--model",
+            "model",
+            "--output",
+            str(output),
+            "--agentic-set",
+            "expanded",
+            "--variant",
+            "proxy",
+            "--proxy-policy",
+            "--preflight-ledger",
+            str(preflight),
+            "--candidate-source-commit",
+            source_commit,
+            "--candidate-image-digest",
+            image_digest,
+            "--run-manifest-sha256",
+            _RUN_MANIFEST_SHA256,
+            "--proxy-observer-ledger",
+            str(observer_path),
+        ],
+    )
+
+    runner.main()
+
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert [row["case_id"] for row in rows] == ["case-1", "case-2"]
+    for row in rows:
+        fingerprints = row["contract_fingerprints"]
+        assert len(fingerprints["model_facing"]) == 1
+        assert fingerprints["model_facing_turns"][0]["turn_index"] == 0
+        assert fingerprints["model_facing"][0]["fields"]["declared_policy_deltas"]
+    assert rows[1]["metadata"]["runner_failure_stage"] == "benchmark_client"
+    serialized = output.read_text()
+    assert "private-scored-body" not in serialized
+    assert "private prompt marker" not in serialized
+
+
+def test_metrics_preflight_failure_is_retained_as_categorical_unscored_evidence(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    args = _preflight_args(tmp_path)
+    monkeypatch.setattr(
+        runner,
+        "_phase_metrics",
+        lambda *_args: (_ for _ in ()).throw(runner.PreflightFailure("proxy_phase_metrics_unavailable")),
+    )
+
+    with pytest.raises(SystemExit, match="proxy_phase_metrics_unavailable"):
+        runner._run_paired_preflight(args, [runner.scenario_set("expanded")[0]])
+
+    rows = [json.loads(line) for line in args.output.read_text().splitlines()]
+    summary = rows[-1]
+    assert summary["status"] == "failed"
+    assert summary["scored"] is False
+    assert summary["failure"] == "proxy_phase_metrics_unavailable"
+    assert "metrics.invalid" not in args.output.read_text()
+
+
+def test_network_preflight_failure_retains_partial_safe_observation_without_exception_text(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    args = _preflight_args(tmp_path)
+
+    class FailingClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def complete(self, _payload, *, stream=False):
+            assert stream is False
+            raise RuntimeError("HTTP 502 https://private.invalid body=private-marker")
+
+    runner.OpenAIClient = FailingClient
+    monkeypatch.setattr(runner, "_phase_metrics", lambda *_args: {"acquisition": 0, "finalization": 0})
+
+    with pytest.raises(SystemExit, match="preflight_client_failure"):
+        runner._run_paired_preflight(args, [runner.scenario_set("expanded")[0]])
+
+    serialized = args.output.read_text()
+    rows = [json.loads(line) for line in serialized.splitlines()]
+    assert rows[-1]["status"] == "failed"
+    assert rows[-1]["failure"] == "preflight_client_failure"
+    assert rows[0]["arm"] == "direct"
+    assert rows[0]["model_facing_contracts"]
+    assert "private.invalid" not in serialized
+    assert "private-marker" not in serialized
+
+
+def test_preflight_existing_output_is_rejected_before_any_model_request(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    args = _preflight_args(tmp_path)
+    args.output.write_text('{"prior":"evidence"}\n')
+
+    class UnexpectedClient:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("must not make a preflight request")
+
+    runner.OpenAIClient = UnexpectedClient
+
+    with pytest.raises(SystemExit, match="existing preflight ledger"):
+        runner._run_paired_preflight(args, [runner.scenario_set("expanded")[0]])
+    assert args.output.read_text() == '{"prior":"evidence"}\n'
+
+
 def _source_commit():
     git = shutil.which("git")
     assert git is not None
@@ -554,22 +960,132 @@ def _source_commit():
     ).stdout.strip()
 
 
+def _suffix_pair_observations(runner, proxy_system_mutation):
+    scenario = runner.scenario_set("expanded")[0]
+    scenario_order = [scenario.case_id]
+    planner = runner.PhasePlanner()
+    payload = runner.request_payload(scenario, model="model", proxy_policy=False)
+    direct_tool_model = runner.model_boundary_fingerprint(
+        planner.plan(payload, phase="acquisition"), scenario_order=scenario_order
+    )
+    proxy_tool_payload = planner.plan(payload, phase="acquisition")
+    proxy_tool_payload["messages"][0]["content"] += proxy_system_mutation
+    proxy_tool_model = runner.model_boundary_fingerprint(proxy_tool_payload, scenario_order=scenario_order)
+    direct_terminal_payload = runner._preflight_payload(
+        scenario, model="model", proxy_policy=False, no_tools=True
+    )
+    direct_terminal_model = runner.model_boundary_fingerprint(
+        direct_terminal_payload, scenario_order=scenario_order
+    )
+    proxy_terminal_payload = runner._preflight_payload(
+        scenario, model="model", proxy_policy=False, no_tools=True
+    )
+    proxy_terminal_payload["messages"][0]["content"] += proxy_system_mutation
+    proxy_terminal_model = runner.model_boundary_fingerprint(proxy_terminal_payload, scenario_order=scenario_order)
+    downstream = runner.SafeFingerprint("downstream", "same", {})
+    return [
+        runner.PreflightObservation(
+            "direct", True, 1, ("acquisition", "finalization"), True, downstream, (direct_tool_model,)
+        ),
+        runner.PreflightObservation(
+            "proxy",
+            True,
+            1,
+            ("acquisition", "finalization"),
+            True,
+            downstream,
+            (proxy_tool_model,),
+            {"acquisition": 2, "finalization": 1},
+        ),
+        runner.PreflightObservation(
+            "direct", False, 0, ("terminal",), True, downstream, (direct_terminal_model,)
+        ),
+        runner.PreflightObservation(
+            "proxy", False, 0, ("terminal",), True, downstream, (proxy_terminal_model,)
+        ),
+    ]
+
+
+def _append_observer_record(runner, path, payload, sequence):
+    fingerprint = runner.model_boundary_fingerprint(payload)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "record_type": "qualification_model_boundary",
+                    "sequence": sequence,
+                    "digest": fingerprint.digest,
+                    "fields": fingerprint.fields,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+
+
+def _preflight_args(tmp_path):
+    return SimpleNamespace(
+        direct_base_url="http://direct.invalid/v1",
+        proxy_base_url="http://proxy.invalid/v1",
+        proxy_metrics_url="http://metrics.invalid",
+        proxy_observer_ledger=tmp_path / "observer.jsonl",
+        candidate_source_commit=_source_commit(),
+        candidate_image_digest="sha256:" + "0" * 64,
+        model="model",
+        run_manifest_sha256=_RUN_MANIFEST_SHA256,
+        direct_api_key_file=None,
+        proxy_api_key_file=None,
+        output=tmp_path / "preflight.jsonl",
+    )
+
+
 def _write_passing_preflight(runner, output, source_commit, image_digest, contract_digests=None):
-    fingerprint = runner.SafeFingerprint("downstream", "same", {})
-    model_fingerprint = runner.SafeFingerprint("model_facing", "same", {})
+    scenario = runner.scenario_set("expanded")[0]
+    scenario_order = [item.case_id for item in runner.scenario_set("expanded")]
+    planner = runner.PhasePlanner()
+    direct_tool_payload = runner.request_payload(scenario, model="model", proxy_policy=False)
+    proxy_tool_payload = runner.request_payload(scenario, model="model", proxy_policy=True)
+    direct_tool, _ = runner.request_fingerprints(direct_tool_payload, scenario_order, policy_delta={})
+    proxy_tool, _ = runner.request_fingerprints(
+        proxy_tool_payload, scenario_order, policy_delta={"x-shiftedx-require-receipt": True}
+    )
+    direct_tool_model = runner.model_boundary_fingerprint(
+        planner.plan(direct_tool_payload, phase="acquisition"), scenario_order=scenario_order
+    )
+    proxy_tool_model_payload = planner.plan(proxy_tool_payload, phase="acquisition")
+    proxy_tool_model_payload["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
+    proxy_tool_model = runner.model_boundary_fingerprint(proxy_tool_model_payload, scenario_order=scenario_order)
+    direct_terminal_payload = runner._preflight_payload(
+        scenario, model="model", proxy_policy=False, no_tools=True
+    )
+    direct_terminal, _ = runner.request_fingerprints(direct_terminal_payload, scenario_order, policy_delta={})
+    direct_terminal_model = runner.model_boundary_fingerprint(
+        direct_terminal_payload, scenario_order=scenario_order
+    )
+    proxy_terminal_payload = runner._preflight_payload(
+        scenario, model="model", proxy_policy=False, no_tools=True
+    )
+    proxy_terminal_payload["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
+    proxy_terminal_model = runner.model_boundary_fingerprint(
+        proxy_terminal_payload, scenario_order=scenario_order
+    )
     observations = [
         runner.PreflightObservation(
-            arm=arm,
-            tool_required=tool_required,
-            native_acquisition_tool_calls=1 if tool_required else 0,
-            phases=("acquisition", "finalization") if tool_required else ("terminal",),
-            terminal_schema_valid=True,
-            downstream=fingerprint,
-            model_facing=(model_fingerprint,),
-            proxy_phase_counts={"acquisition": 2, "finalization": 1} if arm == "proxy" and tool_required else None,
-        )
-        for arm in ("direct", "proxy")
-        for tool_required in (True, False)
+            "direct", True, 1, ("acquisition", "finalization"), True, direct_tool, (direct_tool_model,)
+        ),
+        runner.PreflightObservation(
+            "proxy",
+            True,
+            1,
+            ("acquisition", "finalization"),
+            True,
+            proxy_tool,
+            (proxy_tool_model,),
+            {"acquisition": 2, "finalization": 1},
+        ),
+        runner.PreflightObservation("direct", False, 0, ("terminal",), True, direct_terminal, (direct_terminal_model,)),
+        runner.PreflightObservation("proxy", False, 0, ("terminal",), True, direct_terminal, (proxy_terminal_model,)),
     ]
     if contract_digests is None:
         scenarios = runner.scenario_set("expanded")
@@ -578,6 +1094,7 @@ def _write_passing_preflight(runner, output, source_commit, image_digest, contra
                 [runner.request_payload(item, model="model", proxy_policy=arm == "proxy") for item in scenarios],
                 [item.case_id for item in scenarios],
                 policy_delta={"x-shiftedx-require-receipt": True} if arm == "proxy" else {},
+                run_manifest_sha256=_RUN_MANIFEST_SHA256,
             )
             for arm in ("direct", "proxy")
         }
@@ -587,4 +1104,5 @@ def _write_passing_preflight(runner, output, source_commit, image_digest, contra
         source_commit=source_commit,
         image_digest=image_digest,
         contract_digests=contract_digests,
+        run_manifest_sha256=_RUN_MANIFEST_SHA256,
     )

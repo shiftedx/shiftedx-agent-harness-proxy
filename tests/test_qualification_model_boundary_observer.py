@@ -36,7 +36,9 @@ def test_observer_retains_only_model_boundary_component_hashes(monkeypatch, tmp_
     )
 
     row = json.loads(ledger.read_text())
+    assert set(row) == {"record_type", "sequence", "digest", "fields"}
     assert row["record_type"] == "qualification_model_boundary"
+    assert row["sequence"] == 1
     serialized = ledger.read_text()
     assert "private system marker" not in serialized
     assert "private prompt marker" not in serialized

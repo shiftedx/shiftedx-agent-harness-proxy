@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import re
 import time
+import urllib.error
 import urllib.request
 import uuid
 from contextlib import suppress
@@ -19,18 +21,18 @@ from shiftedx_bench.agentic import run_agentic_cases, scenario_set
 from shiftedx_bench.api import OpenAIClient
 
 from shiftedx_harness_proxy.qualification_contract import (
+    ModelBoundaryObserverCursor,
     PhasePlanner,
     PreflightFailure,
     PreflightObservation,
     SafeFingerprint,
-    bind_model_boundary_context,
     model_boundary_fingerprint,
     qualification_contract_digest,
-    read_model_boundary_observer_ledger,
     request_fingerprints,
     require_candidate_provenance,
     require_scoring_gate,
     terminal_schema_valid,
+    validate_run_manifest_sha256,
     write_preflight_ledger,
 )
 from shiftedx_harness_proxy.qualification_contract import (
@@ -97,66 +99,129 @@ def assert_preflight(observations: list[PreflightObservation]) -> None:
 
 
 class CompatibilityClient:
-    """Apply the one versioned plan directly, or observe its proxy equivalent.
+    """Apply the direct phase plan or consume actual proxy-boundary evidence per turn."""
 
-    The direct arm must split calls itself.  The proxy arm keeps its standard
-    combined downstream request and records the same planned model-facing
-    phases; the proxy's aggregate phase counters validate that this plan was
-    actually carried out during paired preflight.
-    """
-
-    def __init__(self, upstream: Any, *, arm: str, scenario_order: list[str], proxy_policy: bool) -> None:
+    def __init__(
+        self,
+        upstream: Any,
+        *,
+        arm: str,
+        scenario_order: list[str],
+        proxy_policy: bool,
+        observer: ModelBoundaryObserverCursor | None = None,
+    ) -> None:
         self.upstream = upstream
         self.arm = arm
         self.scenario_order = scenario_order
         self.proxy_policy = proxy_policy
+        self.observer = observer
         self.planner = PhasePlanner()
         self.calls: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
         self.downstream_payloads: list[dict[str, Any]] = []
+        self._direct_model_payloads: list[tuple[str, dict[str, Any]]] = []
+        self._proxy_model_turns: list[tuple[SafeFingerprint, ...]] = []
 
     def complete(self, payload: dict[str, Any], *, stream: bool = False) -> dict[str, Any]:
         del stream  # Qualification is intentionally non-streaming.
-        self.downstream_payloads.append(payload)
+        self.downstream_payloads.append(copy.deepcopy(payload))
         phases = self.planner.phases_for(payload)
-        if self.arm == "proxy" or phases == ("terminal",):
-            response = self.upstream.complete(payload, stream=False)
-            self.calls.append((phases[-1], payload, response))
-            return response
-        acquisition = self.planner.plan(payload, phase="acquisition")
-        response = self.upstream.complete(acquisition, stream=False)
-        self.calls.append(("acquisition", acquisition, response))
+        if self.arm == "proxy":
+            return self._complete_proxy(payload, phases)
+        if phases == ("terminal",):
+            return self._complete_direct("terminal", payload)
+        response = self._complete_direct("acquisition", self.planner.plan(payload, phase="acquisition"))
         if response.get("tool_calls"):
             return response
-        finalization = self.planner.plan(payload, phase="finalization")
-        final_response = self.upstream.complete(finalization, stream=False)
-        self.calls.append(("finalization", finalization, final_response))
-        return final_response
+        return self._complete_direct("finalization", self.planner.plan(payload, phase="finalization"))
+
+    def _complete_direct(self, phase: str, payload: dict[str, Any]) -> dict[str, Any]:
+        self._direct_model_payloads.append((phase, copy.deepcopy(payload)))
+        response = self.upstream.complete(payload, stream=False)
+        if not isinstance(response, dict):
+            raise PreflightFailure("preflight_response_malformed")
+        self.calls.append((phase, payload, response))
+        return response
+
+    def _complete_proxy(self, payload: dict[str, Any], phases: tuple[str, ...]) -> dict[str, Any]:
+        if self.observer is not None:
+            self.observer.begin_turn()
+        try:
+            response = self.upstream.complete(payload, stream=False)
+        except Exception:
+            self._consume_proxy_observations(payload, require_records=False)
+            raise
+        if not isinstance(response, dict):
+            self._consume_proxy_observations(payload, require_records=True)
+            raise PreflightFailure("preflight_response_malformed")
+        self._consume_proxy_observations(payload, require_records=not _is_local_projection(response))
+        self.calls.append((phases[-1], payload, response))
+        return response
+
+    def _consume_proxy_observations(self, payload: dict[str, Any], *, require_records: bool) -> None:
+        if self.observer is None:
+            return
+        records = self.observer.consume_turn(require_records=require_records)
+        self._proxy_model_turns.append(records)
+        self._validate_proxy_model_turn(payload, records)
+
+    def _validate_proxy_model_turn(
+        self, payload: dict[str, Any], records: tuple[SafeFingerprint, ...]
+    ) -> None:
+        expected = tuple(
+            (
+                phase,
+                model_boundary_fingerprint(
+                    self.planner.plan(payload, phase=phase), scenario_order=self.scenario_order
+                ),
+            )
+            for phase in self.planner.phases_for(payload)
+        )
+        matched_phases: list[int] = []
+        for record in records:
+            matching = [
+                index
+                for index, (_phase, expected_fingerprint) in enumerate(expected)
+                if not _contract_mismatches(expected_fingerprint, record)
+            ]
+            if not matching:
+                raise PreflightFailure("proxy model-boundary observer fields differed")
+            matched_phases.append(matching[0])
+        if matched_phases != sorted(matched_phases):
+            raise PreflightFailure("proxy model-boundary observer order differed")
 
     def actual_contract_fingerprints(self) -> dict[str, Any]:
-        """Return safe evidence from payloads this compatibility client actually handled."""
+        """Return only actual sent/observed hash-only evidence, grouped in turn order."""
         if not self.downstream_payloads:
-            raise RuntimeError("no compatibility-client payload was observed")
+            return {"downstream": None, "model_facing": [], "model_facing_turns": []}
         policy_delta = {"x-shiftedx-require-receipt": True} if self.proxy_policy else {}
-        downstream, planned_model_facing = request_fingerprints(
+        downstream, _planned_model_facing = request_fingerprints(
             self.downstream_payloads[0], self.scenario_order, policy_delta=policy_delta
         )
-        model_facing = (
-            tuple(
-                model_boundary_fingerprint(payload, scenario_order=self.scenario_order)
-                for _phase, payload, _response in self.calls
+        if self.arm == "direct":
+            model_turns = tuple(
+                (model_boundary_fingerprint(payload, scenario_order=self.scenario_order),)
+                for _phase, payload in self._direct_model_payloads
             )
-            if self.arm == "direct"
-            else planned_model_facing
-        )
+        else:
+            model_turns = tuple(self._proxy_model_turns)
+        model_facing = tuple(item for turn in model_turns for item in turn)
         return {
             "downstream": downstream.to_dict(),
             "model_facing": [fingerprint.to_dict() for fingerprint in model_facing],
+            "model_facing_turns": [
+                {
+                    "turn_index": index,
+                    "fingerprints": [fingerprint.to_dict() for fingerprint in turn],
+                }
+                for index, turn in enumerate(model_turns)
+            ],
         }
 
     def observation(self, *, tool_required: bool, original_payload: dict[str, Any]) -> PreflightObservation:
         policy_delta = {"x-shiftedx-require-receipt": True} if self.proxy_policy and tool_required else {}
+        downstream_payload = self.downstream_payloads[0] if self.downstream_payloads else original_payload
         downstream, planned_model_facing = request_fingerprints(
-            original_payload, self.scenario_order, policy_delta=policy_delta
+            downstream_payload, self.scenario_order, policy_delta=policy_delta
         )
         native_calls = sum(
             len(response.get("tool_calls") or [])
@@ -164,23 +229,29 @@ class CompatibilityClient:
             if self.arm == "proxy" or phase == "acquisition"
         )
         terminal_response = self.calls[-1][2] if self.calls else {}
-        phases = PhasePlanner().phases_for(original_payload)
+        model_facing = (
+            tuple(
+                model_boundary_fingerprint(payload, scenario_order=self.scenario_order)
+                for _phase, payload in self._direct_model_payloads
+            )
+            if self.arm == "direct"
+            else tuple(item for turn in self._proxy_model_turns for item in turn)
+            if self.observer is not None
+            else planned_model_facing
+        )
         return PreflightObservation(
             arm=self.arm,  # type: ignore[arg-type]  # validated by the CLI construction
             tool_required=tool_required,
             native_acquisition_tool_calls=native_calls,
-            phases=phases,
+            phases=PhasePlanner().phases_for(original_payload),
             terminal_schema_valid=terminal_schema_valid(terminal_response, original_payload.get("response_format")),
             downstream=downstream,
-            model_facing=(
-                tuple(
-                    model_boundary_fingerprint(payload, scenario_order=self.scenario_order)
-                    for _phase, payload, _response in self.calls
-                )
-                if self.arm == "direct"
-                else planned_model_facing
-            ),
+            model_facing=model_facing,
         )
+
+
+def _is_local_projection(response: dict[str, Any]) -> bool:
+    return isinstance(response.get("x-shiftedx-local-projection"), dict)
 
 
 def _preflight_payload(scenario: Any, *, model: str, proxy_policy: bool, no_tools: bool) -> dict[str, Any]:
@@ -221,6 +292,7 @@ def failure_row(
     scenario_order: list[str],
     proxy_policy: bool,
     wall_s: float,
+    actual_contract_fingerprints: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a prompt-free benchmark row when the client cannot return a response."""
     status_match = _HTTP_STATUS.search(str(error))
@@ -287,11 +359,15 @@ def failure_row(
             "agentic_family": scenario.family,
             "real_repo": scenario.real_repo,
             "forbidden_calls": sorted(scenario.forbidden_calls),
-            "runner_failure_stage": "benchmark_client",
+            "runner_failure_stage": "qualification_observer"
+            if isinstance(error, PreflightFailure)
+            else "benchmark_client",
         },
         "request_hash": request_hash,
         "scored": True,
-        "contract_fingerprints": contract_fingerprints(
+        "contract_fingerprints": actual_contract_fingerprints
+        if actual_contract_fingerprints is not None
+        else contract_fingerprints(
             request_payload(scenario, model=model, proxy_policy=proxy_policy),
             scenario_order,
             policy_delta={"x-shiftedx-require-receipt": True} if proxy_policy else {},
@@ -301,10 +377,19 @@ def failure_row(
 
 def append_failure(output: Path, row: dict[str, Any]) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("a", encoding="utf-8") as handle:
-        handle.write(
-            json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
-        )
+    rows = (
+        [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines() if line]
+        if output.exists()
+        else []
+    )
+    # The benchmark writer may have emitted a current-case row before the observer rejected it.
+    # Replace it with the fail-closed evidence row rather than leaving an unverified scored row.
+    rows = [item for item in rows if item.get("case_id") != row.get("case_id")]
+    rows.append(row)
+    output.write_text(
+        "".join(json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n" for item in rows),
+        encoding="utf-8",
+    )
 
 
 def annotate_scored_rows(
@@ -371,6 +456,10 @@ def main() -> None:
     parser.add_argument("--candidate-source-commit")
     parser.add_argument("--candidate-image-digest")
     parser.add_argument(
+        "--run-manifest-sha256",
+        help="SHA-256 of the immutable approved run manifest carrying the exact model/runtime identity.",
+    )
+    parser.add_argument(
         "--paired-preflight",
         action="store_true",
         help="Run unscored synthetic tool/no-tool paths through direct and proxy arms, then write a safe ledger.",
@@ -407,10 +496,16 @@ def main() -> None:
         args.preflight_ledger is None
         or args.candidate_source_commit is None
         or args.candidate_image_digest is None
+        or args.run_manifest_sha256 is None
     ):
         raise SystemExit(
-            "scored mode requires --preflight-ledger, --candidate-source-commit, and --candidate-image-digest"
+            "scored mode requires --preflight-ledger, --candidate-source-commit, --candidate-image-digest, "
+            "and --run-manifest-sha256"
         )
+    try:
+        validate_run_manifest_sha256(args.run_manifest_sha256)
+    except PreflightFailure as error:
+        raise SystemExit("--run-manifest-sha256 must be an immutable SHA-256") from error
     require_scoring_gate(
         output=args.output,
         preflight_ledger=args.preflight_ledger,
@@ -420,13 +515,26 @@ def main() -> None:
             [request_payload(item, model=args.model, proxy_policy=args.proxy_policy) for item in selected],
             [item.case_id for item in selected],
             policy_delta={"x-shiftedx-require-receipt": True} if args.proxy_policy else {},
+            run_manifest_sha256=args.run_manifest_sha256,
         ),
         arm="proxy" if args.proxy_policy else "direct",
+        model=args.model,
+        run_manifest_sha256=args.run_manifest_sha256,
     )
     api_key = args.api_key_file.read_text().strip() if args.api_key_file is not None else None
     if args.api_key_file is not None and not api_key:
         raise SystemExit("--api-key-file must contain a non-empty bearer credential")
     client = OpenAIClient(args.base_url, api_key=api_key, timeout_s=600.0)
+    observer: ModelBoundaryObserverCursor | None = None
+    if args.proxy_policy:
+        if args.proxy_observer_ledger is None:
+            raise SystemExit("scored proxy mode requires --proxy-observer-ledger")
+        try:
+            observer = ModelBoundaryObserverCursor(
+                args.proxy_observer_ledger, [item.case_id for item in selected]
+            )
+        except PreflightFailure as error:
+            raise SystemExit("scored proxy mode requires a fresh proxy model-boundary observer ledger") from error
     run_id = args.run_id or str(uuid.uuid4())
     for scenario in selected:
         overrides: dict[str, Any] = {
@@ -444,12 +552,14 @@ def main() -> None:
         if args.proxy_policy:
             overrides["x-shiftedx-require-receipt"] = scenario.require_receipt
         started = time.perf_counter()
+        planned_client: CompatibilityClient | None = None
         try:
             planned_client = CompatibilityClient(
                 client,
                 arm="proxy" if args.proxy_policy else "direct",
                 scenario_order=[item.case_id for item in selected],
                 proxy_policy=args.proxy_policy,
+                observer=observer,
             )
             rows = run_agentic_cases(
                 client=planned_client,
@@ -462,6 +572,8 @@ def main() -> None:
                 agentic_set=args.agentic_set,
                 case_id=scenario.case_id,
             )
+            if observer is not None:
+                observer.require_drained()
             annotate_scored_rows(
                 args.output,
                 planned_client,
@@ -480,6 +592,9 @@ def main() -> None:
                     scenario_order=[item.case_id for item in selected],
                     proxy_policy=args.proxy_policy,
                     wall_s=time.perf_counter() - started,
+                    actual_contract_fingerprints=(
+                        planned_client.actual_contract_fingerprints() if planned_client is not None else None
+                    ),
                 ),
             )
 
@@ -504,81 +619,78 @@ def _run_paired_preflight(args: argparse.Namespace, selected: list[Any]) -> None
             "--paired-preflight requires --direct-base-url, --proxy-base-url, --proxy-metrics-url, and "
             "--proxy-observer-ledger"
         )
-    if not args.candidate_source_commit or not args.candidate_image_digest:
-        raise SystemExit("--paired-preflight requires exact --candidate-source-commit and --candidate-image-digest")
+    if not args.candidate_source_commit or not args.candidate_image_digest or not args.run_manifest_sha256:
+        raise SystemExit(
+            "--paired-preflight requires exact --candidate-source-commit, --candidate-image-digest, and "
+            "--run-manifest-sha256"
+        )
+    try:
+        validate_run_manifest_sha256(args.run_manifest_sha256)
+    except PreflightFailure as error:
+        raise SystemExit("--run-manifest-sha256 must be an immutable SHA-256") from error
     require_candidate_provenance(args.candidate_source_commit, args.candidate_image_digest)
+    if args.output.exists():
+        raise SystemExit("refusing to overwrite an existing preflight ledger; select a new output path")
     tool_scenario = next((item for item in selected if item.tools), None)
     if tool_scenario is None:
         raise SystemExit("selected agentic set has no tool-required scenario for preflight")
     scenario_order = [item.case_id for item in selected]
-    contract_digests = _qualification_contract_digests(args.model, selected, scenario_order)
-    if args.proxy_observer_ledger.exists() and args.proxy_observer_ledger.stat().st_size:
-        _record_failed_preflight(
-            args,
-            [],
-            contract_digests,
-            reason="proxy_model_boundary_observer_ledger_not_fresh",
-            message="paired preflight requires a new empty proxy model-boundary observer ledger",
-        )
+    contract_digests = _qualification_contract_digests(
+        args.model, selected, scenario_order, args.run_manifest_sha256
+    )
     observations: list[PreflightObservation] = []
-    proxy_metrics_key = _read_key(args.proxy_api_key_file)
-    metrics_before = _phase_metrics(args.proxy_metrics_url, proxy_metrics_key)
-    for arm, base_url, api_key, proxy_policy in (
-        ("direct", args.direct_base_url, _read_key(args.direct_api_key_file), False),
-        ("proxy", args.proxy_base_url, proxy_metrics_key, True),
-    ):
-        tool_client = CompatibilityClient(
-            OpenAIClient(base_url, api_key=api_key, timeout_s=600.0),
-            arm=arm,
-            scenario_order=scenario_order,
-            proxy_policy=proxy_policy,
-        )
-        tool_payload = _preflight_payload(tool_scenario, model=args.model, proxy_policy=proxy_policy, no_tools=False)
-        _run_preflight_path(tool_client, tool_payload, tool_required=True)
-        observations.append(tool_client.observation(tool_required=True, original_payload=tool_payload))
-
-        terminal_client = CompatibilityClient(
-            OpenAIClient(base_url, api_key=api_key, timeout_s=600.0),
-            arm=arm,
-            scenario_order=scenario_order,
-            proxy_policy=False,
-        )
-        terminal_payload = _preflight_payload(tool_scenario, model=args.model, proxy_policy=False, no_tools=True)
-        _run_preflight_path(terminal_client, terminal_payload, tool_required=False)
-        observations.append(terminal_client.observation(tool_required=False, original_payload=terminal_payload))
-    metrics_after = _phase_metrics(args.proxy_metrics_url, proxy_metrics_key)
-    proxy_delta = {key: metrics_after[key] - metrics_before[key] for key in metrics_before}
-    direct_tool = next(item for item in observations if item.arm == "direct" and item.tool_required)
-    direct_terminal = next(item for item in observations if item.arm == "direct" and not item.tool_required)
     try:
-        proxy_model_boundary = bind_model_boundary_context(
-            read_model_boundary_observer_ledger(args.proxy_observer_ledger), scenario_order
-        )
-        expected_model_calls = len(direct_tool.model_facing) + len(direct_terminal.model_facing)
-        if len(proxy_model_boundary) != expected_model_calls:
-            raise PreflightFailure("proxy model-boundary observer record count differed")
-    except PreflightFailure as error:
+        observer = ModelBoundaryObserverCursor(args.proxy_observer_ledger, scenario_order)
+        proxy_metrics_key = _read_key(args.proxy_api_key_file)
+        metrics_before = _phase_metrics(args.proxy_metrics_url, proxy_metrics_key)
+        for arm, base_url, api_key, proxy_policy in (
+            ("direct", args.direct_base_url, _read_key(args.direct_api_key_file), False),
+            ("proxy", args.proxy_base_url, proxy_metrics_key, True),
+        ):
+            tool_client = CompatibilityClient(
+                OpenAIClient(base_url, api_key=api_key, timeout_s=600.0),
+                arm=arm,
+                scenario_order=scenario_order,
+                proxy_policy=proxy_policy,
+                observer=observer if arm == "proxy" else None,
+            )
+            tool_payload = _preflight_payload(
+                tool_scenario, model=args.model, proxy_policy=proxy_policy, no_tools=False
+            )
+            try:
+                _run_preflight_path(tool_client, tool_payload, tool_required=True)
+            finally:
+                observations.append(tool_client.observation(tool_required=True, original_payload=tool_payload))
+
+            terminal_client = CompatibilityClient(
+                OpenAIClient(base_url, api_key=api_key, timeout_s=600.0),
+                arm=arm,
+                scenario_order=scenario_order,
+                proxy_policy=False,
+                observer=observer if arm == "proxy" else None,
+            )
+            terminal_payload = _preflight_payload(tool_scenario, model=args.model, proxy_policy=False, no_tools=True)
+            try:
+                _run_preflight_path(terminal_client, terminal_payload, tool_required=False)
+            finally:
+                observations.append(terminal_client.observation(tool_required=False, original_payload=terminal_payload))
+        metrics_after = _phase_metrics(args.proxy_metrics_url, proxy_metrics_key)
+        proxy_delta = {key: metrics_after[key] - metrics_before[key] for key in metrics_before}
+        observer.require_drained()
+        observations = [
+            replace(observation, proxy_phase_counts=proxy_delta)
+            if observation.arm == "proxy" and observation.tool_required
+            else observation
+            for observation in observations
+        ]
+        _assert_preflight(observations)
+    except Exception as error:
         _record_failed_preflight(
             args,
             observations,
             contract_digests,
-            reason="proxy_model_boundary_observer_failed",
-            message=f"paired preflight failed before scored output: {error}",
+            reason=_preflight_failure_reason(error),
         )
-    observations = [
-        (
-            replace(
-                observation,
-                proxy_phase_counts=proxy_delta,
-                model_facing=proxy_model_boundary[: len(direct_tool.model_facing)],
-            )
-            if observation.arm == "proxy" and observation.tool_required
-            else replace(observation, model_facing=proxy_model_boundary[len(direct_tool.model_facing) :])
-            if observation.arm == "proxy"
-            else observation
-        )
-        for observation in observations
-    ]
     try:
         write_preflight_ledger(
             args.output,
@@ -586,19 +698,21 @@ def _run_paired_preflight(args: argparse.Namespace, selected: list[Any]) -> None
             source_commit=args.candidate_source_commit,
             image_digest=args.candidate_image_digest,
             contract_digests=contract_digests,
+            run_manifest_sha256=args.run_manifest_sha256,
         )
     except PreflightFailure as error:
-        raise SystemExit(f"paired preflight failed before scored output: {error}") from error
+        raise SystemExit("paired preflight failed before scored output: preflight_evidence_write_failed") from error
 
 
 def _qualification_contract_digests(
-    model: str, selected: list[Any], scenario_order: list[str]
+    model: str, selected: list[Any], scenario_order: list[str], run_manifest_sha256: str
 ) -> dict[str, str]:
     return {
         arm: qualification_contract_digest(
             [request_payload(item, model=model, proxy_policy=arm == "proxy") for item in selected],
             scenario_order,
             policy_delta={"x-shiftedx-require-receipt": True} if arm == "proxy" else {},
+            run_manifest_sha256=run_manifest_sha256,
         )
         for arm in ("direct", "proxy")
     }
@@ -610,7 +724,6 @@ def _record_failed_preflight(
     contract_digests: dict[str, str],
     *,
     reason: str,
-    message: str,
 ) -> None:
     with suppress(PreflightFailure):
         write_preflight_ledger(
@@ -619,9 +732,31 @@ def _record_failed_preflight(
             source_commit=args.candidate_source_commit,
             image_digest=args.candidate_image_digest,
             contract_digests=contract_digests,
+            run_manifest_sha256=args.run_manifest_sha256,
             failure_reason=reason,
         )
-    raise SystemExit(message)
+    raise SystemExit(f"paired preflight failed before scored output: {reason}")
+
+
+def _preflight_failure_reason(error: Exception) -> str:
+    if isinstance(error, PreflightFailure):
+        known = {
+            "proxy_phase_metrics_unavailable",
+            "proxy_phase_metrics_malformed",
+            "preflight_response_malformed",
+        }
+        if str(error) in known:
+            return str(error)
+        if "observer" in str(error):
+            return "proxy_model_boundary_observer_failed"
+        return "preflight_contract_validation_failed"
+    if isinstance(error, TimeoutError):
+        return "preflight_timeout"
+    if isinstance(error, urllib.error.HTTPError | urllib.error.URLError | ConnectionError | OSError):
+        return "preflight_transport_failure"
+    if isinstance(error, json.JSONDecodeError | TypeError | ValueError):
+        return "preflight_malformed_response"
+    return "preflight_client_failure"
 
 
 def _phase_metrics(url: str, api_key: str | None) -> dict[str, int]:
@@ -631,12 +766,12 @@ def _phase_metrics(url: str, api_key: str | None) -> dict[str, int]:
         with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310 - operator-supplied private endpoint
             body = response.read().decode("utf-8", errors="replace")
     except Exception as error:
-        raise SystemExit("paired preflight could not read proxy phase counters") from error
+        raise PreflightFailure("proxy_phase_metrics_unavailable") from error
     values: dict[str, int] = {}
     for name in ("acquisition", "finalization"):
         match = re.search(rf"^shiftedx_proxy_phase_{name}_total ([0-9]+(?:\\.[0-9]+)?)$", body, re.MULTILINE)
         if match is None:
-            raise SystemExit("paired preflight could not parse proxy phase counters")
+            raise PreflightFailure("proxy_phase_metrics_malformed")
         values[name] = int(float(match.group(1)))
     return values
 

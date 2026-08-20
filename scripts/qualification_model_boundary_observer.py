@@ -25,21 +25,27 @@ LEDGER = Path(os.environ.get("QUALIFICATION_OBSERVER_LEDGER", ""))
 
 if not UPSTREAM or not LEDGER.name:
     raise RuntimeError("QUALIFICATION_OBSERVER_UPSTREAM and QUALIFICATION_OBSERVER_LEDGER are required")
+if LEDGER.exists() and LEDGER.stat().st_size:
+    raise RuntimeError("QUALIFICATION_OBSERVER_LEDGER must be a new empty ledger")
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 client = httpx.AsyncClient(timeout=httpx.Timeout(600.0), trust_env=False)
+_next_sequence = 1
 
 
 def _append_observation(payload: dict[str, Any]) -> None:
+    global _next_sequence
     fingerprint = model_boundary_fingerprint(payload)
     record = {
         "record_type": "qualification_model_boundary",
+        "sequence": _next_sequence,
         "digest": fingerprint.digest,
         "fields": fingerprint.fields,
     }
     LEDGER.parent.mkdir(parents=True, exist_ok=True)
     with LEDGER.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+    _next_sequence += 1
 
 
 @app.post("/v1/chat/completions")
