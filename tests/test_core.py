@@ -70,9 +70,10 @@ def test_projection_requires_complete_typed_successful_receipt() -> None:
         required_json_types={"status": "string", "workers": "integer"},
     )
     state.record("read_logs", {}, '{"status":"nominal","workers":8,"message":"ok"}')
-    assert state.project_final("read_logs", '{"status":"nominal","workers":8}') == (
-        '{"status":"nominal","workers":8}'
-    )
+    assert state.project_final("read_logs", '{"status":"nominal","workers":8}') is None
+    assert state.projection_shadow_candidate(
+        "read_logs", '{"status":"nominal","workers":8}'
+    ).reason == "exact_primitive_object"
 
     missing = AgentHarness(
         "health",

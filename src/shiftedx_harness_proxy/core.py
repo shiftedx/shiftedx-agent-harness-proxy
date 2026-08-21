@@ -206,6 +206,25 @@ class AgentHarness:
             blocked_unresolved_action=blocked_unresolved_action,
         )
 
+    def projection_shadow_candidate(
+        self,
+        name: str,
+        result: str,
+        *,
+        transcript_degraded: bool = False,
+        blocked_unresolved_action: bool = False,
+    ) -> ProjectionDecision:
+        """Identify a projection candidate for an external shadow observer only."""
+        from .projection import decide_local_projection_shadow_candidate
+
+        return decide_local_projection_shadow_candidate(
+            self,
+            name,
+            result,
+            transcript_degraded=transcript_degraded,
+            blocked_unresolved_action=blocked_unresolved_action,
+        )
+
     def project_final(self, name: str, result: str) -> str | None:
         decision = self.projection_decision(name, result)
         return decision.candidate.content() if decision.eligible and decision.candidate is not None else None

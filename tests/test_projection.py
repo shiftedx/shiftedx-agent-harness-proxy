@@ -38,8 +38,8 @@ def _current_success() -> AgentHarness:
         ("not json", "malformed_tool_result"),
     ],
 )
-def test_projection_decision_rejects_nonexact_visible_values(result: str, reason: str) -> None:
-    decision = _current_success().projection_decision("read_logs", result)
+def test_projection_shadow_candidate_rejects_nonexact_visible_values(result: str, reason: str) -> None:
+    decision = _current_success().projection_shadow_candidate("read_logs", result)
 
     assert decision.eligible is False
     assert decision.reason == reason
@@ -50,7 +50,7 @@ def test_projection_decision_rejects_nonexact_visible_values(result: str, reason
     "state",
     ["failed", "pending_verification", "open_failure", "blocked", "degraded", "stale", "unknown"],
 )
-def test_projection_decision_freezes_receipt_and_state_gates(state: str) -> None:
+def test_projection_shadow_candidate_freezes_receipt_and_state_gates(state: str) -> None:
     harness = _current_success()
     kwargs: dict[str, bool] = {}
     if state == "failed":
@@ -66,11 +66,11 @@ def test_projection_decision_freezes_receipt_and_state_gates(state: str) -> None
     elif state == "stale":
         harness.epoch += 1
     elif state == "unknown":
-        decision = harness.projection_decision("unknown", '{"status":"nominal","workers":8}')
+        decision = harness.projection_shadow_candidate("unknown", '{"status":"nominal","workers":8}')
         assert decision.reason == "unknown_tool_result"
         return
 
-    decision = harness.projection_decision("read_logs", '{"status":"nominal","workers":8}', **kwargs)
+    decision = harness.projection_shadow_candidate("read_logs", '{"status":"nominal","workers":8}', **kwargs)
 
     assert decision.eligible is False
     assert decision.reason in {
@@ -84,7 +84,7 @@ def test_projection_decision_freezes_receipt_and_state_gates(state: str) -> None
 
 
 def test_shadow_evaluation_compares_parsed_value_against_declared_schema_without_content() -> None:
-    decision = _current_success().projection_decision("read_logs", '{"status":"nominal","workers":8}')
+    decision = _current_success().projection_shadow_candidate("read_logs", '{"status":"nominal","workers":8}')
 
     matched = evaluate_projection_shadow(decision, '{"workers":8,"status":"nominal"}')
     mismatched = evaluate_projection_shadow(decision, '{"status":"nominal","workers":9}')
@@ -96,7 +96,7 @@ def test_shadow_evaluation_compares_parsed_value_against_declared_schema_without
     assert json.dumps(matched.to_safe_dict()) == '{"eligible": true, "agreement": true, "reason": "exact_agreement"}'
 
 
-def test_projection_decision_rejects_unsupported_schema_before_parsing_tool_content() -> None:
+def test_projection_shadow_candidate_rejects_unsupported_schema_before_parsing_tool_content() -> None:
     harness = AgentHarness(
         "report",
         available_tools={"read_logs"},
@@ -105,7 +105,7 @@ def test_projection_decision_rejects_unsupported_schema_before_parsing_tool_cont
     )
     harness.record("read_logs", {}, '{"status":["nominal"]}')
 
-    decision = harness.projection_decision("read_logs", '{"status":["nominal"]}')
+    decision = harness.projection_shadow_candidate("read_logs", '{"status":["nominal"]}')
 
     assert decision.to_safe_dict() == {"eligible": False, "reason": "unsupported_schema"}
 
@@ -121,6 +121,17 @@ def test_projection_rejects_nonfinite_json_numbers(constant: str) -> None:
     result = f'{{"value":{constant}}}'
     harness.record("read_logs", {}, result)
 
-    decision = harness.projection_decision("read_logs", result)
+    decision = harness.projection_shadow_candidate("read_logs", result)
 
     assert decision.to_safe_dict() == {"eligible": False, "reason": "malformed_tool_result"}
+
+
+def test_exact_primitive_object_is_shadow_only_until_promoted() -> None:
+    harness = _current_success()
+    shadow = harness.projection_shadow_candidate("read_logs", '{"status":"nominal","workers":8}')
+    release = harness.projection_decision("read_logs", '{"status":"nominal","workers":8}')
+
+    assert shadow.to_safe_dict() == {"eligible": True, "reason": "exact_primitive_object"}
+    assert shadow.candidate is not None
+    assert release.to_safe_dict() == {"eligible": False, "reason": "unpromoted_rule"}
+    assert release.candidate is None

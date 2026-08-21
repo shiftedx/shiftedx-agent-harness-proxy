@@ -655,6 +655,27 @@ async def test_complete_typed_latest_receipt_projects_without_upstream_call() ->
 
 
 @pytest.mark.asyncio
+async def test_exact_object_projection_candidate_remains_shadow_only_in_production() -> None:
+    upstream = ScriptedUpstream([completion(content='{"status":"upstream"}')])
+    payload = request(
+        [
+            {"role": "user", "content": "report"},
+            {"role": "assistant", "tool_calls": [call("read", "read_file", '{"path":"a.py"}')]},
+            {"role": "tool", "tool_call_id": "read", "content": '{"status":"nominal"}'},
+        ]
+    )
+    payload["response_format"] = strict_schema()
+
+    result = await ChatService(Settings(upstream_base_url="http://upstream/v1"), upstream).complete(payload, {})
+
+    assert result.body["choices"][0]["message"]["content"] == '{"status":"upstream"}'
+    assert result.telemetry.receipt_projections == 0
+    assert result.telemetry.local_projection_upstream_calls_avoided == 0
+    assert result.telemetry.upstream_calls == 1
+    assert len(upstream.requests) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "messages",
     [

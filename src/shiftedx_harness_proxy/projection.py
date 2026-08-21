@@ -58,7 +58,30 @@ def decide_local_projection(
     transcript_degraded: bool = False,
     blocked_unresolved_action: bool = False,
 ) -> ProjectionDecision:
-    """Return a categorical, side-effect-free decision for the proven projection rule."""
+    """Return the release decision for the only promoted projection rule."""
+    shadow = decide_local_projection_shadow_candidate(
+        harness,
+        name,
+        result,
+        transcript_degraded=transcript_degraded,
+        blocked_unresolved_action=blocked_unresolved_action,
+    )
+    if not shadow.eligible:
+        return shadow
+    if shadow.reason != "proven_verifier_summary":
+        return _rejected("unpromoted_rule")
+    return ProjectionDecision(True, "eligible", shadow.candidate)
+
+
+def decide_local_projection_shadow_candidate(
+    harness: AgentHarness,
+    name: str,
+    result: str,
+    *,
+    transcript_degraded: bool = False,
+    blocked_unresolved_action: bool = False,
+) -> ProjectionDecision:
+    """Identify a conservative candidate for shadow comparison, never release it."""
     if transcript_degraded:
         return _rejected("transcript_degraded")
     if blocked_unresolved_action or harness.last_action_blocked:
@@ -84,11 +107,11 @@ def decide_local_projection(
         return _rejected("unsupported_schema")
     proven = _proven_verification_candidate(harness, name, result, schema)
     if proven is not None:
-        return ProjectionDecision(True, "eligible", proven)
+        return ProjectionDecision(True, "proven_verifier_summary", proven)
     value = _parse_exact_terminal(result, schema)
     if isinstance(value, str):
         return _rejected(value)
-    return ProjectionDecision(True, "eligible", CanonicalProjection(value, schema))
+    return ProjectionDecision(True, "exact_primitive_object", CanonicalProjection(value, schema))
 
 
 def evaluate_projection_shadow(
