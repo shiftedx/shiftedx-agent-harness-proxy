@@ -13,6 +13,37 @@ A small, stateless policy proxy for OpenAI-compatible Chat Completions. It block
 stalled tool calls, requires verification after mutations, and corrects malformed terminal JSON
 within fixed retry limits. It never executes tools or changes model weights.
 
+## Stock MTPLX performance
+
+No MTPLX fork is required. The validated M4 Max 64 GiB profile used stock MTPLX `2.7.1`:
+
+| Claim | Retained data |
+|---|---:|
+| Quality | Proxy `158/180` vs direct `99/180`; proxy won `6/6` pairs |
+| Decode retained | `101.4%` of direct cold; `100.7%` warm-prefix |
+| RAM-prefix reuse | Identical proxy request: `0/3609` then `3609/3609` cached tokens |
+| Remaining latency gap | Agentic p95 `170.5%` cold; `145.6%` warm (`125%` gate not passed) |
+
+```bash
+MODEL=/path/to/qwen3.8-27b-aeon-nvidia-style-vision-mtplx
+SERVED_MODEL=your-openai-model-id
+mtplx quickstart --model "$MODEL" --model-id "$SERVED_MODEL" --host 127.0.0.1 --port 8000 \
+  --profile turbo --mtp --depth 3 --scheduler-mode serial --batching-preset latency \
+  --mtp-batch-numerics throughput --tool-prompt-mode native --paged-kv-quantization off \
+  --ssd-session-cache off --reasoning on --reasoning-effort medium --max-tokens 1024 \
+  --default-temperature 1 --default-top-p .95 --default-top-k 20 \
+  --draft-temperature 1 --draft-top-p .95 --draft-top-k 20 --no-stats-footer
+
+UPSTREAM_BASE_URL=http://host.docker.internal:8000/v1 \
+UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE=phase_split \
+INTERVENTION_FAST_PATH_MODE=disabled docker compose up --build -d
+```
+
+Keep an opaque Chat Completions `user` value stable per conversation for MTPLX session affinity.
+SSD cache is off above; MTPLX RAM-prefix reuse remains active. Do not select experimental
+`combined_v1`. Evidence: [AEON qualification](benchmark-reports/aeon-historical-parity-result-2026-08-20.md)
+and [latency probes](benchmark-reports/latency-optimization-progress-2026-08-20.md).
+
 ## Local development
 
 Prerequisites: Docker Compose and an OpenAI-compatible model server listening on host port `8000`.
@@ -197,7 +228,7 @@ uv run mypy src
 ./scripts/docker-smoke.sh
 ```
 
-The current release-candidate branch has 754 tests. CI also runs the near-body-limit admission soak,
+The current release-candidate branch has 847 tests. CI also runs the near-body-limit admission soak,
 dependency audit, multi-architecture OCI build, hardened production-profile smoke, exact-image
 vulnerability/secret/misconfiguration scan, SBOM generation, release-manifest capture, and SLSA
 provenance attestation. The complete evidence boundary is summarized in
