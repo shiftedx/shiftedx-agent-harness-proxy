@@ -35,7 +35,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, TypeGuard, cast
 
-_MAX_BYTES = 1024 * 1024
+# A full frozen campaign can retain hundreds of detailed raw attempts.  This
+# remains a bounded private artifact while leaving room for that fixed window.
+TIMING_EVIDENCE_MAX_BYTES = 16 * 1024 * 1024
+_MAX_BYTES = TIMING_EVIDENCE_MAX_BYTES
 _MAX_ROWS = 10_000
 _OUTCOMES = frozenset({"succeeded", "failed", "cancelled", "deadline"})
 _INTERVENTIONS = frozenset(
@@ -654,7 +657,14 @@ def bind_capture_row(
         if not _sha256(digest) or attempt.get("sequence") != ordinal:
             raise TimingFailure("qualification_timing_ledger_invalid")
         phase = _observer_phase(observer.get("fields"))
-        if attempt.get("phase") != phase:
+        raw_status = attempt.get("status")
+        observer_status = _observer_status(observer.get("response"))
+        if (
+            attempt.get("phase") != phase
+            or raw_status not in _OUTCOMES
+            or (observer_status == "succeeded" and raw_status != "succeeded")
+            or (observer_status == "failed" and raw_status == "succeeded")
+        ):
             raise TimingFailure("qualification_timing_ledger_invalid")
         bound_attempts.append(
             {
@@ -662,7 +672,7 @@ def bind_capture_row(
                 "request_sequence": sequence,
                 "observer_digest": digest,
                 "phase": phase,
-                "status": _observer_status(observer.get("response")),
+                "status": raw_status,
                 "cache_lane": cache_lane,
                 "cache_result": _observer_cache_result(observer.get("response")),
             }
@@ -777,7 +787,23 @@ def finalize_timing_evidence(
             )
             # A runner accounting row is only a cross-check; it cannot
             # overwrite server-observed terminal/intervention counters.
-            if provisional_request.sequence != sequence:
+            observed_phase_counts = {"acquisition": 0, "finalization": 0}
+            for observer in selected:
+                phase = _observer_phase(observer.get("fields"))
+                if phase not in observed_phase_counts:
+                    raise TimingFailure("qualification_timing_ledger_invalid")
+                observed_phase_counts[phase] += 1
+            if (
+                provisional_request.sequence != sequence
+                or provisional_request.attempt_count != len(selected)
+                or provisional_request.attempt_sequence_start
+                != (_integer(selected[0]["sequence"]) if selected else None)
+                or provisional_request.attempt_sequence_end
+                != (_integer(selected[-1]["sequence"]) if selected else None)
+                or provisional_request.successful_attempt_count
+                != sum(_observer_status(item.get("response")) == "succeeded" for item in selected)
+                or dict(provisional_request.phase_counts) != observed_phase_counts
+            ):
                 raise TimingFailure("qualification_timing_ledger_invalid")
             final_requests.append(final_request)
             rows.append(
@@ -832,7 +858,9 @@ def finalize_timing_evidence(
                         "decode_availability": unavailable("model_boundary_unavailable"),
                     }
                 )
-            projection = not selected and client["outcome"] == "succeeded"
+            if not selected and client["outcome"] == "succeeded":
+                # Direct treatment has no policy projection path.
+                raise TimingFailure("qualification_timing_ledger_invalid")
             capture = {
                 "schema_version": "2.1",
                 "record_type": "qualification_timing_capture",
@@ -845,8 +873,8 @@ def finalize_timing_evidence(
                 "response_finalize_ns": 0,
                 "other_measured_ns": client_wall - attempt_total,
                 "attempts": attempts,
-                "local_projection": projection,
-                "avoided_immediate_upstream_calls": 1 if projection else 0,
+                "local_projection": False,
+                "avoided_immediate_upstream_calls": 0,
                 "correction_count": 0,
                 "blocked_duplicate_count": 0,
                 "blocked_stall_count": 0,
@@ -862,7 +890,7 @@ def finalize_timing_evidence(
                     request_accounting_row=client,
                     observer_rows=selected,
                     cache_lane=cache_lane,
-                    intervention_class="projection" if projection else "pass_through",
+                    intervention_class="bounded_failure" if client["outcome"] != "succeeded" else "pass_through",
                     client_wall_ns=client_wall,
                     downstream_request_sha256=str(client["downstream_request_sha256"]),
                 )
@@ -893,14 +921,20 @@ def _provisional_observer_slice(
 def _intervention_class(capture: Mapping[str, object]) -> str:
     if capture.get("local_projection"):
         return "projection"
+    if capture.get("outcome") != "succeeded":
+        return "bounded_failure"
     if _integer(capture["blocked_duplicate_count"]) or _integer(capture["blocked_stall_count"]):
         return "blocked_call_recovery"
     if _integer(capture["correction_count"]):
         return "correction"
     phases = capture.get("phase_counts")
-    if isinstance(phases, Mapping) and _integer(phases.get("finalization", 0)):
+    if (
+        isinstance(phases, Mapping)
+        and _integer(phases.get("acquisition", 0))
+        and _integer(phases.get("finalization", 0))
+    ):
         return "phase_split"
-    return "bounded_failure" if capture.get("outcome") != "succeeded" else "pass_through"
+    return "pass_through"
 
 
 def verify_timing_ledger_linkage(
@@ -1024,16 +1058,19 @@ def verify_timing_ledger_linkage(
             if not isinstance(attempt, Mapping):
                 raise TimingFailure("qualification_timing_ledger_invalid")
             phase = _observer_phase(observer.get("fields"))
-            status = _observer_status(observer.get("response"))
+            observer_status = _observer_status(observer.get("response"))
+            status = attempt.get("status")
             if (
                 observer.get("sequence") != observer_sequence
                 or attempt.get("observer_digest") != observer.get("digest")
                 or attempt.get("phase") != phase
-                or attempt.get("status") != status
+                or status not in _OUTCOMES
+                or (observer_status == "succeeded" and status != "succeeded")
+                or (observer_status == "failed" and status == "succeeded")
             ):
                 raise TimingFailure("qualification_timing_ledger_invalid")
             observed_phases[phase] += 1
-            successful_attempts += int(status == "succeeded")
+            successful_attempts += int(observer_status == "succeeded")
         if (
             row["phase_counts"] != observed_phases
             or dict(phase_counts)
@@ -1440,7 +1477,7 @@ def _validate_transport(value: object) -> None:
 def _validate_capture_row(row: Mapping[str, object]) -> None:
     if (
         set(row) != _CAPTURE_KEYS
-        or row.get("schema_version") not in {"2.0", "2.1"}
+        or row.get("schema_version") != "2.1"
         or row.get("record_type") != "qualification_timing_capture"
         or not _nonnegative(row.get("sequence"))
         or row.get("outcome") not in _OUTCOMES

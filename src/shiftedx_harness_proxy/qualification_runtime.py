@@ -75,6 +75,7 @@ from .qualification_reconciliation import (
     request_accounting_record_payload,
 )
 from .qualification_timing import (
+    TIMING_EVIDENCE_MAX_BYTES,
     TimingFailure,
     finalize_timing_evidence,
     read_timing_ledger,
@@ -813,8 +814,12 @@ def supervise_qualification_runtime(
                 # result with a consequent missing/incomplete attempt ledger.
                 if action_exit_code == 0:
                     raise
-            if action_exit_code == 0:
+            try:
                 _finalize_direct_timing(private_run_dir, binding)
+            except QualificationRuntimeFailure:
+                if action_exit_code == 0:
+                    raise
+            if action_exit_code == 0:
                 _require_complete_output(lease.output_ledger, stage, spec)
                 status = "passed"
             else:
@@ -897,14 +902,15 @@ def supervise_qualification_runtime(
                 # artifact without replacing a known child failure category.
                 if action_exit_code == 0:
                     raise
-            if (
-                action_exit_code == 0
-                and stage == "score-proxy"
-                and timing_volume_name is not None
-                and container_id is not None
-            ):
-                _extract_proxy_timing_capture(runner, container_id, _proxy_raw_timing_capture_path(private_run_dir))
-                _finalize_proxy_timing(private_run_dir, binding)
+            if stage == "score-proxy" and timing_volume_name is not None and container_id is not None:
+                try:
+                    _extract_proxy_timing_capture(runner, container_id, _proxy_raw_timing_capture_path(private_run_dir))
+                    _finalize_proxy_timing(private_run_dir, binding)
+                except QualificationRuntimeFailure:
+                    # A failed child retains any valid raw capture but its
+                    # terminal action category remains authoritative.
+                    if action_exit_code == 0:
+                        raise
             if stage == "score-proxy" and reconciliation_session is not None and model_summary is not None:
                 try:
                     proxy_reconciliation_sha256 = _complete_proxy_reconciliation(
@@ -2877,7 +2883,7 @@ def _extract_proxy_timing_capture(runner: RuntimeCommandRunner, container_id: st
         valid_metadata = (
             metadata.returncode == 0
             and (uid, gid, mode) == ("10001", "10001", "600")
-            and 0 <= expected_size <= 1024 * 1024
+            and 0 <= expected_size <= TIMING_EVIDENCE_MAX_BYTES
         )
     except (TypeError, ValueError):
         valid_metadata = False
@@ -2889,7 +2895,7 @@ def _extract_proxy_timing_capture(runner: RuntimeCommandRunner, container_id: st
     if result.returncode != 0:
         raise QualificationRuntimeFailure("runtime_timing_ledger_invalid")
     payload = result.stdout.encode("utf-8")
-    if len(payload) > 1024 * 1024 or len(payload) != expected_size:
+    if len(payload) > TIMING_EVIDENCE_MAX_BYTES or len(payload) != expected_size:
         raise QualificationRuntimeFailure("runtime_timing_ledger_invalid")
     descriptor: int | None = None
     try:

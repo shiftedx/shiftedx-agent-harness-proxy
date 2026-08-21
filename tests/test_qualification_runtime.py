@@ -613,6 +613,8 @@ class _FakeRuntimeRunner:
         self.container_labels: dict[str, dict[str, str]] = {}
         self.volume_labels: dict[str, dict[str, str]] = {}
         self.volume_name = "expected-volume"
+        self.credentials_volume_name = "expected-volume"
+        self.timing_volume_name: str | None = None
         self.failure = failure
         self.drift = drift
         self.container_running = True
@@ -620,6 +622,7 @@ class _FakeRuntimeRunner:
         self.model_requests_completed = 0
         self.metrics_snapshots: list[dict[str, int]] = [_zero_proxy_metrics(), _zero_proxy_metrics()]
         self.metrics_reads = 0
+        self.timing_capture_payload = ""
         type(self)._next_model_started_at += 1
         self.model_started_at = float(type(self)._next_model_started_at)
 
@@ -641,7 +644,12 @@ class _FakeRuntimeRunner:
     def _capture_volume(self, argv: tuple[str, ...]) -> None:
         for value in argv:
             if value.startswith("type=volume,src="):
-                self.volume_name = value.split(",", 2)[1].removeprefix("src=")
+                source = value.split(",", 2)[1].removeprefix("src=")
+                if "dst=/run/secrets" in value or "dst=/target" in value:
+                    self.credentials_volume_name = source
+                if "dst=/run/qualification" in value:
+                    self.timing_volume_name = source
+                self.volume_name = source
 
     def run(
         self, argv: tuple[str, ...], *, env: dict[str, str] | None = None, timeout: float | None = None
@@ -770,7 +778,12 @@ class _FakeRuntimeRunner:
             if self.failure == "inspect":
                 return SimpleNamespace(returncode=1, stdout="", stderr="")
             labels = self.container_labels.get(argv[-1], {})
-            document = _runtime_inspect(labels, self.volume_name, running=self.container_running)
+            document = _runtime_inspect(
+                labels,
+                self.credentials_volume_name,
+                timing_volume_name=self.timing_volume_name,
+                running=self.container_running,
+            )
             if self.drift == "resources":
                 document["HostConfig"]["ReadonlyRootfs"] = False
             elif self.drift == "bind":
@@ -813,6 +826,15 @@ class _FakeRuntimeRunner:
                 stdout=json.dumps(self.metrics_snapshots[index], sort_keys=True, separators=(",", ":")),
                 stderr="",
             )
+        if argv[:3] == ("docker", "exec", "--user") and argv[-1] == "/run/qualification/capture.jsonl":
+            if "stat" in argv:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=f"10001:10001:600:{len(self.timing_capture_payload.encode('utf-8'))}\n",
+                    stderr="",
+                )
+            if "cat" in argv:
+                return SimpleNamespace(returncode=0, stdout=self.timing_capture_payload, stderr="")
         if argv[:3] == ("docker", "exec", "--user"):
             if self.failure == "auth":
                 return SimpleNamespace(returncode=1, stdout="", stderr="")
@@ -947,7 +969,30 @@ def _manifest_settings() -> dict[str, object]:
     }
 
 
-def _runtime_inspect(labels: dict[str, str], volume_name: str, *, running: bool = True) -> dict[str, object]:
+def _runtime_inspect(
+    labels: dict[str, str],
+    volume_name: str,
+    *,
+    timing_volume_name: str | None = None,
+    running: bool = True,
+) -> dict[str, object]:
+    scored_proxy = labels.get("io.shiftedx.qualification.stage") == "scored_proxy"
+    environment = [
+        "DEPLOYMENT_PROFILE=production",
+        "HARNESS_PROFILE=shiftedx-harness-v1",
+        "LISTEN_HOST=0.0.0.0",
+        "LISTEN_PORT=8090",
+        "UPSTREAM_BASE_URL=http://host.docker.internal:18092/v1",
+        "UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE=phase_split",
+        "UPSTREAM_CACHE_CAPABILITY_MODE=disabled",
+        "TELEMETRY_ENABLED=true",
+        "METRICS_ENABLED=true",
+    ]
+    mounts = [{"Type": "volume", "Name": volume_name, "Destination": "/run/secrets", "RW": False}]
+    if scored_proxy:
+        assert timing_volume_name is not None
+        environment.append("QUALIFICATION_TIMING_CAPTURE_PATH=/run/qualification/capture.jsonl")
+        mounts.append({"Type": "volume", "Name": timing_volume_name, "Destination": "/run/qualification", "RW": True})
     return {
         "State": {"Running": running},
         "Image": "sha256:" + "c" * 64,
@@ -955,17 +1000,7 @@ def _runtime_inspect(labels: dict[str, str], volume_name: str, *, running: bool 
             "User": "10001:10001",
             # Docker 29 stores --stop-timeout on Config, not HostConfig.
             "StopTimeout": 20,
-            "Env": [
-                "DEPLOYMENT_PROFILE=production",
-                "HARNESS_PROFILE=shiftedx-harness-v1",
-                "LISTEN_HOST=0.0.0.0",
-                "LISTEN_PORT=8090",
-                "UPSTREAM_BASE_URL=http://host.docker.internal:18092/v1",
-                "UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE=phase_split",
-                "UPSTREAM_CACHE_CAPABILITY_MODE=disabled",
-                "TELEMETRY_ENABLED=true",
-                "METRICS_ENABLED=true",
-            ],
+            "Env": environment,
             "Labels": labels,
         },
         "HostConfig": {
@@ -979,7 +1014,7 @@ def _runtime_inspect(labels: dict[str, str], volume_name: str, *, running: bool 
             "Init": True,
             "PortBindings": {"8090/tcp": [{"HostIp": "127.0.0.1", "HostPort": "19090"}]},
         },
-        "Mounts": [{"Type": "volume", "Name": volume_name, "Destination": "/run/secrets", "RW": False}],
+        "Mounts": mounts,
     }
 
 
@@ -1302,7 +1337,7 @@ def _write_proxy_timing(
     lease: RuntimeLease,
     requests: tuple[RequestAccountingRecord, ...],
     observers: tuple[ModelBoundaryRecord, ...],
-) -> None:
+) -> str:
     """Write deterministic, exact test-only sink evidence through public seams."""
 
     assert lease.proxy_raw_timing_capture is not None
@@ -1339,7 +1374,7 @@ def _write_proxy_timing(
                 }
             )
         capture = {
-            "schema_version": "2.0",
+            "schema_version": "2.1",
             "record_type": "qualification_timing_capture",
             "sequence": request.sequence,
             "outcome": request.outcome,
@@ -1359,10 +1394,6 @@ def _write_proxy_timing(
             "phase_counts": phase_counts,
         }
         captures.append(capture)
-    lease.proxy_raw_timing_capture.write_text(
-        "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in captures), encoding="utf-8"
-    )
-    lease.proxy_raw_timing_capture.chmod(0o600)
     write_request_accounting_ledger(lease.proxy_request_accounting_provisional_ledger, requests)
     provisional = [
         {
@@ -1383,6 +1414,32 @@ def _write_proxy_timing(
         "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in provisional), encoding="utf-8"
     )
     lease.proxy_provisional_request_ledger.chmod(0o600)
+    return "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in captures)
+
+
+def _write_direct_provisional(lease: RuntimeLease, *, attempt_count: int = 1) -> None:
+    assert lease.direct_provisional_request_ledger is not None
+    lease.direct_provisional_request_ledger.write_text(
+        json.dumps(
+            {
+                "pair_ordinal": 1,
+                "arm": "direct",
+                "cache_lane": "warm-prefix" if lease.cache_lane == "warm-prefix" else "cold",
+                "client_wall_ns": attempt_count + 1,
+                "outcome": "succeeded",
+                "observer_sequence_start": 1 if attempt_count else None,
+                "observer_sequence_end": attempt_count if attempt_count else None,
+                "observer_record_count": attempt_count,
+                "direct_attempt_wall_ns": [1] * attempt_count,
+                "downstream_request_sha256": "a" * 64,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    lease.direct_provisional_request_ledger.chmod(0o600)
 
 
 def _model_attempt(
@@ -1672,6 +1729,7 @@ def test_cold_direct_stage_adapts_actual_attempt_ledger_into_passed_model_eviden
         _write_scored_output(lease)
         assert lease.direct_model_attempt_ledger is not None
         write_model_boundary_attempt_ledger(lease.direct_model_attempt_ledger, [_model_attempt(1, _cold_cache())])
+        _write_direct_provisional(lease)
         runner.model_requests_completed += 1
         return 0
 
@@ -1709,6 +1767,7 @@ def test_warm_direct_stage_requires_and_binds_one_prime_before_its_first_hit(tmp
         assert lease.prime_model_attempt_ledger is not None
         write_model_boundary_attempt_ledger(lease.prime_model_attempt_ledger, [_model_attempt(1, _warm_prime_cache())])
         write_model_boundary_attempt_ledger(lease.direct_model_attempt_ledger, [_model_attempt(1, _warm_hit_cache())])
+        _write_direct_provisional(lease)
         runner.model_requests_completed += 2
         return 0
 
@@ -1744,6 +1803,7 @@ def test_successful_model_attempt_without_cache_evidence_blocks_outcome(tmp_path
         _write_scored_output(lease)
         assert lease.direct_model_attempt_ledger is not None
         write_model_boundary_attempt_ledger(lease.direct_model_attempt_ledger, [_model_attempt(1, None)])
+        _write_direct_provisional(lease)
         return 0
 
     direct = _supervise(
@@ -1786,7 +1846,7 @@ def test_proxy_stage_adapts_only_its_fresh_observer_attempts(tmp_path) -> None:
         runner.calls.append(("action", (), None))
         _write_scored_output(lease)
         assert lease.observer_ledger is not None
-        assert lease.proxy_request_ledger is not None
+        assert lease.proxy_request_accounting_provisional_ledger is not None
         observer_record = _model_attempt(1, _cold_cache())
         lease.observer_ledger.write_text(
             json.dumps(observer_record.to_dict(), sort_keys=True, separators=(",", ":")) + "\n"
@@ -1805,11 +1865,7 @@ def test_proxy_stage_adapts_only_its_fresh_observer_attempts(tmp_path) -> None:
             blocked_duplicate_count=0,
             blocked_stall_count=0,
         )
-        write_request_accounting_ledger(
-            lease.proxy_request_ledger,
-            (accounting_record,),
-        )
-        _write_proxy_timing(lease, (accounting_record,), (observer_record,))
+        runner.timing_capture_payload = _write_proxy_timing(lease, (accounting_record,), (observer_record,))
         after = _zero_proxy_metrics()
         after.update(
             {
@@ -1884,6 +1940,7 @@ def test_warm_proxy_attestation_keeps_the_single_preflight_runtime_contract(tmp_
         assert lease.prime_model_attempt_ledger is not None
         write_model_boundary_attempt_ledger(lease.prime_model_attempt_ledger, [_model_attempt(1, _warm_prime_cache())])
         write_model_boundary_attempt_ledger(lease.direct_model_attempt_ledger, [_model_attempt(1, _warm_hit_cache())])
+        _write_direct_provisional(lease)
         direct_runner.model_requests_completed += 2
         return 0
 
@@ -1903,7 +1960,7 @@ def test_warm_proxy_attestation_keeps_the_single_preflight_runtime_contract(tmp_
     def proxy_action(lease: RuntimeLease) -> int:
         _write_scored_output(lease)
         assert lease.observer_ledger is not None
-        assert lease.proxy_request_ledger is not None
+        assert lease.proxy_request_accounting_provisional_ledger is not None
         assert lease.prime_model_attempt_ledger is not None
         write_model_boundary_attempt_ledger(lease.prime_model_attempt_ledger, [_model_attempt(1, _warm_prime_cache())])
         observer_record = _model_attempt(1, _warm_hit_cache())
@@ -1924,11 +1981,7 @@ def test_warm_proxy_attestation_keeps_the_single_preflight_runtime_contract(tmp_
             blocked_duplicate_count=0,
             blocked_stall_count=0,
         )
-        write_request_accounting_ledger(
-            lease.proxy_request_ledger,
-            (accounting_record,),
-        )
-        _write_proxy_timing(lease, (accounting_record,), (observer_record,))
+        proxy_runner.timing_capture_payload = _write_proxy_timing(lease, (accounting_record,), (observer_record,))
         after = _zero_proxy_metrics()
         after.update({"downstream_requests": 1, "upstream_calls": 1, "phase_acquisition": 1})
         proxy_runner.metrics_snapshots[1] = after
@@ -2035,6 +2088,7 @@ def test_proxy_nonzero_child_still_finalizes_its_safe_reconciliation_window(tmp_
     )
 
     assert (outcome.status, outcome.failure_category) == ("failed", "action_failed")
+    assert (private_run_dir / "scored-proxy-raw-timing-capture.jsonl").exists()
     reconciliation = private_run_dir / "scored-proxy-reconciliation.json"
     assert json.loads(reconciliation.read_text(encoding="utf-8"))["status"] == "passed"
     assert outcome.proxy_reconciliation_sha256 == hashlib.sha256(reconciliation.read_bytes()).hexdigest()

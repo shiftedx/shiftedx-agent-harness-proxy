@@ -133,7 +133,7 @@ def _capture(*, attempts: list[dict[str, object]] | None = None, **overrides: ob
         phase_counts[str(attempt["phase"])] += 1
     components = 1 + 2 + 3 + 4 + 5
     row: dict[str, object] = {
-        "schema_version": "2.0",
+        "schema_version": "2.1",
         "record_type": "qualification_timing_capture",
         "sequence": 1,
         "outcome": "succeeded",
@@ -494,7 +494,13 @@ def test_exact_hash_linkage_freezes_intervention_precedence() -> None:
     ]
     for expected, outcome, local_projection, corrections, blocked_duplicates, blocked_stalls, details in cases:
         observers = [_observer(index, phase=phase, status=status) for index, (phase, status) in enumerate(details, 1)]
-        attempts = [_capture_attempt(sequence=index, phase=phase) for index, (phase, _status) in enumerate(details, 1)]
+        attempts = [
+            {
+                **_capture_attempt(sequence=index, phase=phase),
+                "status": "succeeded" if 200 <= status < 300 else "failed",
+            }
+            for index, (phase, status) in enumerate(details, 1)
+        ]
         phase_counts = {
             "acquisition": sum(phase == "acquisition" for phase, _status in details),
             "finalization": sum(phase == "finalization" for phase, _status in details),
