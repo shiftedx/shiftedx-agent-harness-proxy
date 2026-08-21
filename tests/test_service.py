@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict
 
 from shiftedx_harness_proxy.config import Settings
 from shiftedx_harness_proxy.errors import ProxyError
+from shiftedx_harness_proxy.fast_path import InMemoryFastPathObserver
 from shiftedx_harness_proxy.service import ChatService
 
 
@@ -106,6 +107,46 @@ class CombinedScriptedUpstream(ScriptedUpstream):
     async def combined_tool_terminal_schema_supported(self) -> bool:
         self.capability_probes += 1
         return self.supported
+
+
+@pytest.mark.asyncio
+async def test_shadow_fast_path_records_hash_only_equivalence_but_sends_normal_harness_payload() -> None:
+    upstream = ScriptedUpstream([completion(content="done")])
+    observer = InMemoryFastPathObserver()
+    await ChatService(
+        Settings(upstream_base_url="http://upstream/v1", intervention_fast_path_mode="shadow"),
+        upstream,
+        fast_path_observer=observer,
+    ).complete({"model": "model", "messages": [{"role": "user", "content": "hello"}]}, {})
+
+    assert len(observer.records) == 1
+    safe = observer.records[0].to_safe_dict()
+    assert safe["eligible"] is True
+    assert safe["equivalent"] is True
+    assert "hello" not in str(safe)
+    assert upstream.requests[0]["messages"][0]["role"] == "system"
+    assert upstream.requests[0]["messages"][-1]["content"].startswith("[shiftedx harness]")
+
+
+@pytest.mark.asyncio
+async def test_client_body_or_header_never_selects_fast_path() -> None:
+    upstream = ScriptedUpstream([completion(content="done")])
+    observer = InMemoryFastPathObserver()
+    await ChatService(
+        Settings(upstream_base_url="http://upstream/v1"),
+        upstream,
+        fast_path_observer=observer,
+    ).complete(
+        {
+            "model": "model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "x-shiftedx-fast-path": "enabled",
+        },
+        {"x-shiftedx-fast-path": "enabled"},
+    )
+
+    assert observer.records == []
+    assert upstream.requests[0]["messages"][0]["role"] == "system"
 
 
 @pytest.mark.asyncio

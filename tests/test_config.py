@@ -103,6 +103,17 @@ def test_tool_response_capability_mode_is_process_fixed_and_rejects_invalid_valu
         )
 
 
+def test_intervention_fast_path_is_process_fixed_and_cannot_be_enabled_without_promotion_authority() -> None:
+    assert Settings(upstream_base_url="http://model/v1").intervention_fast_path_mode == "disabled"
+    assert (
+        Settings(upstream_base_url="http://model/v1", intervention_fast_path_mode="shadow")
+        .intervention_fast_path_mode
+        == "shadow"
+    )
+    with pytest.raises(ValidationError, match="immutable signed promotion authority"):
+        Settings(upstream_base_url="http://model/v1", intervention_fast_path_mode="enabled")
+
+
 @pytest.mark.parametrize(
     "configured_fields",
     ["", "provider_cache_scope,,alternate_scope", "---"],

@@ -185,6 +185,20 @@ terminal validation, but no harness suffix, receipt policy, or synthetic tool-re
 Its native acquisition tool calls remain unchanged. In `passthrough` mode, opt-out behavior remains
 an ordinary single upstream request.
 
+### Intervention fast-path shadow mode
+
+`INTERVENTION_FAST_PATH_MODE=disabled` is the default. `shadow` is a process-fixed observation mode:
+after validation and transcript reconstruction it admits only an empty-tool, no-receipt-extension,
+no-schema, no-tool-choice, non-degraded request with no policy state or phase capability work. It
+still sends the ordinary full harness payload. A private injected observer may retain only the two
+payload hashes, equivalence boolean, and reason category after proving that the candidate differs
+solely by the versioned harness suffix and rendered state. No request content, client header, or body
+field can select the mode. `enabled` is rejected at startup until an immutable signed promotion
+authority and model-backed parity corpus are available. Shadow records bind the fixed eligibility
+contract `server_harness_passthrough_no_policy_work:v1` and mutation contract
+`shiftedx_harness_v1:system_suffix_and_state_prompt:v1` so later evidence cannot merge changed
+semantics.
+
 `/metrics` exposes only aggregate counters:
 `shiftedx_proxy_phase_acquisition_total`, `shiftedx_proxy_phase_finalization_total`, and
 `shiftedx_proxy_phase_schema_rejections_total`. They have no request-derived labels or content.

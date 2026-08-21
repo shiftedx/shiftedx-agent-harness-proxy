@@ -17,6 +17,7 @@ from .cache_policy import (
 from .config import Settings, configured_roles
 from .core import HARNESS_SYSTEM_SUFFIX, AgentHarness, bare_json_issue, normalize_bare_json
 from .errors import ProxyError, UpstreamFailure
+from .fast_path import FastPathObserver, classify_fast_path, compare_fast_path_shadow
 from .projection_accounting import LOCAL_PROJECTION_EXTENSION, local_projection_accounting
 from .provider_capabilities import (
     CapabilityPhase,
@@ -65,11 +66,14 @@ class ChatService:
         self,
         settings: Settings,
         upstream: Upstream,
+        *,
+        fast_path_observer: FastPathObserver | None = None,
     ) -> None:
         self.settings = settings
         self.upstream = upstream
         self.base_roles = configured_roles(settings)
         self.cache_namespace_fields = settings.cache_namespace_fields()
+        self.fast_path_observer = fast_path_observer
 
     async def complete(
         self,
@@ -215,7 +219,24 @@ class ChatService:
                 ),
             )
 
+        fast_path_decision = classify_fast_path(
+            mode=self.settings.intervention_fast_path_mode,
+            harness_enabled=harness_enabled,
+            has_receipt_extension=has_receipt_override,
+            normalized_tools=tools,
+            has_response_format="response_format" in forwarded,
+            has_tool_choice="tool_choice" in forwarded,
+            has_parallel_tool_calls="parallel_tool_calls" in forwarded,
+            rebuilt=rebuilt,
+            local_projection_available=projection is not None,
+            uses_phase_split=use_phase_split,
+            uses_combined_capability=use_combined,
+        )
         working_messages = _inject_harness(copy.deepcopy(forwarded["messages"]), harness, rebuilt)
+        if fast_path_decision.eligible and self.fast_path_observer is not None:
+            candidate_payload = outbound_payload(forwarded, copy.deepcopy(forwarded["messages"]), phase=None)
+            normal_payload = outbound_payload(forwarded, working_messages, phase=None)
+            self.fast_path_observer.record(compare_fast_path_shadow(candidate_payload, normal_payload, rebuilt))
         upstream_calls = 0
         internal_retries = 0
         phase: CapabilityPhase | None = "acquisition" if use_phase_split else None
