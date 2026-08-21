@@ -12,6 +12,7 @@ from shiftedx_harness_proxy.admission import AdmissionController, BoundedUpstrea
 from shiftedx_harness_proxy.api import Counters, _complete_while_connected, _read_payload, create_app
 from shiftedx_harness_proxy.config import Settings
 from shiftedx_harness_proxy.errors import ProxyError
+from shiftedx_harness_proxy.qualification_timing import begin_request_timing, end_request_timing
 
 
 class SlowUpstream:
@@ -171,14 +172,22 @@ async def test_upstream_operation_overload_has_a_bounded_retry_hint() -> None:
 
 
 @pytest.mark.asyncio
-async def test_only_chat_consumes_an_upstream_attempt_slot() -> None:
+async def test_management_calls_share_upstream_capacity_without_becoming_model_attempts() -> None:
     controller = AdmissionController(settings(concurrency_limit=1))
     upstream = BoundedUpstream(ProbeUpstream(), controller)
 
-    async with controller.upstream_slot():
+    timing, token = begin_request_timing()
+    try:
         assert await upstream.models({}) == {"object": "list", "data": []}
         assert await upstream.combined_tool_terminal_schema_supported() is True
         assert await upstream.ready() is True
+        assert timing.attempts == []
+    finally:
+        end_request_timing(token)
+
+    async with controller.upstream_slot():
+        with pytest.raises(ProxyError, match="Upstream capacity"):
+            await upstream.models({})
 
 
 @pytest.mark.asyncio

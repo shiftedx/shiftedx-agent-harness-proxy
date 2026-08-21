@@ -312,12 +312,12 @@ def create_app(
                     )
                     headers = _telemetry_headers(result, settings)
                     headers["X-Request-ID"] = correlation_id
+                    response = JSONResponse(result.body, headers=headers)
+                    _ensure_before_deadline(deadline_at)
                     timing = current_request_timing()
                     if timing is not None:
                         timing.classify("succeeded")
                         timing.begin_response_finalize()
-                    response = JSONResponse(result.body, headers=headers)
-                    _ensure_before_deadline(deadline_at)
                     counters.observe(result)
                     return response
         except TimeoutError as exc:

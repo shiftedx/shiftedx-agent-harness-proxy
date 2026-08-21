@@ -227,13 +227,18 @@ class BoundedUpstream:
                 return result
 
     async def models(self, request_headers: dict[str, str]) -> dict[str, Any]:
-        return await self._upstream.models(request_headers)
+        # Management probes still share the bounded connection/work pool, but
+        # only chat completions are model-attempt timing records.
+        async with self._admission.upstream_slot():
+            return await self._upstream.models(request_headers)
 
     async def combined_tool_terminal_schema_supported(self) -> bool:
-        return await self._upstream.combined_tool_terminal_schema_supported()
+        async with self._admission.upstream_slot():
+            return await self._upstream.combined_tool_terminal_schema_supported()
 
     async def ready(self) -> bool:
-        upstream_ready = await self._upstream.ready()
+        async with self._admission.upstream_slot():
+            upstream_ready = await self._upstream.ready()
         if not upstream_ready:
             return False
         if self._admission.settings.upstream_tool_response_capability_mode == "combined_v1":
