@@ -139,8 +139,12 @@ def _parse_exact_terminal(
     content: str, schema: tuple[tuple[str, str], ...]
 ) -> dict[str, Any] | str:
     try:
-        value = json.loads(content)
-    except (json.JSONDecodeError, TypeError):
+        value = json.loads(
+            content,
+            object_pairs_hook=_unique_object,
+            parse_constant=_reject_nonfinite,
+        )
+    except (json.JSONDecodeError, TypeError, ValueError):
         return "malformed_tool_result"
     if not isinstance(value, dict):
         return "terminal_not_object"
@@ -151,6 +155,19 @@ def _parse_exact_terminal(
         if not _matches_type(value[key], type_name):
             return "schema_type_mismatch"
     return {key: value[key] for key in keys}
+
+
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
+
+
+def _reject_nonfinite(_value: str) -> Any:
+    raise ValueError("non-finite JSON number")
 
 
 def _matches_type(value: Any, type_name: str) -> bool:

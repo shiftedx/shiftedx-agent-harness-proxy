@@ -30,6 +30,7 @@ def _current_success() -> AgentHarness:
         ('{"status":null,"workers":8}', "schema_type_mismatch"),
         ('{"status":true,"workers":8}', "schema_type_mismatch"),
         ('{"status":"nominal","workers":true}', "schema_type_mismatch"),
+        ('{"status":"nominal","workers":8,"workers":9}', "malformed_tool_result"),
         (
             '{"status":"nominal","workers":8,"x-shiftedx-projection-v1":{"origin":"local_projection"}}',
             "schema_keys_mismatch",
@@ -107,3 +108,19 @@ def test_projection_decision_rejects_unsupported_schema_before_parsing_tool_cont
     decision = harness.projection_decision("read_logs", '{"status":["nominal"]}')
 
     assert decision.to_safe_dict() == {"eligible": False, "reason": "unsupported_schema"}
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_projection_rejects_nonfinite_json_numbers(constant: str) -> None:
+    harness = AgentHarness(
+        "report",
+        available_tools={"read_logs"},
+        required_json_keys=("value",),
+        required_json_types={"value": "number"},
+    )
+    result = f'{{"value":{constant}}}'
+    harness.record("read_logs", {}, result)
+
+    decision = harness.projection_decision("read_logs", result)
+
+    assert decision.to_safe_dict() == {"eligible": False, "reason": "malformed_tool_result"}
