@@ -676,6 +676,57 @@ def test_model_boundary_fingerprint_binds_only_safe_cache_mode_policy(monkeypatc
     assert normal_fingerprint.digest != bypass_fingerprint.digest
 
 
+def test_model_boundary_fingerprint_binds_a_stable_safe_cache_prefix_identity(monkeypatch):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    payload = runner.request_payload(scenario, model="private-model", proxy_policy=False)
+    planner = runner.PhasePlanner()
+    first = planner.plan(payload, phase="finalization")
+    continued = copy.deepcopy(first)
+    continued["messages"].extend(
+        [
+            {
+                "role": "assistant",
+                "content": "private tool request",
+                "tool_calls": [{"id": "private-call", "function": {"name": "inspect", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "private-call", "content": "private receipt"},
+        ]
+    )
+
+    first_fingerprint = runner.model_boundary_fingerprint(first)
+    continued_fingerprint = runner.model_boundary_fingerprint(continued)
+
+    assert first_fingerprint.fields["cache_prefix"] == continued_fingerprint.fields["cache_prefix"]
+    identity = first_fingerprint.fields["cache_prefix"]
+    assert identity["version"] == "compatible-prefix-v1"
+    assert set(identity) == {
+        "digest",
+        "version",
+        "template_sha256",
+        "system_prompt_sha256",
+        "model_id_sha256",
+        "tool_schema_sha256",
+        "tool_choice_policy",
+        "terminal_schema_sha256",
+        "sampler",
+        "reasoning",
+        "token_budget",
+        "phase",
+        "cache_mode_policy",
+    }
+    assert len(identity["digest"]) == 64
+    assert identity["template_sha256"] == first_fingerprint.fields["base_system_prompt_sha256"]
+    assert identity["reasoning"] == first_fingerprint.fields["reasoning"]
+    assert identity["model_id_sha256"] == first_fingerprint.fields["model_id_sha256"]
+    assert identity["phase"] == "finalization"
+    assert identity["cache_mode_policy"] is None
+    serialized = json.dumps(identity, sort_keys=True)
+    assert "private tool request" not in serialized
+    assert "private receipt" not in serialized
+    assert "private-model" not in serialized
+
+
 def test_preflight_rejects_invalid_terminal_schema(monkeypatch):
     runner = load_runner(monkeypatch)
     schema = runner.response_format("case", ("status",), {"status": "string"})
@@ -1577,6 +1628,14 @@ def test_cache_prime_payload_matches_first_scored_model_facing_digest(monkeypatc
     assert (
         runner.model_boundary_fingerprint(proxy_prime, scenario_order=scenario_order).digest
         == runner.model_boundary_fingerprint(proxy_scored, scenario_order=scenario_order).digest
+    )
+    assert (
+        runner.model_boundary_fingerprint(direct_prime).fields["cache_prefix"]["digest"]
+        == runner.model_boundary_fingerprint(direct_scored).fields["cache_prefix"]["digest"]
+    )
+    assert (
+        runner.model_boundary_fingerprint(proxy_prime).fields["cache_prefix"]["digest"]
+        == runner.model_boundary_fingerprint(proxy_scored).fields["cache_prefix"]["digest"]
     )
     assert proxy_prime["messages"][0]["content"].count(HARNESS_SYSTEM_SUFFIX) == 1
 

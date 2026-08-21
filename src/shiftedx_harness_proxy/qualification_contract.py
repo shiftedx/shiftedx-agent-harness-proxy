@@ -759,6 +759,7 @@ def model_boundary_fingerprint(payload: JsonObject, *, scenario_order: list[str]
         "phase": _observed_model_boundary_phase(payload),
     }
     fields["declared_policy_deltas"] = _observed_harness_policy_delta(payload)
+    fields["cache_prefix"] = _cache_prefix_identity(fields)
     if scenario_order is not None:
         fields.update(_model_boundary_context(scenario_order))
     return SafeFingerprint("model_facing_observed", _sha256(fields), fields)
@@ -956,6 +957,9 @@ def _safe_model_boundary_fields(fields: dict[str, Any]) -> bool:
         },
     ):
         return False
+    cache_prefix = fields["cache_prefix"]
+    if not isinstance(cache_prefix, dict) or cache_prefix != _cache_prefix_identity(fields):
+        return False
     policy_delta = fields["declared_policy_deltas"]
     return policy_delta in ({}, _expected_harness_policy_delta(), {"harness_system_suffix_sha256": "invalid"})
 
@@ -1075,6 +1079,7 @@ def _model_boundary_field_keys() -> tuple[str, ...]:
         "cache_mode_policy",
         "compatibility",
         "declared_policy_deltas",
+        "cache_prefix",
     )
 
 
@@ -1083,6 +1088,33 @@ def _cache_mode_policy(payload: JsonObject) -> Literal["bypass"] | None:
     if isinstance(metadata, dict) and metadata.get("cache_mode") == "bypass":
         return "bypass"
     return None
+
+
+def _cache_prefix_identity(fields: dict[str, Any]) -> dict[str, Any]:
+    """Return the safe, request-side identity of a server-cache-compatible prefix.
+
+    This is deliberately an identity candidate, not a cache-hit assertion: only
+    MTPLX response statistics establish hit/miss or cached-token observations.
+    Receipt, tool-result, user-turn, and transcript values are excluded so the
+    private evidence can group stable prefix material without retaining it.
+    """
+    compatibility = fields["compatibility"]
+    assert isinstance(compatibility, dict)
+    identity = {
+        "version": "compatible-prefix-v1",
+        "template_sha256": fields["base_system_prompt_sha256"],
+        "system_prompt_sha256": fields["system_prompt_sha256"],
+        "model_id_sha256": fields["model_id_sha256"],
+        "tool_schema_sha256": fields["tool_schema_sha256"],
+        "tool_choice_policy": copy.deepcopy(fields["tool_choice_policy"]),
+        "terminal_schema_sha256": fields["terminal_schema_sha256"],
+        "sampler": copy.deepcopy(fields["sampler"]),
+        "reasoning": copy.deepcopy(fields["reasoning"]),
+        "token_budget": fields["token_budget"],
+        "phase": compatibility["phase"],
+        "cache_mode_policy": fields["cache_mode_policy"],
+    }
+    return {"digest": _sha256(identity), **identity}
 
 
 def _system_prompt(payload: JsonObject) -> Any:
@@ -1212,7 +1244,7 @@ def contract_mismatches(left: SafeFingerprint, right: SafeFingerprint) -> list[s
                 and not allowed_harness_system_delta
             ):
                 mismatches.append(key)
-        elif key == "system_prompt_sha256" and allowed_harness_system_delta:
+        elif key in {"system_prompt_sha256", "cache_prefix"} and allowed_harness_system_delta:
             continue
         elif left.fields.get(key) != right.fields.get(key):
             mismatches.append(key)
