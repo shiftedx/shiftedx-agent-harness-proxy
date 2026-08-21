@@ -17,6 +17,7 @@ from typing import Any, NoReturn, cast
 import httpx
 
 from shiftedx_harness_proxy.qualification_timing import HttpxTraceDurations
+from shiftedx_harness_proxy.transport import UPSTREAM_KEEPALIVE_EXPIRY_SECONDS
 
 _MAX_REQUESTS = 128
 _MAX_CONCURRENCY = 16
@@ -262,7 +263,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--request-spacing-ms", type=lambda value: _nonnegative_int(value, maximum=_MAX_SPACING_MS), default=0
     )
-    parser.add_argument("--current-keepalive-expiry-seconds", type=_expiry, default=httpx.Limits().keepalive_expiry)
     parser.add_argument("--declared-keepalive-expiry-seconds", type=_expiry, default=0.0)
     parser.add_argument("--max-runtime-seconds", type=float, default=_DEFAULT_RUNTIME_SECONDS)
     parser.add_argument("--output", type=Path, required=True)
@@ -270,13 +270,10 @@ def main(argv: list[str] | None = None) -> int:
         args = parser.parse_args(argv)
         if not 0 < args.max_runtime_seconds <= _MAX_RUNTIME_SECONDS:
             raise ValueError
-        current_expiry = args.current_keepalive_expiry_seconds
-        if current_expiry is None:
-            raise ValueError
         cases = [
             _run_case(
-                label="current_pool_default",
-                keepalive_expiry_seconds=current_expiry,
+                label="current_pool_contract",
+                keepalive_expiry_seconds=UPSTREAM_KEEPALIVE_EXPIRY_SECONDS,
                 request_count=args.requests,
                 concurrency=args.concurrency,
                 request_spacing_ms=args.request_spacing_ms,

@@ -5,6 +5,8 @@ import json
 import sys
 from pathlib import Path
 
+from shiftedx_harness_proxy.transport import UPSTREAM_KEEPALIVE_EXPIRY_SECONDS
+
 
 def _load_script():
     script = Path(__file__).parents[1] / "scripts" / "transport_microprobe.py"
@@ -29,8 +31,6 @@ def test_local_microprobe_reports_only_aggregate_pool_mechanism_evidence(tmp_pat
                 "1",
                 "--request-spacing-ms",
                 "0",
-                "--current-keepalive-expiry-seconds",
-                "5",
                 "--declared-keepalive-expiry-seconds",
                 "0",
                 "--output",
@@ -46,6 +46,8 @@ def test_local_microprobe_reports_only_aggregate_pool_mechanism_evidence(tmp_pat
     assert report["production_latency_claim"] is False
     assert report["workload"] == {"request_count": 6, "concurrency": 1, "request_spacing_ms": 0}
     assert report["trace_connection_reuse"] == "no_reused_connection_event_in_httpx_0_28_1_trace"
+    assert report["cases"][0]["label"] == "current_pool_contract"
+    assert report["cases"][0]["keepalive_expiry_seconds"] == UPSTREAM_KEEPALIVE_EXPIRY_SECONDS
     assert [case["keepalive_expiry_seconds"] for case in report["cases"]] == [5.0, 0.0]
     for case in report["cases"]:
         assert case["response_count"] == 6
