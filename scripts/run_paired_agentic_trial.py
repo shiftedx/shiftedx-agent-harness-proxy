@@ -74,6 +74,9 @@ _HTTP_STATUS = re.compile(r"\bHTTP ([1-5][0-9]{2})\b")
 _CANONICAL_COUNTER = re.compile(r"^(?:0|[1-9][0-9]{0,19})$")
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 _MAX_PROXY_RESPONSE_BYTES = 16 * 1024 * 1024
+_MAX_PROVISIONAL_TIMING_ROWS = 10_000
+_MAX_PROVISIONAL_TIMING_ROW_BYTES = 1024
+_MAX_PROVISIONAL_TIMING_PAYLOAD_BYTES = 1024 * 1024
 PROXY_RESPONSE_ACCOUNTING = "_shiftedx_qualification_proxy_accounting"
 ProxyRequestRecord: TypeAlias = RequestAccountingRecord
 SamplerProfile: TypeAlias = str
@@ -134,6 +137,7 @@ class ProvisionalClientTimingRecord(NamedTuple):
     observer_sequence_start: int | None
     observer_sequence_end: int | None
     observer_record_count: int
+    direct_attempt_wall_ns: tuple[int, ...]
     downstream_request_sha256: str
 
     def to_dict(self) -> dict[str, Any]:
@@ -146,6 +150,7 @@ class ProvisionalClientTimingRecord(NamedTuple):
             "observer_sequence_start": self.observer_sequence_start,
             "observer_sequence_end": self.observer_sequence_end,
             "observer_record_count": self.observer_record_count,
+            "direct_attempt_wall_ns": list(self.direct_attempt_wall_ns),
             "downstream_request_sha256": self.downstream_request_sha256,
         }
 
@@ -177,6 +182,7 @@ class ProvisionalClientTimingLedger:
         client_wall_ns: int,
         outcome: ProvisionalRequestOutcome,
         observer_records: tuple[ModelBoundaryRecord, ...],
+        direct_attempt_wall_ns: tuple[int, ...],
         downstream_request_sha256: str,
     ) -> None:
         if arm not in {"direct", "proxy"}:
@@ -193,6 +199,7 @@ class ProvisionalClientTimingLedger:
                 observer_sequence_start=observer_records[0].sequence if observer_records else None,
                 observer_sequence_end=observer_records[-1].sequence if observer_records else None,
                 observer_record_count=len(observer_records),
+                direct_attempt_wall_ns=direct_attempt_wall_ns,
                 downstream_request_sha256=downstream_request_sha256,
             )
         )
@@ -235,18 +242,31 @@ def write_provisional_client_timing_ledger(
     path: Path, records: tuple[ProvisionalClientTimingRecord, ...]
 ) -> None:
     """Create private runner evidence exactly once; this ledger is not final timing evidence."""
-    if path.is_symlink() or path.exists():
-        raise ProvisionalTimingLedgerFailure("provisional_request_ledger_exists")
+    _validate_provisional_timing_parent(path)
+    try:
+        if path.is_symlink() or path.exists():
+            raise ProvisionalTimingLedgerFailure("provisional_request_ledger_exists")
+    except ProvisionalTimingLedgerFailure:
+        raise
+    except OSError:
+        raise ProvisionalTimingLedgerFailure("provisional_request_ledger_write_failed") from None
+    if not isinstance(records, tuple):
+        raise ProvisionalTimingLedgerFailure("provisional_request_ledger_invalid")
+    if len(records) > _MAX_PROVISIONAL_TIMING_ROWS:
+        raise ProvisionalTimingLedgerFailure("provisional_request_ledger_invalid")
     expected_ordinals = list(range(1, len(records) + 1))
     if [record.pair_ordinal for record in records] != expected_ordinals:
         raise ProvisionalTimingLedgerFailure("provisional_request_ledger_duplicate_or_invalid_ordinal")
-    rows: list[dict[str, Any]] = []
+    encoded_rows: list[bytes] = []
     for record in records:
         if (
             record.arm not in {"direct", "proxy"}
             or record.cache_lane not in {"cold", "warm-prefix"}
             or record.outcome not in {"succeeded", "failed", "deadline", "cancelled"}
+            or type(record.pair_ordinal) is not int
+            or type(record.client_wall_ns) is not int
             or record.client_wall_ns < 0
+            or type(record.observer_record_count) is not int
             or record.observer_record_count < 0
             or _SHA256_HEX.fullmatch(record.downstream_request_sha256) is None
         ):
@@ -263,15 +283,36 @@ def write_provisional_client_timing_ledger(
             )
         ):
             raise ProvisionalTimingLedgerFailure("provisional_request_ledger_invalid")
-        rows.append(record.to_dict())
-    payload = b"".join(
-        json.dumps(
-            row, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
-        ).encode("utf-8")
-        + b"\n"
-        for row in rows
-    )
-    path.parent.mkdir(parents=True, exist_ok=True)
+        if (
+            record.observer_record_count > 0
+            and (
+                type(record.observer_sequence_start) is not int
+                or type(record.observer_sequence_end) is not int
+            )
+        ):
+            raise ProvisionalTimingLedgerFailure("provisional_request_ledger_invalid")
+        if (
+            not isinstance(record.direct_attempt_wall_ns, tuple)
+            or any(type(duration) is not int or duration < 0 for duration in record.direct_attempt_wall_ns)
+            or (record.arm == "direct" and len(record.direct_attempt_wall_ns) != record.observer_record_count)
+            or (record.arm == "proxy" and record.direct_attempt_wall_ns)
+        ):
+            raise ProvisionalTimingLedgerFailure("provisional_request_ledger_invalid")
+        try:
+            encoded = (
+                json.dumps(
+                    record.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+                ).encode("utf-8")
+                + b"\n"
+            )
+        except (TypeError, ValueError):
+            raise ProvisionalTimingLedgerFailure("provisional_request_ledger_invalid") from None
+        if len(encoded) > _MAX_PROVISIONAL_TIMING_ROW_BYTES:
+            raise ProvisionalTimingLedgerFailure("provisional_request_ledger_invalid")
+        encoded_rows.append(encoded)
+    payload = b"".join(encoded_rows)
+    if len(payload) > _MAX_PROVISIONAL_TIMING_PAYLOAD_BYTES:
+        raise ProvisionalTimingLedgerFailure("provisional_request_ledger_invalid")
     descriptor: int | None = None
     try:
         descriptor = os.open(
@@ -284,6 +325,35 @@ def write_provisional_client_timing_ledger(
         os.fsync(descriptor)
     except FileExistsError as error:
         raise ProvisionalTimingLedgerFailure("provisional_request_ledger_exists") from error
+    except OSError:
+        raise ProvisionalTimingLedgerFailure("provisional_request_ledger_write_failed") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _validate_provisional_timing_parent(path: Path) -> None:
+    if not path.is_absolute():
+        raise ProvisionalTimingLedgerFailure("provisional_request_ledger_parent_invalid")
+    descriptor: int | None = None
+    try:
+        parent = path.parent
+        listed = parent.lstat()
+        if parent.is_symlink() or not stat.S_ISDIR(listed.st_mode) or stat.S_IMODE(listed.st_mode) != 0o700:
+            raise OSError
+        descriptor = os.open(
+            parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or stat.S_IMODE(opened.st_mode) != 0o700
+            or (opened.st_dev, opened.st_ino) != (listed.st_dev, listed.st_ino)
+        ):
+            raise OSError
+    except OSError:
+        raise ProvisionalTimingLedgerFailure("provisional_request_ledger_parent_invalid") from None
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -589,6 +659,7 @@ class CompatibilityClient:
         self._direct_model_payloads: list[tuple[str, dict[str, Any]]] = []
         self._proxy_model_turns: list[tuple[SafeFingerprint, ...]] = []
         self._direct_attempt_records: list[ModelBoundaryRecord] = []
+        self._direct_attempt_wall_ns: list[int] = []
 
     @property
     def attempt_records(self) -> tuple[ModelBoundaryRecord, ...]:
@@ -603,6 +674,7 @@ class CompatibilityClient:
         pair_ordinal = self.provisional_timing.begin() if self.provisional_timing is not None else None
         started_ns = time.perf_counter_ns() if self.provisional_timing is not None else None
         prior_turn_count = len(self.observer.record_turns) if self.observer is not None else 0
+        prior_direct_attempt_count = len(self._direct_attempt_records)
         error: BaseException | None = None
         try:
             self.downstream_payloads.append(copy.deepcopy(payload))
@@ -627,21 +699,28 @@ class CompatibilityClient:
                     if self.observer is not None and len(self.observer.record_turns) > prior_turn_count
                     else ()
                 )
+                if self.arm == "direct":
+                    observer_records = tuple(self._direct_attempt_records[prior_direct_attempt_count:])
+                    direct_attempt_wall_ns = tuple(self._direct_attempt_wall_ns[prior_direct_attempt_count:])
+                else:
+                    direct_attempt_wall_ns = ()
                 self.provisional_timing.append(
                     pair_ordinal=pair_ordinal,
                     arm=self.arm,
                     client_wall_ns=time.perf_counter_ns() - started_ns,
                     outcome=_provisional_outcome(error),
                     observer_records=observer_records,
+                    direct_attempt_wall_ns=direct_attempt_wall_ns,
                     downstream_request_sha256=downstream_request_sha256(payload),
                 )
 
     def _complete_direct(self, phase: str, payload: dict[str, Any]) -> dict[str, Any]:
         self._direct_model_payloads.append((phase, copy.deepcopy(payload)))
         sequence = len(self._direct_attempt_records) + 1
+        started_ns = time.perf_counter_ns()
         try:
             response = self.upstream.complete(payload, stream=False)
-        except Exception:
+        except BaseException:
             self._direct_attempt_records.append(
                 model_boundary_record(
                     payload,
@@ -651,12 +730,9 @@ class CompatibilityClient:
                 )
             )
             raise
-        record = model_boundary_record(
-            payload,
-            sequence=sequence,
-            status_code=200,
-            response=response,
-        )
+        finally:
+            self._direct_attempt_wall_ns.append(time.perf_counter_ns() - started_ns)
+        record = model_boundary_record(payload, sequence=sequence, status_code=200, response=response)
         self._direct_attempt_records.append(record)
         if not isinstance(response, dict):
             raise PreflightFailure("preflight_response_malformed")

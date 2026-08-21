@@ -1731,6 +1731,7 @@ def test_provisional_client_timing_records_safe_matching_digests_and_terminal_ou
             observer_sequence_start=1,
             observer_sequence_end=1,
             observer_record_count=1,
+            direct_attempt_wall_ns=(),
             downstream_request_sha256=runner.downstream_request_sha256(direct_payload),
         ),
     )
@@ -1763,7 +1764,7 @@ def test_provisional_client_timing_records_success_failure_and_cancellation_in_i
                 raise outcome
             return outcome
 
-    clock = iter((10, 20, 30, 50, 60, 90))
+    clock = iter((10, 11, 12, 20, 30, 31, 32, 50, 60, 61, 62, 90))
     monkeypatch.setattr(runner.time, "perf_counter_ns", lambda: next(clock))
     ledger = runner.ProvisionalClientTimingLedger(cache_lane="cold")
     client = runner.CompatibilityClient(
@@ -1785,7 +1786,92 @@ def test_provisional_client_timing_records_success_failure_and_cancellation_in_i
         (2, "failed", 20),
         (3, "cancelled", 30),
     ]
-    assert all(record.observer_record_count == 0 for record in ledger.records)
+    assert [(record.observer_sequence_start, record.observer_record_count) for record in ledger.records] == [
+        (1, 1),
+        (2, 1),
+        (3, 1),
+    ]
+    assert [record.direct_attempt_wall_ns for record in ledger.records] == [(1,), (1,), (1,)]
+
+
+def test_provisional_direct_timing_uses_the_attempt_slice_for_a_two_phase_logical_call(monkeypatch):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    responses = iter(
+        [
+            {"content": "", "tool_calls": []},
+            {"content": '{"status":"passed"}', "tool_calls": []},
+        ]
+    )
+
+    class Direct:
+        def complete(self, _payload, *, stream=False):
+            assert stream is False
+            return next(responses)
+
+    clock = iter((100, 110, 120, 130, 140, 180))
+    monkeypatch.setattr(runner.time, "perf_counter_ns", lambda: next(clock))
+    ledger = runner.ProvisionalClientTimingLedger(cache_lane="warm-prefix")
+    client = runner.CompatibilityClient(
+        Direct(),
+        arm="direct",
+        scenario_order=[scenario.case_id],
+        proxy_policy=False,
+        provisional_timing=ledger,
+    )
+
+    client.complete(runner.request_payload(scenario, model="model", proxy_policy=False))
+
+    assert ledger.records[0].observer_sequence_start == 1
+    assert ledger.records[0].observer_sequence_end == 2
+    assert ledger.records[0].observer_record_count == 2
+    assert ledger.records[0].direct_attempt_wall_ns == (10, 10)
+
+
+def test_provisional_timing_writer_requires_a_private_existing_parent_and_safe_bounded_rows(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    private_parent = tmp_path / "private"
+    private_parent.mkdir(mode=0o700)
+    private_parent.chmod(0o700)
+    record = runner.ProvisionalClientTimingRecord(
+        pair_ordinal=1,
+        arm="direct",
+        cache_lane="cold",
+        client_wall_ns=1,
+        outcome="succeeded",
+        observer_sequence_start=None,
+        observer_sequence_end=None,
+        observer_record_count=0,
+        direct_attempt_wall_ns=(),
+        downstream_request_sha256="a" * 64,
+    )
+
+    with pytest.raises(runner.ProvisionalTimingLedgerFailure, match="provisional_request_ledger_parent_invalid"):
+        runner.write_provisional_client_timing_ledger(Path("relative-provisional.jsonl"), (record,))
+
+    public_parent = tmp_path / "public"
+    public_parent.mkdir(mode=0o755)
+    public_parent.chmod(0o755)
+    with pytest.raises(runner.ProvisionalTimingLedgerFailure, match="provisional_request_ledger_parent_invalid"):
+        runner.write_provisional_client_timing_ledger(public_parent / "provisional.jsonl", (record,))
+
+    with pytest.raises(runner.ProvisionalTimingLedgerFailure, match="provisional_request_ledger_invalid"):
+        runner.write_provisional_client_timing_ledger(
+            private_parent / "bool.jsonl", (record._replace(client_wall_ns=True),)
+        )
+
+    monkeypatch.setattr(runner, "_MAX_PROVISIONAL_TIMING_PAYLOAD_BYTES", 1)
+    with pytest.raises(runner.ProvisionalTimingLedgerFailure, match="provisional_request_ledger_invalid"):
+        runner.write_provisional_client_timing_ledger(private_parent / "oversized.jsonl", (record,))
+
+    monkeypatch.setattr(runner, "_MAX_PROVISIONAL_TIMING_PAYLOAD_BYTES", 1024 * 1024)
+    failure_path = private_parent / "os-failure.jsonl"
+    monkeypatch.setattr(runner, "_write_all", lambda *_args: (_ for _ in ()).throw(OSError(str(failure_path))))
+    with pytest.raises(
+        runner.ProvisionalTimingLedgerFailure, match="provisional_request_ledger_write_failed"
+    ) as raised:
+        runner.write_provisional_client_timing_ledger(failure_path, (record,))
+    assert str(failure_path) not in str(raised.value)
 
 
 def test_scored_direct_run_writes_actual_attempt_ledger_atomically(monkeypatch, tmp_path):
@@ -1859,6 +1945,7 @@ def test_scored_direct_run_writes_actual_attempt_ledger_atomically(monkeypatch, 
     provisional_rows = [json.loads(line) for line in provisional.read_text(encoding="utf-8").splitlines()]
     assert [row["pair_ordinal"] for row in provisional_rows] == [1, 2]
     assert all(row["outcome"] == "succeeded" for row in provisional_rows)
+    assert [len(row["direct_attempt_wall_ns"]) for row in provisional_rows] == [1, 1]
 
 
 def _cache_response(*, content="", tool_calls=None, bypass=False):
@@ -3000,6 +3087,7 @@ def test_scored_proxy_rows_use_actual_observer_fingerprints_and_failures_keep_sa
         (1, 1),
         (2, 1),
     ]
+    assert all(row["direct_attempt_wall_ns"] == [] for row in provisional_rows)
 
 
 def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_records(monkeypatch, tmp_path):
@@ -3087,6 +3175,7 @@ def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_re
 
     provisional_rows = [json.loads(line) for line in provisional_path.read_text(encoding="utf-8").splitlines()]
     assert all(row["observer_record_count"] == 0 for row in provisional_rows)
+    assert all(row["direct_attempt_wall_ns"] == [] for row in provisional_rows)
 
     rows = [json.loads(line) for line in output.read_text().splitlines()]
     assert [row["case_id"] for row in rows] == ["case-1", "case-2"]
