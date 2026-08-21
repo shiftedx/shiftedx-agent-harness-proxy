@@ -608,6 +608,7 @@ def verify_timing_ledger_linkage(
     observers = [dict(row) for row in observer_rows]
     if len(values) != len(accounting):
         raise TimingFailure("qualification_timing_ledger_invalid")
+    next_observer_sequence = 1
     for expected, (row, request) in enumerate(zip(values, accounting, strict=True), 1):
         if (
             request.get("sequence") != expected
@@ -619,28 +620,152 @@ def verify_timing_ledger_linkage(
         end = request.get("attempt_sequence_end")
         count = request.get("attempt_count")
         local_projection = request.get("local_projection")
-        if not _nonnegative(count) or not isinstance(local_projection, bool):
+        outcome = request.get("outcome")
+        phase_counts = request.get("phase_counts")
+        request_counts = {
+            key: request.get(key)
+            for key in (
+                "successful_attempt_count",
+                "retry_attempt_count",
+                "correction_count",
+                "blocked_duplicate_count",
+                "blocked_stall_count",
+                "avoided_immediate_upstream_calls",
+            )
+        }
+        if (
+            not _nonnegative(count)
+            or not isinstance(local_projection, bool)
+            or outcome not in _OUTCOMES
+            or not isinstance(phase_counts, Mapping)
+            or set(phase_counts) != {"acquisition", "finalization"}
+            or not all(_nonnegative(value) for value in phase_counts.values())
+            or not all(_nonnegative(value) for value in request_counts.values())
+            or int(request_counts["successful_attempt_count"]) > int(count)
+        ):
             raise TimingFailure("qualification_timing_ledger_invalid")
-        if local_projection or count == 0:
+        if local_projection:
+            if (
+                outcome != "succeeded"
+                or start is not None
+                or end is not None
+                or int(count) != 0
+                or int(request_counts["successful_attempt_count"]) != 0
+                or int(request_counts["retry_attempt_count"]) != 0
+                or int(request_counts["correction_count"]) != 0
+                or int(request_counts["blocked_duplicate_count"]) != 0
+                or int(request_counts["blocked_stall_count"]) != 0
+                or int(request_counts["avoided_immediate_upstream_calls"]) != 1
+                or any(int(value) for value in phase_counts.values())
+            ):
+                raise TimingFailure("qualification_timing_ledger_invalid")
             selected: list[dict[str, object]] = []
+        elif int(count) == 0:
             if start is not None or end is not None:
                 raise TimingFailure("qualification_timing_ledger_invalid")
+            if (
+                int(request_counts["successful_attempt_count"]) != 0
+                or int(request_counts["retry_attempt_count"]) != 0
+                or int(request_counts["avoided_immediate_upstream_calls"]) != 0
+                or any(int(value) for value in phase_counts.values())
+            ):
+                raise TimingFailure("qualification_timing_ledger_invalid")
+            selected = []
         else:
-            if not _positive(start) or not _positive(end) or int(end) < int(start):
+            if (
+                not _positive(start)
+                or not _positive(end)
+                or int(start) != next_observer_sequence
+                or int(end) < int(start)
+            ):
                 raise TimingFailure("qualification_timing_ledger_invalid")
             selected = observers[int(start) - 1 : int(end)]
             if len(selected) != int(count):
                 raise TimingFailure("qualification_timing_ledger_invalid")
+            next_observer_sequence = int(end) + 1
         attempts = row["attempts"]
         if (
             not isinstance(attempts, list)
             or len(attempts) != len(selected)
             or row["observer_slice_sha256"] != observer_slice_sha256(selected)
+            or row["outcome"] != outcome
+            or row["local_projection"] != local_projection
+            or any(
+                row[key] != request_counts[key]
+                for key in (
+                    "retry_attempt_count",
+                    "correction_count",
+                    "blocked_duplicate_count",
+                    "blocked_stall_count",
+                    "avoided_immediate_upstream_calls",
+                )
+            )
         ):
             raise TimingFailure("qualification_timing_ledger_invalid")
-        for attempt, observer in zip(attempts, selected, strict=True):
-            if not isinstance(attempt, Mapping) or attempt.get("observer_digest") != observer.get("digest"):
+        observed_phases = {"acquisition": 0, "finalization": 0, "terminal": 0}
+        successful_attempts = 0
+        observer_start = int(start) if selected else 1
+        for observer_sequence, (attempt, observer) in enumerate(
+            zip(attempts, selected, strict=True), start=observer_start
+        ):
+            if not isinstance(attempt, Mapping):
                 raise TimingFailure("qualification_timing_ledger_invalid")
+            phase = _observer_phase(observer.get("fields"))
+            status = _observer_status(observer.get("response"))
+            if (
+                observer.get("sequence") != observer_sequence
+                or attempt.get("observer_digest") != observer.get("digest")
+                or attempt.get("phase") != phase
+                or attempt.get("status") != status
+            ):
+                raise TimingFailure("qualification_timing_ledger_invalid")
+            observed_phases[phase] += 1
+            successful_attempts += int(status == "succeeded")
+        if (
+            row["phase_counts"] != observed_phases
+            or dict(phase_counts)
+            != {
+                "acquisition": observed_phases["acquisition"],
+                "finalization": observed_phases["finalization"],
+            }
+            or int(request_counts["successful_attempt_count"]) != successful_attempts
+            or row["intervention_class"]
+            != _intervention_precedence(
+                outcome=outcome,
+                local_projection=local_projection,
+                correction_count=int(request_counts["correction_count"]),
+                blocked_duplicate_count=int(request_counts["blocked_duplicate_count"]),
+                blocked_stall_count=int(request_counts["blocked_stall_count"]),
+                phase_counts=observed_phases,
+            )
+        ):
+            raise TimingFailure("qualification_timing_ledger_invalid")
+    if next_observer_sequence != len(observers) + 1:
+        raise TimingFailure("qualification_timing_ledger_invalid")
+
+
+def _intervention_precedence(
+    *,
+    outcome: object,
+    local_projection: bool,
+    correction_count: int,
+    blocked_duplicate_count: int,
+    blocked_stall_count: int,
+    phase_counts: Mapping[str, int],
+) -> str:
+    """Classify one linked request with the frozen public aggregation precedence."""
+
+    if local_projection:
+        return "projection"
+    if outcome != "succeeded":
+        return "bounded_failure"
+    if blocked_duplicate_count or blocked_stall_count:
+        return "blocked_call_recovery"
+    if correction_count:
+        return "correction"
+    if phase_counts["acquisition"] and phase_counts["finalization"]:
+        return "phase_split"
+    return "pass_through"
 
 
 def summarize_timing(path: Path, *, direct_timing_path: Path | None = None) -> dict[str, object]:
@@ -649,13 +774,28 @@ def summarize_timing(path: Path, *, direct_timing_path: Path | None = None) -> d
     rows = read_timing_ledger(path)
     direct_rows = read_timing_ledger(direct_timing_path) if direct_timing_path is not None else ()
     walls = [int(row["downstream_wall_ns"]) for row in rows]
-    threshold = _percentiles(walls)["p95_wall_ns"]
     buckets: dict[tuple[str, str], list[dict[str, object]]] = {}
+    lanes: dict[str, list[dict[str, object]]] = {}
     for row in rows:
         buckets.setdefault((str(row["intervention_class"]), str(row["cache_lane"])), []).append(row)
+        lanes.setdefault(str(row["cache_lane"]), []).append(row)
+    lane_thresholds = {
+        lane: _percentiles([int(row["downstream_wall_ns"]) for row in values])["p95_wall_ns"]
+        for lane, values in sorted(lanes.items())
+    }
+    lane_tail_totals = {
+        lane: sum(
+            int(row["downstream_wall_ns"]) for row in values if int(row["downstream_wall_ns"]) >= lane_thresholds[lane]
+        )
+        for lane, values in lanes.items()
+    }
     by_lane: dict[str, dict[str, dict[str, object]]] = {}
     for (intervention, lane), values in sorted(buckets.items()):
-        by_lane.setdefault(intervention, {})[lane] = _bucket(values, threshold)
+        by_lane.setdefault(intervention, {})[lane] = _bucket(
+            values,
+            lane_thresholds[lane],
+            lane_tail_totals[lane],
+        )
     attempts = [item for row in rows for item in _as_list(row["attempts"])]
     model_values = [
         int(item["model_time_ns"])
@@ -669,7 +809,7 @@ def summarize_timing(path: Path, *, direct_timing_path: Path | None = None) -> d
         "unexplained_ns": 0,
         "wall_ns": _percentiles(walls),
         "by_intervention_cache_lane": by_lane,
-        "tail_threshold_ns": threshold,
+        "tail_threshold_ns_by_cache_lane": lane_thresholds,
         "attempts": {
             "model_attempts": len(attempts),
             "model_attempts_avoided": sum(int(row["avoided_immediate_upstream_calls"]) for row in rows),
@@ -757,14 +897,20 @@ def _row_model_time(row: Mapping[str, object]) -> int | None:
     return sum(values) if values and len(values) == len(attempts) else None
 
 
-def _bucket(rows: Sequence[dict[str, object]], threshold: int) -> dict[str, object]:
+def _bucket(rows: Sequence[dict[str, object]], threshold: int, lane_tail_total_ns: int) -> dict[str, object]:
     walls = [int(row["downstream_wall_ns"]) for row in rows]
     tail = [wall for wall in walls if wall >= threshold]
+    tail_total_ns = sum(tail)
     return {
         "count": len(walls),
         **_percentiles(walls),
+        "tail_threshold_ns": threshold,
         "tail_record_count": len(tail),
-        "tail_wall_ns": sum(tail),
+        "tail_total_ns": tail_total_ns,
+        # Retain the old name as an exact alias for consumers that already
+        # stored it; the lane-local threshold above is the authoritative one.
+        "tail_wall_ns": tail_total_ns,
+        "tail_share_ppm": (tail_total_ns * 1_000_000) // lane_tail_total_ns if lane_tail_total_ns else 0,
         "tail_excess_ns": sum(max(wall - threshold, 0) for wall in walls),
     }
 

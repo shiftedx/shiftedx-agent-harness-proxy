@@ -83,6 +83,7 @@ def _request(
     blocked_stall_count: int = 0,
     retry_attempt_count: int = 0,
     other_measured_ns: int = 1,
+    cache_lane: str = "cold",
 ) -> dict[str, object]:
     selected = attempts if attempts is not None else [_attempt(request_sequence=sequence)]
     phase_counts = {"acquisition": 0, "finalization": 0, "terminal": 0}
@@ -99,7 +100,7 @@ def _request(
         "observer_slice_sha256": "b" * 64,
         "outcome": outcome,
         "intervention_class": intervention,
-        "cache_lane": "cold",
+        "cache_lane": cache_lane,
         "downstream_wall_ns": wall,
         "admission_wait_ns": 1,
         "body_read_ns": 2,
@@ -149,9 +150,9 @@ def _capture(*, attempts: list[dict[str, object]] | None = None, **overrides: ob
     return row
 
 
-def _capture_attempt(*, phase: str = "acquisition", wall_ns: int = 30) -> dict[str, object]:
+def _capture_attempt(*, sequence: int = 1, phase: str = "acquisition", wall_ns: int = 30) -> dict[str, object]:
     return {
-        "sequence": 1,
+        "sequence": sequence,
         "phase": phase,
         "status": "succeeded",
         "wall_ns": wall_ns,
@@ -272,6 +273,13 @@ def test_exact_hash_linkage_binds_existing_accounting_row_and_ordered_observer_s
         "attempt_sequence_start": 1,
         "attempt_sequence_end": 1,
         "attempt_count": 1,
+        "successful_attempt_count": 1,
+        "phase_counts": {"acquisition": 1, "finalization": 0},
+        "retry_attempt_count": 0,
+        "correction_count": 0,
+        "blocked_duplicate_count": 0,
+        "blocked_stall_count": 0,
+        "avoided_immediate_upstream_calls": 0,
     }
     observer = _observer()
     capture = _capture(attempts=[_capture_attempt()])
@@ -292,6 +300,209 @@ def test_exact_hash_linkage_binds_existing_accounting_row_and_ordered_observer_s
     verify_timing_ledger_linkage([row], [accounting], [observer])
     with pytest.raises(TimingFailure):
         verify_timing_ledger_linkage([row], [accounting], [{**observer, "digest": "f" * 64}])
+
+
+def test_exact_hash_linkage_rejects_semantically_drifted_accounting_and_observer_partitions() -> None:
+    from shiftedx_harness_proxy.qualification_timing import verify_timing_ledger_linkage
+
+    accounting = {
+        "sequence": 1,
+        "outcome": "succeeded",
+        "local_projection": False,
+        "attempt_sequence_start": 1,
+        "attempt_sequence_end": 1,
+        "attempt_count": 1,
+        "successful_attempt_count": 1,
+        "phase_counts": {"acquisition": 1, "finalization": 0},
+        "retry_attempt_count": 0,
+        "correction_count": 0,
+        "blocked_duplicate_count": 0,
+        "blocked_stall_count": 0,
+        "avoided_immediate_upstream_calls": 0,
+    }
+    observer = _observer()
+    row = bind_capture_row(
+        _capture(attempts=[_capture_attempt()]),
+        sequence=1,
+        pair_ordinal=1,
+        arm="proxy",
+        request_accounting_row=accounting,
+        observer_rows=[observer],
+        cache_lane="cold",
+        intervention_class="pass_through",
+    )
+
+    def mutated(**changes: object) -> dict[str, object]:
+        value = json.loads(json.dumps(row))
+        value.update(changes)
+        return value
+
+    mutations = [
+        mutated(outcome="failed"),
+        mutated(correction_count=1),
+        mutated(blocked_duplicate_count=1),
+        mutated(blocked_stall_count=1),
+        mutated(retry_attempt_count=1),
+        mutated(intervention_class="correction"),
+    ]
+    phase_drift = mutated(phase_counts={"acquisition": 0, "finalization": 1, "terminal": 0})
+    phase_drift["attempts"][0]["phase"] = "finalization"  # type: ignore[index]
+    mutations.append(phase_drift)
+    status_drift = mutated()
+    status_drift["attempts"][0]["status"] = "failed"  # type: ignore[index]
+    mutations.append(status_drift)
+
+    for value in mutations:
+        with pytest.raises(TimingFailure, match="^qualification_timing_ledger_invalid$"):
+            verify_timing_ledger_linkage([value], [accounting], [observer])
+
+    projection_accounting = {
+        **accounting,
+        "attempt_sequence_start": None,
+        "attempt_sequence_end": None,
+        "attempt_count": 0,
+        "successful_attempt_count": 0,
+        "phase_counts": {"acquisition": 0, "finalization": 0},
+        "local_projection": True,
+        "avoided_immediate_upstream_calls": 1,
+    }
+    projection = bind_capture_row(
+        _capture(attempts=[], local_projection=True, avoided_immediate_upstream_calls=1),
+        sequence=1,
+        pair_ordinal=1,
+        arm="proxy",
+        request_accounting_row=projection_accounting,
+        observer_rows=[],
+        cache_lane="cold",
+        intervention_class="projection",
+    )
+    projection["local_projection"] = False
+    projection["avoided_immediate_upstream_calls"] = 0
+    projection["intervention_class"] = "pass_through"
+    with pytest.raises(TimingFailure, match="^qualification_timing_ledger_invalid$"):
+        verify_timing_ledger_linkage([projection], [projection_accounting], [])
+
+
+@pytest.mark.parametrize(
+    ("accounting", "capture", "intervention"),
+    [
+        (
+            {
+                "sequence": 1,
+                "outcome": "succeeded",
+                "local_projection": True,
+                "attempt_sequence_start": None,
+                "attempt_sequence_end": None,
+                "attempt_count": 1,
+                "successful_attempt_count": 0,
+                "phase_counts": {"acquisition": 0, "finalization": 0},
+                "retry_attempt_count": 0,
+                "correction_count": 0,
+                "blocked_duplicate_count": 0,
+                "blocked_stall_count": 0,
+                "avoided_immediate_upstream_calls": 1,
+            },
+            _capture(attempts=[], local_projection=True, avoided_immediate_upstream_calls=1),
+            "projection",
+        ),
+        (
+            {
+                "sequence": 1,
+                "outcome": "succeeded",
+                "local_projection": False,
+                "attempt_sequence_start": None,
+                "attempt_sequence_end": None,
+                "attempt_count": 0,
+                "successful_attempt_count": 0,
+                "phase_counts": {"acquisition": 0, "finalization": 0},
+                "retry_attempt_count": 1,
+                "correction_count": 0,
+                "blocked_duplicate_count": 0,
+                "blocked_stall_count": 0,
+                "avoided_immediate_upstream_calls": 0,
+            },
+            _capture(attempts=[], retry_attempt_count=1),
+            "pass_through",
+        ),
+    ],
+)
+def test_exact_hash_linkage_rejects_rehashed_incoherent_accounting_partitions(
+    accounting: dict[str, object], capture: dict[str, object], intervention: str
+) -> None:
+    from shiftedx_harness_proxy.qualification_timing import verify_timing_ledger_linkage
+
+    row = bind_capture_row(
+        capture,
+        sequence=1,
+        pair_ordinal=1,
+        arm="proxy",
+        request_accounting_row=accounting,
+        observer_rows=[],
+        cache_lane="cold",
+        intervention_class=intervention,
+    )
+
+    with pytest.raises(TimingFailure, match="^qualification_timing_ledger_invalid$"):
+        verify_timing_ledger_linkage([row], [accounting], [])
+
+
+def test_exact_hash_linkage_freezes_intervention_precedence() -> None:
+    from shiftedx_harness_proxy.qualification_timing import verify_timing_ledger_linkage
+
+    cases = [
+        ("projection", "succeeded", True, 0, 0, 0, []),
+        ("bounded_failure", "failed", False, 1, 1, 1, [("acquisition", 500)]),
+        ("blocked_call_recovery", "succeeded", False, 1, 1, 0, [("acquisition", 200)]),
+        ("correction", "succeeded", False, 1, 0, 0, [("acquisition", 200), ("finalization", 200)]),
+        ("phase_split", "succeeded", False, 0, 0, 0, [("acquisition", 200), ("finalization", 200)]),
+        ("pass_through", "succeeded", False, 0, 0, 0, [("acquisition", 200)]),
+    ]
+    for expected, outcome, local_projection, corrections, blocked_duplicates, blocked_stalls, details in cases:
+        observers = [_observer(index, phase=phase, status=status) for index, (phase, status) in enumerate(details, 1)]
+        attempts = [_capture_attempt(sequence=index, phase=phase) for index, (phase, _status) in enumerate(details, 1)]
+        phase_counts = {
+            "acquisition": sum(phase == "acquisition" for phase, _status in details),
+            "finalization": sum(phase == "finalization" for phase, _status in details),
+        }
+        accounting = {
+            "sequence": 1,
+            "outcome": outcome,
+            "local_projection": local_projection,
+            "attempt_sequence_start": 1 if details else None,
+            "attempt_sequence_end": len(details) if details else None,
+            "attempt_count": len(details),
+            "successful_attempt_count": sum(200 <= status < 300 for _phase, status in details),
+            "phase_counts": phase_counts,
+            "retry_attempt_count": len(details) - sum(count > 0 for count in phase_counts.values()),
+            "correction_count": corrections,
+            "blocked_duplicate_count": blocked_duplicates,
+            "blocked_stall_count": blocked_stalls,
+            "avoided_immediate_upstream_calls": int(local_projection),
+        }
+        row = bind_capture_row(
+            _capture(
+                attempts=attempts,
+                outcome=outcome,
+                local_projection=local_projection,
+                avoided_immediate_upstream_calls=int(local_projection),
+                correction_count=corrections,
+                blocked_duplicate_count=blocked_duplicates,
+                blocked_stall_count=blocked_stalls,
+                retry_attempt_count=accounting["retry_attempt_count"],
+            ),
+            sequence=1,
+            pair_ordinal=1,
+            arm="proxy",
+            request_accounting_row=accounting,
+            observer_rows=observers,
+            cache_lane="cold",
+            intervention_class=expected,
+        )
+        verify_timing_ledger_linkage([row], [accounting], observers)
+        drift = json.loads(json.dumps(row))
+        drift["intervention_class"] = "correction" if expected == "pass_through" else "pass_through"
+        with pytest.raises(TimingFailure, match="^qualification_timing_ledger_invalid$"):
+            verify_timing_ledger_linkage([drift], [accounting], observers)
 
 
 def test_public_summary_matches_private_direct_proxy_pass_through_by_safe_ordinal(tmp_path: Path) -> None:
@@ -331,6 +542,55 @@ def test_summary_uses_floor_percentiles_and_allowlisted_aggregate_fields(tmp_pat
     serialized = json.dumps(summary)
     for forbidden in ("sequence", "pair_ordinal", "observer_digest", "sha256", "endpoint", "prompt"):
         assert forbidden not in serialized
+
+
+def test_summary_attributes_tails_with_each_cache_lanes_own_frozen_p95(tmp_path: Path) -> None:
+    from shiftedx_harness_proxy.qualification_timing import summarize_timing
+
+    rows = [
+        _request(sequence=1, pair_ordinal=1, other_measured_ns=1),
+        _request(sequence=2, pair_ordinal=2, other_measured_ns=60, intervention="correction", correction_count=1),
+        _request(sequence=3, pair_ordinal=3, other_measured_ns=9960, intervention="correction", correction_count=1),
+        _request(sequence=4, pair_ordinal=4, other_measured_ns=1, cache_lane="warm-prefix"),
+        _request(
+            sequence=5,
+            pair_ordinal=5,
+            other_measured_ns=2,
+            cache_lane="warm-prefix",
+            intervention="correction",
+            correction_count=1,
+        ),
+        _request(
+            sequence=6,
+            pair_ordinal=6,
+            other_measured_ns=10,
+            cache_lane="warm-prefix",
+            intervention="correction",
+            correction_count=1,
+        ),
+        _request(
+            sequence=7,
+            pair_ordinal=7,
+            other_measured_ns=960,
+            cache_lane="warm-prefix",
+            intervention="blocked_call_recovery",
+            blocked_duplicate_count=1,
+        ),
+    ]
+    ledger = tmp_path / "two-lane.jsonl"
+    write_timing_ledger(ledger, rows)
+
+    summary = summarize_timing(ledger)
+
+    assert summary["tail_threshold_ns_by_cache_lane"] == {"cold": 100, "warm-prefix": 50}
+    correction = summary["by_intervention_cache_lane"]["correction"]["warm-prefix"]
+    blocked = summary["by_intervention_cache_lane"]["blocked_call_recovery"]["warm-prefix"]
+    assert correction["tail_record_count"] == 1
+    assert correction["tail_total_ns"] == 50
+    assert correction["tail_share_ppm"] == 47_619
+    assert blocked["tail_record_count"] == 1
+    assert blocked["tail_total_ns"] == 1_000
+    assert blocked["tail_share_ppm"] == 952_380
 
 
 def test_private_writers_reject_duplicate_keys_no_clobber_and_partial_writes(tmp_path: Path, monkeypatch) -> None:
