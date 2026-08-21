@@ -25,6 +25,7 @@ from .provider_capabilities import (
     requires_phase_split,
     upstream_phase,
 )
+from .qualification_timing import current_request_timing
 from .transcript import (
     PolicyAnnotationError,
     Reconstruction,
@@ -190,9 +191,16 @@ class ChatService:
         except ValueError as exc:
             raise ProxyError(400, "invalid_messages", str(exc)) from exc
         harness = rebuilt.harness
+        _snapshot_timing(harness, retry_attempt_count=0)
 
         projection = _project_latest_if_current(forwarded["messages"], rebuilt)
         if projection is not None:
+            _snapshot_timing(
+                harness,
+                retry_attempt_count=0,
+                local_projection=True,
+                avoided_immediate_upstream_calls=1,
+            )
             body = _projected_response(str(forwarded.get("model", "")), projection)
             return ChatResult(
                 body,
@@ -239,8 +247,10 @@ class ChatService:
                             ),
                         }
                     )
+                    _snapshot_timing(harness, retry_attempt_count=internal_retries)
                     continue
                 rejected = _rejected_results(calls, harness)
+                _snapshot_timing(harness, retry_attempt_count=internal_retries)
                 if not rejected:
                     return ChatResult(
                         _without_reserved_projection_marker(response),
@@ -269,6 +279,7 @@ class ChatService:
                     )
                     working_messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
                 working_messages.append({"role": "user", "content": harness.render()})
+                _snapshot_timing(harness, retry_attempt_count=internal_retries)
                 continue
 
             content = message.get("content")
@@ -306,6 +317,7 @@ class ChatService:
             internal_retries += 1
             working_messages.append({"role": "assistant", "content": content})
             working_messages.append({"role": "user", "content": harness.correction(issue)})
+            _snapshot_timing(harness, retry_attempt_count=internal_retries)
 
         raise ProxyError(
             502,
@@ -342,6 +354,7 @@ class ChatService:
                 if retries >= self.settings.max_internal_retries:
                     break
                 retries += 1
+                _snapshot_phase_split_timing(retries)
                 continue
             if phase == "acquisition":
                 phase = "finalization"
@@ -351,6 +364,7 @@ class ChatService:
             if retries >= self.settings.max_internal_retries:
                 break
             retries += 1
+            _snapshot_phase_split_timing(retries)
         raise ProxyError(
             502,
             "harness_retry_exhausted",
@@ -363,6 +377,42 @@ def _tool_name(tool: JsonObject) -> str:
     if not isinstance(function, dict) or not isinstance(function.get("name"), str):
         raise ProxyError(400, "invalid_tools", "Every tool must contain function.name.")
     return str(function["name"])
+
+
+def _snapshot_timing(
+    harness: AgentHarness,
+    *,
+    retry_attempt_count: int,
+    local_projection: bool = False,
+    avoided_immediate_upstream_calls: int = 0,
+) -> None:
+    """Preserve policy mutations even when a later upstream turn fails."""
+
+    timing = current_request_timing()
+    if timing is not None:
+        timing.record_interventions(
+            correction_count=harness.terminal_corrections,
+            blocked_duplicate_count=harness.blocked_duplicates,
+            blocked_stall_count=harness.blocked_stalls,
+            retry_attempt_count=retry_attempt_count,
+            local_projection=local_projection,
+            avoided_immediate_upstream_calls=avoided_immediate_upstream_calls,
+        )
+
+
+def _snapshot_phase_split_timing(retry_attempt_count: int) -> None:
+    """Retain phase-split retry state even though harness policy is off."""
+
+    timing = current_request_timing()
+    if timing is not None:
+        timing.record_interventions(
+            correction_count=0,
+            blocked_duplicate_count=0,
+            blocked_stall_count=0,
+            retry_attempt_count=retry_attempt_count,
+            local_projection=False,
+            avoided_immediate_upstream_calls=0,
+        )
 
 
 def _off_result(

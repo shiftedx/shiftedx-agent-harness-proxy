@@ -64,6 +64,25 @@ class SlowModelsUpstream(SlowUpstream):
         return {"object": "list", "data": []}
 
 
+class ProbeUpstream:
+    async def chat(self, payload: dict[str, Any], request_headers: dict[str, str]) -> dict[str, Any]:
+        del payload, request_headers
+        return {"id": "chatcmpl", "choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    async def models(self, request_headers: dict[str, str]) -> dict[str, Any]:
+        del request_headers
+        return {"object": "list", "data": []}
+
+    async def combined_tool_terminal_schema_supported(self) -> bool:
+        return True
+
+    async def ready(self) -> bool:
+        return True
+
+    async def close(self) -> None:
+        return None
+
+
 def settings(**overrides: Any) -> Settings:
     values: dict[str, Any] = {
         "upstream_base_url": "http://upstream/v1",
@@ -149,6 +168,17 @@ async def test_upstream_operation_overload_has_a_bounded_retry_hint() -> None:
     assert raised.value.code == "upstream_concurrency_limited"
     assert raised.value.status_code == 503
     assert raised.value.headers == {"Retry-After": "1"}
+
+
+@pytest.mark.asyncio
+async def test_only_chat_consumes_an_upstream_attempt_slot() -> None:
+    controller = AdmissionController(settings(concurrency_limit=1))
+    upstream = BoundedUpstream(ProbeUpstream(), controller)
+
+    async with controller.upstream_slot():
+        assert await upstream.models({}) == {"object": "list", "data": []}
+        assert await upstream.combined_tool_terminal_schema_supported() is True
+        assert await upstream.ready() is True
 
 
 @pytest.mark.asyncio

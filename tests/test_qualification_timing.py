@@ -9,11 +9,15 @@ from pathlib import Path
 import pytest
 
 from shiftedx_harness_proxy.qualification_timing import (
+    PrivateTimingSink,
+    RequestTiming,
     TimingFailure,
     bind_capture_row,
     canonical_json,
     observer_slice_sha256,
+    read_timing_capture_ledger,
     request_accounting_row_sha256,
+    reserve_timing_capture_ledger,
     unavailable,
     unavailable_transport,
     write_timing_ledger,
@@ -165,6 +169,35 @@ def _capture_attempt(*, sequence: int = 1, phase: str = "acquisition", wall_ns: 
         "decode_ns": None,
         "decode_availability": _availability("model_boundary_unavailable"),
     }
+
+
+def test_attempt_end_is_frozen_before_later_attempts_begin(monkeypatch) -> None:
+    from shiftedx_harness_proxy import qualification_timing as timing
+
+    ticks = iter((100, 110, 120, 900))
+    monkeypatch.setattr(timing.time, "perf_counter_ns", lambda: next(ticks))
+    request = RequestTiming()
+    first = request.begin_attempt("acquisition", 0)
+    first.finish("succeeded")
+    second = request.begin_attempt("finalization", 0)
+
+    assert first.ended_ns == 110
+    assert first.finalize()["wall_ns"] == 10
+    assert second.started_ns == 120
+
+
+def test_private_timing_sink_writes_ingress_order_after_out_of_order_completion(tmp_path: Path) -> None:
+    path = tmp_path / "captures.jsonl"
+    reserve_timing_capture_ledger(path)
+    sink = PrivateTimingSink(path)
+    first = sink.allocate_sequence()
+    second = sink.allocate_sequence()
+
+    sink.append(_capture(), sequence=second)
+    assert read_timing_capture_ledger(path) == ()
+    sink.append(_capture(), sequence=first)
+
+    assert [row["sequence"] for row in read_timing_capture_ledger(path)] == [1, 2]
 
 
 def test_timing_ledger_rejects_legacy_millisecond_schema_fail_closed(tmp_path: Path) -> None:

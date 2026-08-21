@@ -102,7 +102,7 @@ def create_observer_app(config: QualificationObserverConfig) -> FastAPI:
                 json=payload,
                 headers=_forwarded_headers(request),
             )
-        except Exception:
+        except BaseException:
             _append_observation(state, payload, status_code=None, response_payload=None)
             raise
         try:

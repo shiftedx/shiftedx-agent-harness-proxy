@@ -7,6 +7,11 @@ from pydantic import SecretStr
 
 from shiftedx_harness_proxy.api import create_app
 from shiftedx_harness_proxy.config import Settings
+from shiftedx_harness_proxy.qualification_timing import (
+    PrivateTimingSink,
+    read_timing_capture_ledger,
+    reserve_timing_capture_ledger,
+)
 from shiftedx_harness_proxy.transport import HttpxUpstream
 
 
@@ -91,6 +96,35 @@ class ObjectFinalizationUpstream(EchoUpstream):
         self.requests.append(payload)
         content: Any = "acquisition terminal" if "tools" in payload else {"status": "done"}
         return {"id": "chatcmpl", "choices": [{"message": {"role": "assistant", "content": content}}]}
+
+
+@pytest.mark.asyncio
+async def test_injected_private_timing_sink_captures_chat_lifecycle_without_public_surface(tmp_path) -> None:
+    ledger = tmp_path / "timing-captures.jsonl"
+    reserve_timing_capture_ledger(ledger)
+    app = create_app(
+        Settings(upstream_base_url="http://upstream/v1"),
+        EchoUpstream(),
+        timing_sink=PrivateTimingSink(ledger),
+    )
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={"model": "model", "messages": [{"role": "user", "content": "hello"}]},
+            )
+
+    assert response.status_code == 200
+    assert not [name for name in response.headers if "timing" in name.lower()]
+    captures = read_timing_capture_ledger(ledger)
+    assert len(captures) == 1
+    capture = captures[0]
+    assert capture["outcome"] == "succeeded"
+    assert capture["body_read_ns"] > 0
+    assert capture["admission_wait_ns"] >= 0
+    assert capture["response_finalize_ns"] >= 0
+    assert len(capture["attempts"]) == 1
 
 
 @pytest.mark.asyncio

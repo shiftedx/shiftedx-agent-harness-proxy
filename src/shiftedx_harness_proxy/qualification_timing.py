@@ -33,7 +33,7 @@ import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeGuard
 
 _MAX_BYTES = 1024 * 1024
 _MAX_ROWS = 10_000
@@ -285,15 +285,26 @@ class _CapturedAttempt:
     started_ns: int
     status: str = "failed"
     transport: dict[str, object] | None = None
+    ended_ns: int | None = None
+
+    def finish(self, status: str) -> None:
+        """Freeze the attempt at its own terminal boundary exactly once."""
+
+        if self.ended_ns is None:
+            self.ended_ns = time.perf_counter_ns()
+            self.status = status if status in _OUTCOMES else "failed"
 
     def finalize(self) -> dict[str, object]:
-        total = time.perf_counter_ns() - self.started_ns
+        if self.ended_ns is None:
+            self.finish(self.status)
+        assert self.ended_ns is not None
+        total = self.ended_ns - self.started_ns
         transport = self.transport or unavailable_transport(total)
         return {
             "sequence": self.sequence,
             "phase": self.phase,
             "status": self.status,
-            "wall_ns": self.upstream_slot_wait_ns + int(transport["total_ns"]),
+            "wall_ns": self.upstream_slot_wait_ns + _integer(transport["total_ns"]),
             "upstream_slot_wait_ns": self.upstream_slot_wait_ns,
             "transport": transport,
             "ttft_ns": None,
@@ -322,6 +333,8 @@ class RequestTiming:
     phase_counts: dict[str, int] = field(default_factory=lambda: {name: 0 for name in _PHASES})
     local_projection: bool = False
     avoided_immediate_upstream_calls: int = 0
+    outcome: Literal["succeeded", "failed", "cancelled", "deadline"] | None = None
+    response_finalize_started_ns: int | None = None
 
     def record_admission_wait(self, duration_ns: int) -> None:
         self.admission_wait_ns += _require_nonnegative(duration_ns)
@@ -334,6 +347,19 @@ class RequestTiming:
 
     def record_response_finalize(self, duration_ns: int) -> None:
         self.response_finalize_ns += _require_nonnegative(duration_ns)
+
+    def begin_response_finalize(self) -> None:
+        if self.response_finalize_started_ns is None:
+            self.response_finalize_started_ns = time.perf_counter_ns()
+
+    def finish_response_finalize(self) -> None:
+        if self.response_finalize_started_ns is not None:
+            self.record_response_finalize(time.perf_counter_ns() - self.response_finalize_started_ns)
+            self.response_finalize_started_ns = None
+
+    def classify(self, outcome: Literal["succeeded", "failed", "cancelled", "deadline"]) -> None:
+        if self.outcome is None:
+            self.outcome = outcome
 
     def record_interventions(
         self,
@@ -375,9 +401,14 @@ class RequestTiming:
         self.phase_counts[normalized] += 1
         return attempt
 
-    def capture(self, outcome: Literal["succeeded", "failed", "cancelled", "deadline"]) -> dict[str, object]:
+    def capture(
+        self, outcome: Literal["succeeded", "failed", "cancelled", "deadline"] | None = None
+    ) -> dict[str, object]:
+        selected_outcome = outcome or self.outcome or "failed"
+        self.classify(selected_outcome)
+        self.finish_response_finalize()
         attempts = [attempt.finalize() for attempt in self.attempts]
-        attempt_wall = sum(int(item["wall_ns"]) for item in attempts)
+        attempt_wall = sum(_integer(item["wall_ns"]) for item in attempts)
         policy_exclusive = self.service_wall_ns - attempt_wall
         if policy_exclusive < 0:
             raise TimingFailure("qualification_timing_unexplained_delta")
@@ -389,7 +420,7 @@ class RequestTiming:
             "schema_version": "2.0",
             "record_type": "qualification_timing_capture",
             "sequence": 0,
-            "outcome": outcome,
+            "outcome": selected_outcome,
             "downstream_wall_ns": wall,
             "admission_wait_ns": self.admission_wait_ns,
             "body_read_ns": self.body_read_ns,
@@ -439,7 +470,7 @@ def begin_upstream_attempt(phase: str | None, upstream_slot_wait_ns: int) -> tup
 def end_upstream_attempt(token: Any, *, status: str) -> None:
     attempt = _CURRENT_ATTEMPT.get()
     if attempt is not None:
-        attempt.status = status if status in _OUTCOMES else "failed"
+        attempt.finish(status)
     if token is not None:
         _CURRENT_ATTEMPT.reset(token)
 
@@ -465,15 +496,33 @@ class PrivateTimingSink:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._lock = threading.Lock()
-        self._next_sequence = len(read_timing_capture_ledger(path)) + 1
+        next_sequence = len(read_timing_capture_ledger(path)) + 1
+        self._next_ingress_sequence = next_sequence
+        self._next_write_sequence = next_sequence
+        self._pending: dict[int, dict[str, object]] = {}
 
-    def append(self, capture: Mapping[str, object]) -> None:
+    def allocate_sequence(self) -> int:
+        """Reserve a durable request ordering at downstream ingress."""
+
+        with self._lock:
+            sequence = self._next_ingress_sequence
+            self._next_ingress_sequence += 1
+            return sequence
+
+    def append(self, capture: Mapping[str, object], *, sequence: int) -> None:
         row = dict(capture)
         with self._lock:
-            row["sequence"] = self._next_sequence
+            if not _positive(sequence) or sequence >= self._next_ingress_sequence or sequence in self._pending:
+                raise TimingFailure("qualification_timing_ledger_invalid")
+            row["sequence"] = sequence
             _validate_capture_row(row)
-            _append_private(self.path, canonical_json(row) + b"\n")
-            self._next_sequence += 1
+            self._pending[sequence] = row
+            pending: list[dict[str, object]] = []
+            while self._next_write_sequence in self._pending:
+                pending.append(self._pending.pop(self._next_write_sequence))
+                self._next_write_sequence += 1
+            if pending:
+                _append_private(self.path, b"".join(canonical_json(value) + b"\n" for value in pending))
 
 
 def reserve_timing_capture_ledger(path: Path) -> None:
@@ -641,7 +690,7 @@ def verify_timing_ledger_linkage(
             or set(phase_counts) != {"acquisition", "finalization"}
             or not all(_nonnegative(value) for value in phase_counts.values())
             or not all(_nonnegative(value) for value in request_counts.values())
-            or int(request_counts["successful_attempt_count"]) > int(count)
+            or _integer(request_counts["successful_attempt_count"]) > _integer(count)
         ):
             raise TimingFailure("qualification_timing_ledger_invalid")
         if local_projection:
@@ -649,25 +698,25 @@ def verify_timing_ledger_linkage(
                 outcome != "succeeded"
                 or start is not None
                 or end is not None
-                or int(count) != 0
-                or int(request_counts["successful_attempt_count"]) != 0
-                or int(request_counts["retry_attempt_count"]) != 0
-                or int(request_counts["correction_count"]) != 0
-                or int(request_counts["blocked_duplicate_count"]) != 0
-                or int(request_counts["blocked_stall_count"]) != 0
-                or int(request_counts["avoided_immediate_upstream_calls"]) != 1
-                or any(int(value) for value in phase_counts.values())
+                or _integer(count) != 0
+                or _integer(request_counts["successful_attempt_count"]) != 0
+                or _integer(request_counts["retry_attempt_count"]) != 0
+                or _integer(request_counts["correction_count"]) != 0
+                or _integer(request_counts["blocked_duplicate_count"]) != 0
+                or _integer(request_counts["blocked_stall_count"]) != 0
+                or _integer(request_counts["avoided_immediate_upstream_calls"]) != 1
+                or any(_integer(value) for value in phase_counts.values())
             ):
                 raise TimingFailure("qualification_timing_ledger_invalid")
             selected: list[dict[str, object]] = []
-        elif int(count) == 0:
+        elif _integer(count) == 0:
             if start is not None or end is not None:
                 raise TimingFailure("qualification_timing_ledger_invalid")
             if (
-                int(request_counts["successful_attempt_count"]) != 0
-                or int(request_counts["retry_attempt_count"]) != 0
-                or int(request_counts["avoided_immediate_upstream_calls"]) != 0
-                or any(int(value) for value in phase_counts.values())
+                _integer(request_counts["successful_attempt_count"]) != 0
+                or _integer(request_counts["retry_attempt_count"]) != 0
+                or _integer(request_counts["avoided_immediate_upstream_calls"]) != 0
+                or any(_integer(value) for value in phase_counts.values())
             ):
                 raise TimingFailure("qualification_timing_ledger_invalid")
             selected = []
@@ -675,14 +724,14 @@ def verify_timing_ledger_linkage(
             if (
                 not _positive(start)
                 or not _positive(end)
-                or int(start) != next_observer_sequence
-                or int(end) < int(start)
+                or _integer(start) != next_observer_sequence
+                or _integer(end) < _integer(start)
             ):
                 raise TimingFailure("qualification_timing_ledger_invalid")
-            selected = observers[int(start) - 1 : int(end)]
-            if len(selected) != int(count):
+            selected = observers[_integer(start) - 1 : _integer(end)]
+            if len(selected) != _integer(count):
                 raise TimingFailure("qualification_timing_ledger_invalid")
-            next_observer_sequence = int(end) + 1
+            next_observer_sequence = _integer(end) + 1
         attempts = row["attempts"]
         if (
             not isinstance(attempts, list)
@@ -704,7 +753,7 @@ def verify_timing_ledger_linkage(
             raise TimingFailure("qualification_timing_ledger_invalid")
         observed_phases = {"acquisition": 0, "finalization": 0, "terminal": 0}
         successful_attempts = 0
-        observer_start = int(start) if selected else 1
+        observer_start = _integer(start) if selected else 1
         for observer_sequence, (attempt, observer) in enumerate(
             zip(attempts, selected, strict=True), start=observer_start
         ):
@@ -728,14 +777,14 @@ def verify_timing_ledger_linkage(
                 "acquisition": observed_phases["acquisition"],
                 "finalization": observed_phases["finalization"],
             }
-            or int(request_counts["successful_attempt_count"]) != successful_attempts
+            or _integer(request_counts["successful_attempt_count"]) != successful_attempts
             or row["intervention_class"]
             != _intervention_precedence(
                 outcome=outcome,
                 local_projection=local_projection,
-                correction_count=int(request_counts["correction_count"]),
-                blocked_duplicate_count=int(request_counts["blocked_duplicate_count"]),
-                blocked_stall_count=int(request_counts["blocked_stall_count"]),
+                correction_count=_integer(request_counts["correction_count"]),
+                blocked_duplicate_count=_integer(request_counts["blocked_duplicate_count"]),
+                blocked_stall_count=_integer(request_counts["blocked_stall_count"]),
                 phase_counts=observed_phases,
             )
         ):
@@ -773,19 +822,21 @@ def summarize_timing(path: Path, *, direct_timing_path: Path | None = None) -> d
 
     rows = read_timing_ledger(path)
     direct_rows = read_timing_ledger(direct_timing_path) if direct_timing_path is not None else ()
-    walls = [int(row["downstream_wall_ns"]) for row in rows]
+    walls = [_integer(row["downstream_wall_ns"]) for row in rows]
     buckets: dict[tuple[str, str], list[dict[str, object]]] = {}
     lanes: dict[str, list[dict[str, object]]] = {}
     for row in rows:
         buckets.setdefault((str(row["intervention_class"]), str(row["cache_lane"])), []).append(row)
         lanes.setdefault(str(row["cache_lane"]), []).append(row)
     lane_thresholds = {
-        lane: _percentiles([int(row["downstream_wall_ns"]) for row in values])["p95_wall_ns"]
+        lane: _percentiles([_integer(row["downstream_wall_ns"]) for row in values])["p95_wall_ns"]
         for lane, values in sorted(lanes.items())
     }
     lane_tail_totals = {
         lane: sum(
-            int(row["downstream_wall_ns"]) for row in values if int(row["downstream_wall_ns"]) >= lane_thresholds[lane]
+            _integer(row["downstream_wall_ns"])
+            for row in values
+            if _integer(row["downstream_wall_ns"]) >= lane_thresholds[lane]
         )
         for lane, values in lanes.items()
     }
@@ -798,11 +849,13 @@ def summarize_timing(path: Path, *, direct_timing_path: Path | None = None) -> d
         )
     attempts = [item for row in rows for item in _as_list(row["attempts"])]
     model_values = [
-        int(item["model_time_ns"])
+        _integer(item["model_time_ns"])
         for item in attempts
         if isinstance(item, Mapping) and item.get("model_time_ns") is not None
     ]
-    avoided_values = [int(row["model_time_avoided_ns"]) for row in rows if row.get("model_time_avoided_ns") is not None]
+    avoided_values = [
+        _integer(row["model_time_avoided_ns"]) for row in rows if row.get("model_time_avoided_ns") is not None
+    ]
     return {
         "record_count": len(rows),
         "retained_wall_ns": sum(walls),
@@ -812,7 +865,7 @@ def summarize_timing(path: Path, *, direct_timing_path: Path | None = None) -> d
         "tail_threshold_ns_by_cache_lane": lane_thresholds,
         "attempts": {
             "model_attempts": len(attempts),
-            "model_attempts_avoided": sum(int(row["avoided_immediate_upstream_calls"]) for row in rows),
+            "model_attempts_avoided": sum(_integer(row["avoided_immediate_upstream_calls"]) for row in rows),
             "model_time_ns": _available_sum(model_values, "model_boundary_unavailable"),
             "model_time_avoided_ns": _available_sum(avoided_values, "paired_counterfactual"),
         },
@@ -822,11 +875,13 @@ def summarize_timing(path: Path, *, direct_timing_path: Path | None = None) -> d
                 "intervention_class": intervention,
                 "cache_lane": lane,
                 "count": len(values),
-                "p95_wall_ns": _percentiles([int(value["downstream_wall_ns"]) for value in values])["p95_wall_ns"],
+                "p95_wall_ns": _percentiles([_integer(value["downstream_wall_ns"]) for value in values])["p95_wall_ns"],
             }
             for (intervention, lane), values in sorted(
                 buckets.items(),
-                key=lambda item: _percentiles([int(value["downstream_wall_ns"]) for value in item[1]])["p95_wall_ns"],
+                key=lambda item: _percentiles([_integer(value["downstream_wall_ns"]) for value in item[1]])[
+                    "p95_wall_ns"
+                ],
                 reverse=True,
             )
         ],
@@ -846,18 +901,21 @@ def _matched_pass_through(
             "model_time_added_ns": _unavailable_value("direct_timing_ledger_unavailable"),
         }
     direct = {
-        (int(row["pair_ordinal"]), str(row["cache_lane"])): row
+        (_integer(row["pair_ordinal"]), str(row["cache_lane"])): row
         for row in direct_rows
         if row["arm"] == "direct" and row["intervention_class"] == "pass_through"
     }
     pairs = [
-        (row, direct[(int(row["pair_ordinal"]), str(row["cache_lane"]))])
+        (row, direct[(_integer(row["pair_ordinal"]), str(row["cache_lane"]))])
         for row in proxy_rows
         if row["arm"] == "proxy"
         and row["intervention_class"] == "pass_through"
-        and (int(row["pair_ordinal"]), str(row["cache_lane"])) in direct
+        and (_integer(row["pair_ordinal"]), str(row["cache_lane"])) in direct
     ]
-    walls = [int(proxy["downstream_wall_ns"]) - int(direct_row["downstream_wall_ns"]) for proxy, direct_row in pairs]
+    walls = [
+        _integer(proxy["downstream_wall_ns"]) - _integer(direct_row["downstream_wall_ns"])
+        for proxy, direct_row in pairs
+    ]
     ttft: list[int] = []
     model: list[int] = []
     for proxy, direct_row in pairs:
@@ -884,13 +942,13 @@ def _first_ttft(row: Mapping[str, object]) -> int | None:
     if not attempts or not isinstance(attempts[0], Mapping):
         return None
     value = attempts[0].get("ttft_ns")
-    return int(value) if value is not None else None
+    return _integer(value) if value is not None else None
 
 
 def _row_model_time(row: Mapping[str, object]) -> int | None:
     attempts = _as_list(row.get("attempts"))
     values = [
-        int(item["model_time_ns"])
+        _integer(item["model_time_ns"])
         for item in attempts
         if isinstance(item, Mapping) and item.get("model_time_ns") is not None
     ]
@@ -898,7 +956,7 @@ def _row_model_time(row: Mapping[str, object]) -> int | None:
 
 
 def _bucket(rows: Sequence[dict[str, object]], threshold: int, lane_tail_total_ns: int) -> dict[str, object]:
-    walls = [int(row["downstream_wall_ns"]) for row in rows]
+    walls = [_integer(row["downstream_wall_ns"]) for row in rows]
     tail = [wall for wall in walls if wall >= threshold]
     tail_total_ns = sum(tail)
     return {
@@ -954,7 +1012,7 @@ def _validate_rows(rows: list[dict[str, object]]) -> None:
         if not isinstance(row, dict) or row.get("sequence") != sequence:
             raise TimingFailure("qualification_timing_ledger_invalid")
         _validate_row(row)
-        pair_ordinal = int(row["pair_ordinal"])
+        pair_ordinal = _integer(row["pair_ordinal"])
         if pair_ordinal in ordinals:
             raise TimingFailure("qualification_timing_ledger_invalid")
         ordinals.add(pair_ordinal)
@@ -1000,7 +1058,7 @@ def _validate_row(row: Mapping[str, object]) -> None:
     ):
         raise TimingFailure("qualification_timing_ledger_invalid")
     total = sum(
-        int(row[key])
+        _integer(row[key])
         for key in (
             "admission_wait_ns",
             "body_read_ns",
@@ -1018,7 +1076,7 @@ def _validate_row(row: Mapping[str, object]) -> None:
         ):
             raise TimingFailure("qualification_timing_ledger_invalid")
         _validate_attempt(attempt)
-        total += int(attempt["wall_ns"])
+        total += _integer(attempt["wall_ns"])
         actual_phases[str(attempt["phase"])] += 1
     if phases != actual_phases:
         raise TimingFailure("qualification_timing_ledger_invalid")
@@ -1032,7 +1090,7 @@ def _validate_row(row: Mapping[str, object]) -> None:
             or attempts
             or any(phases.values())
             or any(
-                int(row[key])
+                _integer(row[key])
                 for key in ("correction_count", "blocked_duplicate_count", "blocked_stall_count", "retry_attempt_count")
             )
             or row["avoided_immediate_upstream_calls"] != 1
@@ -1061,7 +1119,7 @@ def _validate_attempt(attempt: Mapping[str, object]) -> None:
     transport = attempt.get("transport")
     _validate_transport(transport)
     assert isinstance(transport, Mapping)
-    if int(attempt["wall_ns"]) != int(attempt["upstream_slot_wait_ns"]) + int(transport["total_ns"]):
+    if _integer(attempt["wall_ns"]) != _integer(attempt["upstream_slot_wait_ns"]) + _integer(transport["total_ns"]):
         raise TimingFailure("qualification_timing_unexplained_delta")
     for value, availability in (
         (attempt.get("ttft_ns"), attempt.get("ttft_availability")),
@@ -1079,7 +1137,7 @@ def _validate_transport(value: object) -> None:
         duration = value.get(f"{name}_ns")
         _validate_nullable(duration, value.get(f"{name}_availability"))
         if duration is not None:
-            total += int(duration)
+            total += _integer(duration)
     if (
         total != value["total_ns"]
         or value.get("other_ns") is None
@@ -1297,12 +1355,20 @@ def _sha256(value: object) -> bool:
     return isinstance(value, str) and _SHA256.fullmatch(value) is not None
 
 
-def _nonnegative(value: object) -> bool:
+def _nonnegative(value: object) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _positive(value: object) -> bool:
     return _nonnegative(value) and int(value) > 0
+
+
+def _integer(value: object) -> int:
+    """Return a validated ledger integer with a concrete static type."""
+
+    if not _nonnegative(value):
+        raise TimingFailure("qualification_timing_ledger_invalid")
+    return value
 
 
 def _require_nonnegative(value: object) -> int:

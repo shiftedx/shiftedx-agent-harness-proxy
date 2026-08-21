@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any, Protocol
 
 import httpx
@@ -11,6 +12,7 @@ import httpx
 from .config import Settings
 from .errors import UpstreamFailure, UpstreamTimeout
 from .provider_capabilities import combined_tool_terminal_schema_supported
+from .qualification_timing import attach_httpx_trace, set_httpx_transport
 
 JsonObject = dict[str, Any]
 FORWARDED_REQUEST_HEADERS = frozenset({"x-request-id"})
@@ -101,28 +103,40 @@ class HttpxUpstream:
         return headers
 
     async def _request(self, method: str, endpoint: str, **kwargs: Any) -> JsonObject:
+        trace = attach_httpx_trace()
+        started_ns = time.perf_counter_ns()
+        if trace is not None:
+            extensions = dict(kwargs.pop("extensions", {}))
+            extensions["trace"] = trace.callback
+            kwargs["extensions"] = extensions
         try:
-            async with self.client.stream(
-                method, self.settings.upstream_url(endpoint), follow_redirects=False, **kwargs
-            ) as response:
-                if response.is_redirect or response.status_code >= 400:
-                    raise _upstream_http_failure(response)
-                body = bytearray()
-                async for chunk in response.aiter_bytes():
-                    body.extend(chunk)
-                    if len(body) > self.settings.max_upstream_response_bytes:
-                        raise UpstreamFailure("upstream_response_too_large")
-        except httpx.TimeoutException as exc:
-            raise UpstreamTimeout() from exc
-        except httpx.HTTPError as exc:
-            raise UpstreamFailure("upstream_connection_error") from exc
-        try:
-            value = json.loads(body)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise UpstreamFailure("upstream_malformed_json") from exc
-        if not isinstance(value, dict):
-            raise UpstreamFailure("upstream_malformed_json")
-        return value
+            try:
+                async with self.client.stream(
+                    method, self.settings.upstream_url(endpoint), follow_redirects=False, **kwargs
+                ) as response:
+                    if response.is_redirect or response.status_code >= 400:
+                        raise _upstream_http_failure(response)
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        body.extend(chunk)
+                        if len(body) > self.settings.max_upstream_response_bytes:
+                            raise UpstreamFailure("upstream_response_too_large")
+            except httpx.TimeoutException as exc:
+                raise UpstreamTimeout() from exc
+            except httpx.HTTPError as exc:
+                raise UpstreamFailure("upstream_connection_error") from exc
+            try:
+                value = json.loads(body)
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                raise UpstreamFailure("upstream_malformed_json") from exc
+            if not isinstance(value, dict):
+                raise UpstreamFailure("upstream_malformed_json")
+            return value
+        finally:
+            # This finalizer is deliberately outside the HTTP exception mapping
+            # so it observes success, timeout, connection failure, and
+            # cancellation without retaining exception details.
+            set_httpx_transport(trace, time.perf_counter_ns() - started_ns)
 
     async def chat(self, payload: JsonObject, request_headers: dict[str, str]) -> JsonObject:
         return await self._request(
