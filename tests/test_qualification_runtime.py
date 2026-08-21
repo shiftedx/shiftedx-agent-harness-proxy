@@ -37,9 +37,16 @@ from shiftedx_harness_proxy.qualification_contract import (
 from shiftedx_harness_proxy.qualification_model_evidence import model_endpoint_contract_hashes
 from shiftedx_harness_proxy.qualification_reconciliation import (
     RequestAccountingRecord,
+    request_accounting_record_payload,
     write_request_accounting_ledger,
 )
 from shiftedx_harness_proxy.qualification_runtime import RuntimeLease
+from shiftedx_harness_proxy.qualification_timing import (
+    bind_capture_row,
+    unavailable,
+    unavailable_transport,
+    write_timing_ledger,
+)
 
 
 def _canonical_sha256(value: object) -> str:
@@ -423,9 +430,7 @@ def _campaign_stage_request(
     ordinal, selected = next(
         (index, value)
         for index, value in enumerate(slots, start=1)
-        if isinstance(value, dict)
-        and value.get("cache_lane") == cache_lane
-        and value.get("pair_index") == pair_index
+        if isinstance(value, dict) and value.get("cache_lane") == cache_lane and value.get("pair_index") == pair_index
     )
     assert isinstance(selected, dict)
     private_run_dir = slots_dir / f"{ordinal:02d}-{cache_lane}-pair{pair_index}"
@@ -1063,9 +1068,7 @@ def test_in_container_metrics_probe_rejects_redirects_before_replaying_trusted_o
     )
     assert outcome.status == "passed"
     source = next(
-        call[1][-1]
-        for call in runner.calls
-        if call[0] == "run" and call[1][:3] == ("docker", "exec", "--user")
+        call[1][-1] for call in runner.calls if call[0] == "run" and call[1][:3] == ("docker", "exec", "--user")
     )
 
     class Secret:
@@ -1090,9 +1093,7 @@ def test_in_container_metrics_probe_rejects_redirects_before_replaying_trusted_o
     class RedirectingOpener:
         def __init__(self, handlers) -> None:
             self.redirect_handler = next(
-                handler
-                for handler in handlers
-                if isinstance(handler, urllib.request.HTTPRedirectHandler)
+                handler for handler in handlers if isinstance(handler, urllib.request.HTTPRedirectHandler)
             )
 
         def open(self, request, *, timeout: float):
@@ -1198,9 +1199,7 @@ def test_loopback_listener_probe_distinguishes_only_connection_refused(monkeypat
 
     monkeypatch.setattr(runtime_module.socket, "create_connection", fail_connection)
 
-    state = runtime_module.SubprocessRuntimeCommandRunner().loopback_listener_state(
-        "127.0.0.1", 19999
-    )
+    state = runtime_module.SubprocessRuntimeCommandRunner().loopback_listener_state("127.0.0.1", 19999)
 
     assert state == expected
 
@@ -1214,9 +1213,7 @@ def test_loopback_listener_probe_closes_a_live_connection(monkeypatch) -> None:
     connection.close = close
     monkeypatch.setattr(runtime_module.socket, "create_connection", lambda *_args, **_kwargs: connection)
 
-    state = runtime_module.SubprocessRuntimeCommandRunner().loopback_listener_state(
-        "127.0.0.1", 19999
-    )
+    state = runtime_module.SubprocessRuntimeCommandRunner().loopback_listener_state("127.0.0.1", 19999)
 
     assert state == "listening"
     assert connection.closed is True
@@ -1285,6 +1282,8 @@ def _write_complete_ledger(lease: RuntimeLease) -> int:
         lease.direct_model_attempt_ledger.chmod(0o600)
     if lease.proxy_request_ledger is not None:
         write_request_accounting_ledger(lease.proxy_request_ledger, ())
+    if lease.proxy_timing_ledger is not None:
+        write_timing_ledger(lease.proxy_timing_ledger, [])
     return 0
 
 
@@ -1294,6 +1293,79 @@ def _write_scored_output(lease: RuntimeLease) -> None:
         encoding="utf-8",
     )
     lease.output_ledger.chmod(0o600)
+
+
+def _write_proxy_timing(
+    lease: RuntimeLease,
+    requests: tuple[RequestAccountingRecord, ...],
+    observers: tuple[ModelBoundaryRecord, ...],
+) -> None:
+    """Write deterministic, exact test-only sink evidence through public seams."""
+
+    assert lease.proxy_timing_ledger is not None
+    rows: list[dict[str, object]] = []
+    observer_rows = tuple(record.to_dict() for record in observers)
+    for request in requests:
+        if request.attempt_count:
+            assert request.attempt_sequence_start is not None and request.attempt_sequence_end is not None
+            selected = observer_rows[request.attempt_sequence_start - 1 : request.attempt_sequence_end]
+        else:
+            selected = ()
+        phase_counts = {"acquisition": 0, "finalization": 0, "terminal": 0}
+        attempts: list[dict[str, object]] = []
+        for sequence, observer in enumerate(selected, 1):
+            phase = observer["fields"]["compatibility"]["phase"]
+            assert isinstance(phase, str)
+            phase_counts[phase] += 1
+            attempts.append(
+                {
+                    "sequence": sequence,
+                    "phase": phase,
+                    "status": "succeeded",
+                    "wall_ns": 1,
+                    "upstream_slot_wait_ns": 0,
+                    "transport": unavailable_transport(1),
+                    "ttft_ns": None,
+                    "ttft_availability": unavailable("non_streaming_response"),
+                    "model_time_ns": None,
+                    "model_time_availability": unavailable("model_boundary_unavailable"),
+                    "decode_ns": None,
+                    "decode_availability": unavailable("model_boundary_unavailable"),
+                }
+            )
+        capture = {
+            "schema_version": "2.0",
+            "record_type": "qualification_timing_capture",
+            "sequence": request.sequence,
+            "outcome": request.outcome,
+            "downstream_wall_ns": len(attempts) + 1,
+            "admission_wait_ns": 0,
+            "body_read_ns": 0,
+            "policy_exclusive_ns": 0,
+            "response_finalize_ns": 0,
+            "other_measured_ns": 1,
+            "attempts": attempts,
+            "local_projection": request.local_projection,
+            "avoided_immediate_upstream_calls": request.avoided_immediate_upstream_calls,
+            "correction_count": request.correction_count,
+            "blocked_duplicate_count": request.blocked_duplicate_count,
+            "blocked_stall_count": request.blocked_stall_count,
+            "retry_attempt_count": request.retry_attempt_count,
+            "phase_counts": phase_counts,
+        }
+        rows.append(
+            bind_capture_row(
+                capture,
+                sequence=request.sequence,
+                pair_ordinal=request.sequence,
+                arm="proxy",
+                request_accounting_row=request_accounting_record_payload(request),
+                observer_rows=selected,
+                cache_lane="warm-prefix" if lease.cache_lane == "warm-prefix" else "cold",
+                intervention_class="projection" if request.local_projection else "pass_through",
+            )
+        )
+    write_timing_ledger(lease.proxy_timing_ledger, rows)
 
 
 def _model_attempt(
@@ -1698,27 +1770,29 @@ def test_proxy_stage_adapts_only_its_fresh_observer_attempts(tmp_path) -> None:
         _write_scored_output(lease)
         assert lease.observer_ledger is not None
         assert lease.proxy_request_ledger is not None
-        record = _model_attempt(1, _cold_cache()).to_dict()
-        lease.observer_ledger.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+        observer_record = _model_attempt(1, _cold_cache())
+        lease.observer_ledger.write_text(
+            json.dumps(observer_record.to_dict(), sort_keys=True, separators=(",", ":")) + "\n"
+        )
         lease.observer_ledger.chmod(0o600)
+        accounting_record = RequestAccountingRecord(
+            sequence=1,
+            outcome="succeeded",
+            local_projection=False,
+            attempt_sequence_start=1,
+            attempt_sequence_end=1,
+            attempt_count=1,
+            successful_attempt_count=1,
+            phase_counts={"acquisition": 1, "finalization": 0},
+            retry_attempt_count=0,
+            blocked_duplicate_count=0,
+            blocked_stall_count=0,
+        )
         write_request_accounting_ledger(
             lease.proxy_request_ledger,
-            (
-                RequestAccountingRecord(
-                    sequence=1,
-                    outcome="succeeded",
-                    local_projection=False,
-                    attempt_sequence_start=1,
-                    attempt_sequence_end=1,
-                    attempt_count=1,
-                    successful_attempt_count=1,
-                    phase_counts={"acquisition": 1, "finalization": 0},
-                    retry_attempt_count=0,
-                    blocked_duplicate_count=0,
-                    blocked_stall_count=0,
-                ),
-            ),
+            (accounting_record,),
         )
+        _write_proxy_timing(lease, (accounting_record,), (observer_record,))
         after = _zero_proxy_metrics()
         after.update(
             {
@@ -1749,15 +1823,9 @@ def test_proxy_stage_adapts_only_its_fresh_observer_attempts(tmp_path) -> None:
     assert reconciliation_record["status"] == "passed"
     assert proxy.outcome_path is not None
     runtime_outcome = json.loads(proxy.outcome_path.read_text(encoding="utf-8"))
-    assert runtime_outcome["proxy_reconciliation_sha256"] == hashlib.sha256(
-        reconciliation.read_bytes()
-    ).hexdigest()
-    scored_attestation = json.loads(
-        (private_run_dir / "scored-proxy-runtime-attestation.json").read_text()
-    )
-    preflight_attestation = json.loads(
-        (private_run_dir / "preflight-runtime-attestation.json").read_text()
-    )
+    assert runtime_outcome["proxy_reconciliation_sha256"] == hashlib.sha256(reconciliation.read_bytes()).hexdigest()
+    scored_attestation = json.loads((private_run_dir / "scored-proxy-runtime-attestation.json").read_text())
+    preflight_attestation = json.loads((private_run_dir / "preflight-runtime-attestation.json").read_text())
     assert scored_attestation["runtime_contract_sha256"] == preflight_attestation["runtime_contract_sha256"]
     metric_indices = [
         index
@@ -1797,12 +1865,8 @@ def test_warm_proxy_attestation_keeps_the_single_preflight_runtime_contract(tmp_
         _write_scored_output(lease)
         assert lease.direct_model_attempt_ledger is not None
         assert lease.prime_model_attempt_ledger is not None
-        write_model_boundary_attempt_ledger(
-            lease.prime_model_attempt_ledger, [_model_attempt(1, _warm_prime_cache())]
-        )
-        write_model_boundary_attempt_ledger(
-            lease.direct_model_attempt_ledger, [_model_attempt(1, _warm_hit_cache())]
-        )
+        write_model_boundary_attempt_ledger(lease.prime_model_attempt_ledger, [_model_attempt(1, _warm_prime_cache())])
+        write_model_boundary_attempt_ledger(lease.direct_model_attempt_ledger, [_model_attempt(1, _warm_hit_cache())])
         direct_runner.model_requests_completed += 2
         return 0
 
@@ -1824,32 +1888,30 @@ def test_warm_proxy_attestation_keeps_the_single_preflight_runtime_contract(tmp_
         assert lease.observer_ledger is not None
         assert lease.proxy_request_ledger is not None
         assert lease.prime_model_attempt_ledger is not None
-        write_model_boundary_attempt_ledger(
-            lease.prime_model_attempt_ledger, [_model_attempt(1, _warm_prime_cache())]
-        )
-        observed = _model_attempt(1, _warm_hit_cache()).to_dict()
+        write_model_boundary_attempt_ledger(lease.prime_model_attempt_ledger, [_model_attempt(1, _warm_prime_cache())])
+        observer_record = _model_attempt(1, _warm_hit_cache())
         lease.observer_ledger.write_text(
-            json.dumps(observed, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"
+            json.dumps(observer_record.to_dict(), sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"
         )
         lease.observer_ledger.chmod(0o600)
+        accounting_record = RequestAccountingRecord(
+            sequence=1,
+            outcome="succeeded",
+            local_projection=False,
+            attempt_sequence_start=1,
+            attempt_sequence_end=1,
+            attempt_count=1,
+            successful_attempt_count=1,
+            phase_counts={"acquisition": 1, "finalization": 0},
+            retry_attempt_count=0,
+            blocked_duplicate_count=0,
+            blocked_stall_count=0,
+        )
         write_request_accounting_ledger(
             lease.proxy_request_ledger,
-            (
-                RequestAccountingRecord(
-                    sequence=1,
-                    outcome="succeeded",
-                    local_projection=False,
-                    attempt_sequence_start=1,
-                    attempt_sequence_end=1,
-                    attempt_count=1,
-                    successful_attempt_count=1,
-                    phase_counts={"acquisition": 1, "finalization": 0},
-                    retry_attempt_count=0,
-                    blocked_duplicate_count=0,
-                    blocked_stall_count=0,
-                ),
-            ),
+            (accounting_record,),
         )
+        _write_proxy_timing(lease, (accounting_record,), (observer_record,))
         after = _zero_proxy_metrics()
         after.update({"downstream_requests": 1, "upstream_calls": 1, "phase_acquisition": 1})
         proxy_runner.metrics_snapshots[1] = after
@@ -1916,9 +1978,7 @@ def test_proxy_reconciliation_failure_retains_failed_artifact_and_blocks_passed_
     assert outcome.outcome_path is not None
     runtime_outcome = json.loads(outcome.outcome_path.read_text(encoding="utf-8"))
     assert runtime_outcome["status"] == "failed"
-    assert runtime_outcome["proxy_reconciliation_sha256"] == hashlib.sha256(
-        reconciliation.read_bytes()
-    ).hexdigest()
+    assert runtime_outcome["proxy_reconciliation_sha256"] == hashlib.sha256(reconciliation.read_bytes()).hexdigest()
 
 
 def test_proxy_nonzero_child_still_finalizes_its_safe_reconciliation_window(tmp_path) -> None:
@@ -2503,9 +2563,7 @@ def test_campaign_readiness_does_not_treat_a_responding_wrong_model_as_offline(t
 
 
 @pytest.mark.parametrize("live_failure", ["redirect", "oversized"])
-def test_campaign_readiness_does_not_treat_a_live_invalid_http_endpoint_as_offline(
-    tmp_path, live_failure
-) -> None:
+def test_campaign_readiness_does_not_treat_a_live_invalid_http_endpoint_as_offline(tmp_path, live_failure) -> None:
     """Redirect and oversize rejection are live-protocol failures, not stopped listeners."""
 
     manifest = _manifest(tmp_path)
@@ -2579,9 +2637,7 @@ def test_campaign_advances_a_full_first_pair_through_proxy_reconciliation(tmp_pa
             action=_write_complete_ledger,
             command_runner=direct_runner,
         ),
-        readiness_probe=runtime_module.QualificationCampaignReadinessProbe(
-            command_runner=direct_runner
-        ),
+        readiness_probe=runtime_module.QualificationCampaignReadinessProbe(command_runner=direct_runner),
     )
     assert (second.kind, second.stage, second.status) == ("stage_completed", "score-direct", "passed")
     assert not list((private_campaign_dir / "slots").glob(".readiness-*-model-cache-evidence.json"))
@@ -2594,9 +2650,7 @@ def test_campaign_advances_a_full_first_pair_through_proxy_reconciliation(tmp_pa
             action=_write_complete_ledger,
             command_runner=proxy_runner,
         ),
-        readiness_probe=runtime_module.QualificationCampaignReadinessProbe(
-            command_runner=proxy_runner
-        ),
+        readiness_probe=runtime_module.QualificationCampaignReadinessProbe(command_runner=proxy_runner),
     )
 
     assert (third.kind, third.sequence, third.stage, third.status) == (
@@ -3245,6 +3299,7 @@ def _lease(stage: str) -> RuntimeLease:
         preflight_ledger=Path("/private/preflight.jsonl"),
         output_ledger=Path(f"/private/{stage}.jsonl"),
         attestation_path=Path("/private/runtime-attestation.json"),
+        proxy_timing_ledger=Path("/private/scored-proxy-timing.jsonl") if stage == "score-proxy" else None,
     )
 
 
@@ -3262,6 +3317,8 @@ def test_thin_cli_derives_fixed_child_argv_without_secret_values(stage) -> None:
     assert argv[argv.index("--sampler-profile") + 1] == "historical-aeon-v1"
     assert argv[argv.index("--run-id") + 1] == "qualified-run"
     assert argv[argv.index("--cache-mode") + 1] == ("bypass" if stage == "preflight" else "warm-prefix")
+    if stage == "score-proxy":
+        assert argv[argv.index("--proxy-timing-ledger") + 1] == "/private/scored-proxy-timing.jsonl"
     assert "private-secret-value" not in serialized
     assert "--model" in argv
     if stage == "preflight":

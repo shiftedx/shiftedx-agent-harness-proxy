@@ -613,13 +613,12 @@ def test_historical_aeon_profile_binds_payload_fingerprint_prime_and_score_gate(
     corrected_digest = runner.contract_fingerprints(corrected, order, policy_delta={})["downstream"]["digest"]
     assert historical_digest != corrected_digest
 
-    prime = runner.cache_prime_payload(
-        scenario, model="model", arm="direct", sampler_profile="historical-aeon-v1"
-    )
+    prime = runner.cache_prime_payload(scenario, model="model", arm="direct", sampler_profile="historical-aeon-v1")
     first_scored = runner.PhasePlanner().plan(historical, phase="acquisition")
-    assert runner.model_boundary_fingerprint(prime, scenario_order=order).digest == runner.model_boundary_fingerprint(
-        first_scored, scenario_order=order
-    ).digest
+    assert (
+        runner.model_boundary_fingerprint(prime, scenario_order=order).digest
+        == runner.model_boundary_fingerprint(first_scored, scenario_order=order).digest
+    )
 
     digests = runner._qualification_contract_digests("model", [scenario], order, "a" * 64, "historical-aeon-v1")
     expected = runner.qualification_contract_digest(
@@ -637,9 +636,12 @@ def test_historical_aeon_profile_binds_payload_fingerprint_prime_and_score_gate(
         run_manifest_sha256="a" * 64,
     )
     assert digests["cold"]["direct"] == expected
-    assert digests["cold"]["direct"] != runner._qualification_contract_digests(
-        "model", [scenario], order, "a" * 64, "corrected-parity-v1"
-    )["cold"]["direct"]
+    assert (
+        digests["cold"]["direct"]
+        != runner._qualification_contract_digests("model", [scenario], order, "a" * 64, "corrected-parity-v1")["cold"][
+            "direct"
+        ]
+    )
 
 
 def test_contract_fingerprint_reports_accidental_sampler_mismatch(monkeypatch):
@@ -736,9 +738,7 @@ def test_preflight_ledger_retains_only_hashes_and_allowlisted_outcomes(monkeypat
 
     serialized = output.read_text()
     rows = [json.loads(line) for line in serialized.splitlines()]
-    proxy_tool_row = next(
-        row for row in rows if row.get("arm") == "proxy" and row.get("path") == "tool_required"
-    )
+    proxy_tool_row = next(row for row in rows if row.get("arm") == "proxy" and row.get("path") == "tool_required")
     assert proxy_tool_row["proxy_correction_count"] == 0
     assert '"scored":false' in serialized
     assert scenario.prompt not in serialized
@@ -829,9 +829,7 @@ def test_preflight_accepts_r5_immediate_proxy_correction_run_expansion(monkeypat
         (("D1", "D2", "D2", "D3"), 1, {"acquisition": 2, "finalization": 1}, "phase metrics"),
     ],
 )
-def test_preflight_run_expansion_fails_closed(
-    monkeypatch, proxy_contracts, corrections, phase_counts, message
-):
+def test_preflight_run_expansion_fails_closed(monkeypatch, proxy_contracts, corrections, phase_counts, message):
     runner = load_runner(monkeypatch)
 
     with pytest.raises(runner.PreflightFailure, match=message):
@@ -1055,6 +1053,7 @@ def test_proxy_request_accounting_records_local_projection_with_exactly_zero_att
         correction_count=0,
         blocked_duplicate_count=0,
         blocked_stall_count=0,
+        avoided_immediate_upstream_calls=1,
     )
     assert not observer_path.exists()
 
@@ -1422,6 +1421,7 @@ def test_proxy_request_ledger_is_exact_private_atomic_and_no_clobber(monkeypatch
             retry_attempt_count=0,
             blocked_duplicate_count=0,
             blocked_stall_count=0,
+            avoided_immediate_upstream_calls=1,
         ),
     ]
 
@@ -1442,6 +1442,7 @@ def test_proxy_request_ledger_is_exact_private_atomic_and_no_clobber(monkeypatch
             "correction_count": 0,
             "blocked_duplicate_count": 1,
             "blocked_stall_count": 0,
+            "avoided_immediate_upstream_calls": 0,
         },
         {
             "sequence": 2,
@@ -1456,6 +1457,7 @@ def test_proxy_request_ledger_is_exact_private_atomic_and_no_clobber(monkeypatch
             "correction_count": 0,
             "blocked_duplicate_count": 0,
             "blocked_stall_count": 0,
+            "avoided_immediate_upstream_calls": 1,
         },
     ]
     assert output.stat().st_mode & 0o777 == 0o600
@@ -1793,8 +1795,7 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
             if self.is_proxy:
                 observed_payloads = (
                     (planner.plan(payload, phase="acquisition"),)
-                    if payload.get("tools")
-                    and (should_call_tool or not finalization_requested)
+                    if payload.get("tools") and (should_call_tool or not finalization_requested)
                     else (
                         planner.plan(payload, phase="acquisition"),
                         planner.plan(payload, phase="acquisition"),

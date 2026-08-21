@@ -371,6 +371,7 @@ class ProxyRequestAccounting:
                 blocked_duplicate_count=blocked_duplicates,
                 blocked_stall_count=blocked_stalls,
                 correction_count=corrections,
+                avoided_immediate_upstream_calls=int(local_projection),
             )
         )
 
@@ -812,19 +813,27 @@ def _atomic_replace_jsonl(output: Path, rows: list[dict[str, Any]]) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=output.parent, delete=False) as handle:
+        payload = "".join(
+            json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n" for item in rows
+        ).encode("utf-8")
+        with tempfile.NamedTemporaryFile("wb", dir=output.parent, delete=False) as handle:
             temporary = Path(handle.name)
-            handle.write(
-                "".join(
-                    json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n" for item in rows
-                )
-            )
+            _write_all(handle.fileno(), payload)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, output)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise OSError("private evidence partial write")
+        offset += written
 
 
 def response_format(case_id: str, keys: tuple[str, ...] | None, types: dict[str, str]) -> dict[str, Any]:
@@ -898,6 +907,11 @@ def main() -> None:
         "--proxy-request-ledger",
         type=Path,
         help="Fresh safe per-downstream-call accounting ledger for proxy reconciliation.",
+    )
+    parser.add_argument(
+        "--proxy-timing-ledger",
+        type=Path,
+        help=("Final private timing ledger emitted by the mounted qualification sink; the runner never fabricates it."),
     )
     parser.add_argument(
         "--runtime-attestation",
@@ -1267,8 +1281,7 @@ def _run_paired_preflight(args: argparse.Namespace, selected: list[Any]) -> None
                     tool_observation = replace(
                         tool_observation,
                         proxy_correction_count=sum(
-                            record.correction_count
-                            for record in proxy_request_accounting.records[tool_request_start:]
+                            record.correction_count for record in proxy_request_accounting.records[tool_request_start:]
                         ),
                     )
                 observations.append(tool_observation)

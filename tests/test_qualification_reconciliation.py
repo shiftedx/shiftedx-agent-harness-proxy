@@ -70,6 +70,7 @@ def _context(**changes: object) -> ReconciliationContext:
         model_evidence_sha256="4" * 64,
         observer_ledger_sha256="5" * 64,
         request_ledger_sha256="6" * 64,
+        timing_ledger_sha256="7" * 64,
     )
     return replace(value, **changes)
 
@@ -125,6 +126,7 @@ def _request(
         blocked_duplicate_count=blocked_duplicates,
         blocked_stall_count=blocked_stalls,
         correction_count=corrections,
+        avoided_immediate_upstream_calls=int(local_projection),
     )
 
 
@@ -145,6 +147,7 @@ def _write_request_ledger(path: Path, records: list[RequestAccountingRecord]) ->
                     "correction_count": record.correction_count,
                     "blocked_duplicate_count": record.blocked_duplicate_count,
                     "blocked_stall_count": record.blocked_stall_count,
+                    "avoided_immediate_upstream_calls": record.avoided_immediate_upstream_calls,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -224,46 +227,39 @@ def test_request_ledger_reader_rejects_untrusted_or_payload_bearing_rows(tmp_pat
 
 
 @pytest.mark.parametrize("outcome", ["failed", "cancelled", "deadline"])
-@pytest.mark.parametrize(
-    "count_field", ["correction_count", "blocked_duplicate_count", "blocked_stall_count"]
-)
-def test_request_ledger_reader_rejects_response_telemetry_without_a_successful_response(
+@pytest.mark.parametrize("count_field", ["correction_count", "blocked_duplicate_count", "blocked_stall_count"])
+def test_request_ledger_reader_preserves_pre_failure_interventions(
     tmp_path: Path, outcome: str, count_field: str
 ) -> None:
     path = tmp_path / "proxy-requests.jsonl"
     record = replace(
-        _request(1, start=1, end=1, attempts=1, successful=0, acquisition=1, outcome=outcome),
+        _request(1, start=1, end=1, attempts=1, successful=1, acquisition=1, outcome=outcome),
         **{count_field: 1},
     )
     _write_request_ledger(path, [record])
 
-    with pytest.raises(ReconciliationFailure, match="^reconciliation_request_ledger_invalid$"):
-        read_request_accounting_ledger(path)
+    assert read_request_accounting_ledger(path) == (record,)
 
 
 @pytest.mark.parametrize("outcome", ["failed", "cancelled", "deadline"])
-@pytest.mark.parametrize(
-    "count_field", ["correction_count", "blocked_duplicate_count", "blocked_stall_count"]
-)
-def test_request_ledger_writer_rejects_response_telemetry_without_a_successful_response(
+@pytest.mark.parametrize("count_field", ["correction_count", "blocked_duplicate_count", "blocked_stall_count"])
+def test_request_ledger_writer_preserves_pre_failure_interventions(
     tmp_path: Path, outcome: str, count_field: str
 ) -> None:
     path = tmp_path / "proxy-requests.jsonl"
     record = replace(
-        _request(1, start=1, end=1, attempts=1, successful=0, acquisition=1, outcome=outcome),
+        _request(1, start=1, end=1, attempts=1, successful=1, acquisition=1, outcome=outcome),
         **{count_field: 1},
     )
 
-    with pytest.raises(ReconciliationFailure, match="^reconciliation_request_ledger_invalid$"):
-        write_request_accounting_ledger(path, [record])
-    assert not path.exists()
+    write_request_accounting_ledger(path, [record])
+
+    assert read_request_accounting_ledger(path) == (record,)
 
 
 @pytest.mark.parametrize("outcome", ["failed", "cancelled", "deadline"])
-@pytest.mark.parametrize(
-    "count_field", ["correction_count", "blocked_duplicate_count", "blocked_stall_count"]
-)
-def test_reconciliation_rejects_response_telemetry_without_a_successful_response(
+@pytest.mark.parametrize("count_field", ["correction_count", "blocked_duplicate_count", "blocked_stall_count"])
+def test_reconciliation_sums_pre_failure_interventions_for_every_outcome(
     tmp_path: Path, outcome: str, count_field: str
 ) -> None:
     after = replace(
@@ -275,21 +271,29 @@ def test_reconciliation_rejects_response_telemetry_without_a_successful_response
         cancellations=int(outcome == "cancelled"),
         deadline_expiries=int(outcome == "deadline"),
     )
-    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, after))
     record = replace(
-        _request(1, start=1, end=1, attempts=1, successful=0, acquisition=1, outcome=outcome),
+        _request(1, start=1, end=1, attempts=1, successful=1, acquisition=1, outcome=outcome),
         **{count_field: 1},
     )
     artifact = tmp_path / "reconciliation.json"
+    metric_name = {
+        "correction_count": "correction_turns",
+        "blocked_duplicate_count": "blocked_duplicates",
+        "blocked_stall_count": "blocked_stalls",
+    }[count_field]
+    after = replace(after, **{metric_name: 1})
+    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, after))
 
-    with pytest.raises(ReconciliationFailure, match="^reconciliation_request_record_invalid$"):
-        session.complete(
-            _context(),
-            [_observer(1, status_code=500)],
-            [record],
-            ModelOperationSummary(requests_completed_delta=0, prime_count=0),
-            artifact,
-        )
+    result = session.complete(
+        _context(),
+        [_observer(1)],
+        [record],
+        ModelOperationSummary(requests_completed_delta=1, prime_count=0),
+        artifact,
+    )
+
+    assert result.status == "passed"
+    assert json.loads(artifact.read_text(encoding="utf-8"))["checks"]["corrections"] is True
 
 
 def test_begin_snapshots_zero_metrics_before_action_and_complete_binds_post_action_evidence(
@@ -311,6 +315,7 @@ def test_begin_snapshots_zero_metrics_before_action_and_complete_binds_post_acti
     document = json.loads(artifact.read_text(encoding="utf-8"))
     assert document["observer_ledger_sha256"] == "5" * 64
     assert document["request_ledger_sha256"] == "6" * 64
+    assert document["timing_ledger_sha256"] == "7" * 64
     loaded = load_passed_proxy_reconciliation(artifact, context=_context())
     assert loaded.file_sha256 == result.file_sha256
 
@@ -341,9 +346,7 @@ def test_decreased_post_action_metrics_retain_a_categorical_failed_artifact(tmp_
 def test_complete_rejects_post_action_evidence_context_that_drifts_from_pre_action_identity(
     tmp_path: Path,
 ) -> None:
-    session = ProxyReconciliationSession.begin(
-        _identity(), FakeMetricsReader(_ZERO_METRICS, _ZERO_METRICS)
-    )
+    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, _ZERO_METRICS))
 
     with pytest.raises(ReconciliationFailure, match="^reconciliation_context_invalid$"):
         session.complete(
@@ -373,7 +376,7 @@ def test_cold_success_reconciles_one_request_operation_phase_and_model_completio
     assert result.path == artifact
     assert artifact.stat().st_mode & 0o777 == 0o600
     assert document == {
-        "schema_version": "1.0",
+        "schema_version": "2.0",
         "record_type": "qualification_proxy_reconciliation",
         "status": "passed",
         "failure_category": None,
@@ -386,6 +389,7 @@ def test_cold_success_reconciles_one_request_operation_phase_and_model_completio
         "model_evidence_sha256": "4" * 64,
         "observer_ledger_sha256": "5" * 64,
         "request_ledger_sha256": "6" * 64,
+        "timing_ledger_sha256": "7" * 64,
         "before_metrics_sha256": "f6a36bd22ce6b8322810f9e122ae64591cc1e98d24c5a826ffe739c2caeedac4",
         "after_metrics_sha256": "935d1cba34b47336944892f26b1666ad813711aa417ac44fe3113b678751f6c8",
         "deltas": {
@@ -470,6 +474,7 @@ def test_request_phase_mismatch_retains_only_categorical_failed_artifact(tmp_pat
         "model_evidence_sha256",
         "observer_ledger_sha256",
         "request_ledger_sha256",
+        "timing_ledger_sha256",
         "before_metrics_sha256",
         "after_metrics_sha256",
         "deltas",

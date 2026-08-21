@@ -1281,9 +1281,7 @@ def assert_preflight(observations: list[PreflightObservation]) -> None:
         else:
             if len(direct.model_facing) != len(proxy.model_facing):
                 raise PreflightFailure("model-facing phase count differed")
-            for direct_fingerprint, proxy_fingerprint in zip(
-                direct.model_facing, proxy.model_facing, strict=True
-            ):
+            for direct_fingerprint, proxy_fingerprint in zip(direct.model_facing, proxy.model_facing, strict=True):
                 mismatch = contract_mismatches(direct_fingerprint, proxy_fingerprint)
                 if mismatch:
                     raise PreflightFailure(f"model-facing contract mismatch: {', '.join(mismatch)}")
@@ -1301,18 +1299,12 @@ def _assert_tool_phase_order(observation: PreflightObservation) -> dict[str, int
         compatibility = fingerprint.fields.get("compatibility")
         phase = compatibility.get("phase") if isinstance(compatibility, dict) else None
         phases.append(phase)
-    if (
-        len(phases) < 2
-        or phases[-1] != "finalization"
-        or any(phase != "acquisition" for phase in phases[:-1])
-    ):
+    if len(phases) < 2 or phases[-1] != "finalization" or any(phase != "acquisition" for phase in phases[:-1]):
         raise PreflightFailure(f"{observation.arm} model-facing tool phase behavior differed")
     return {"acquisition": len(phases) - 1, "finalization": 1}
 
 
-def _assert_proxy_run_expansion(
-    direct: tuple[SafeFingerprint, ...], proxy: tuple[SafeFingerprint, ...]
-) -> int:
+def _assert_proxy_run_expansion(direct: tuple[SafeFingerprint, ...], proxy: tuple[SafeFingerprint, ...]) -> int:
     """Require proxy attempts to be the direct sequence plus contiguous exact repeats."""
 
     proxy_index = 0
@@ -1699,10 +1691,11 @@ def _atomic_write_jsonl(output: Path, records: list[dict[str, Any]]) -> None:
         raise PreflightFailure("refusing to overwrite an existing preflight ledger")
     temporary: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=output.parent, delete=False) as handle:
+        payload = "".join(_canonical(record) + "\n" for record in records).encode("utf-8")
+        with tempfile.NamedTemporaryFile("wb", dir=output.parent, delete=False) as handle:
             temporary = Path(handle.name)
             os.fchmod(handle.fileno(), 0o600)
-            handle.write("".join(_canonical(record) + "\n" for record in records))
+            _write_all(handle.fileno(), payload)
             handle.flush()
             os.fsync(handle.fileno())
         try:
@@ -1713,6 +1706,15 @@ def _atomic_write_jsonl(output: Path, records: list[dict[str, Any]]) -> None:
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise OSError("private evidence partial write")
+        offset += written
 
 
 def _matches_primitive(value: Any, expected: Any) -> bool:

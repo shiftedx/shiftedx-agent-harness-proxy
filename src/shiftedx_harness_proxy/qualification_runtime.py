@@ -72,7 +72,9 @@ from .qualification_reconciliation import (
     ReconciliationFailure,
     ReconciliationIdentity,
     read_request_accounting_ledger,
+    request_accounting_record_payload,
 )
+from .qualification_timing import TimingFailure, read_timing_ledger, verify_timing_ledger_linkage
 
 RuntimeStage = Literal["preflight", "score-direct", "score-proxy"]
 AttestationStage = Literal["preflight", "scored_proxy"]
@@ -231,9 +233,7 @@ def _is_trusted_host_tool(path: Path) -> bool:
     return stat.S_ISREG(status.st_mode) and os.access(path, os.X_OK)
 
 
-def _safe_http_response(
-    url: str, *, headers: dict[str, str] | None, timeout: float
-) -> tuple[int, bytes | None]:
+def _safe_http_response(url: str, *, headers: dict[str, str] | None, timeout: float) -> tuple[int, bytes | None]:
     """Issue one bounded, exact-URL request without proxy or redirect credential replay."""
 
     request = Request(url, headers=headers or {})  # noqa: S310 - callers validate private runtime URLs
@@ -284,9 +284,7 @@ class RuntimeCommandRunner(Protocol):
         self, url: str, *, headers: dict[str, str] | None = None, timeout: float = 5.0
     ) -> tuple[int, dict[str, Any] | None]: ...
 
-    def loopback_listener_state(
-        self, host: str, port: int, *, timeout: float = 1.0
-    ) -> LoopbackListenerState: ...
+    def loopback_listener_state(self, host: str, port: int, *, timeout: float = 1.0) -> LoopbackListenerState: ...
 
 
 class _ContainerMetricsReader:
@@ -454,9 +452,7 @@ class SubprocessRuntimeCommandRunner:
             return status, None
         return status, document if isinstance(document, dict) else None
 
-    def loopback_listener_state(
-        self, host: str, port: int, *, timeout: float = 1.0
-    ) -> LoopbackListenerState:
+    def loopback_listener_state(self, host: str, port: int, *, timeout: float = 1.0) -> LoopbackListenerState:
         """Distinguish a refused loopback connection from all ambiguous failures."""
 
         try:
@@ -550,6 +546,7 @@ class RuntimeLease:
     preflight_ledger: Path
     output_ledger: Path
     attestation_path: Path | None
+    proxy_timing_ledger: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -704,11 +701,7 @@ def _stage_binding(
         raise QualificationRuntimeFailure("runtime_campaign_request_invalid")
     if stage == "preflight":
         expected = CampaignSlot(0, "preflight", 0, f"{spec.campaign.campaign_id}-preflight")
-        if (
-            stage_request.sequence != 1
-            or request_slot != expected
-            or private_run_dir.name != "00-preflight-pair0"
-        ):
+        if stage_request.sequence != 1 or request_slot != expected or private_run_dir.name != "00-preflight-pair0":
             raise QualificationRuntimeFailure("runtime_campaign_request_invalid")
         return _StageBinding(
             spec.campaign.campaign_id_sha256,
@@ -725,8 +718,7 @@ def _stage_binding(
         request_slot.cache_lane != expected_slot.cache_lane
         or request_slot.pair_index != expected_slot.pair_index
         or request_slot.run_id != expected_slot.run_id
-        or private_run_dir.name
-        != f"{request_slot.ordinal:02d}-{request_slot.cache_lane}-pair{request_slot.pair_index}"
+        or private_run_dir.name != f"{request_slot.ordinal:02d}-{request_slot.cache_lane}-pair{request_slot.pair_index}"
     ):
         raise QualificationRuntimeFailure("runtime_campaign_request_invalid")
     expected_sequence = 2 + (request_slot.ordinal - 1) * 2 + (0 if stage == "score-direct" else 1)
@@ -795,9 +787,7 @@ def supervise_qualification_runtime(
             _validate_prior_outcome(binding.preflight_run_dir, "preflight", spec, attestation_path, binding)
             _validate_credentials(spec.credentials, upstream_authenticated=spec.model.upstream_authenticated)
             model_session = _begin_model_evidence(runner, spec, stage, private_run_dir, binding)
-            _require_distinct_scored_model_instance(
-                binding.preflight_run_dir, spec, stage, model_session, binding
-            )
+            _require_distinct_scored_model_instance(binding.preflight_run_dir, spec, stage, model_session, binding)
             if _attestation_model_identity(attestation_path) != model_session.model_identity_sha256:
                 raise QualificationRuntimeFailure("runtime_model_identity_mismatch")
             lease = _direct_lease(spec, stage, private_run_dir, attestation_path, model_session, binding)
@@ -818,9 +808,7 @@ def supervise_qualification_runtime(
         else:
             if stage == "score-proxy":
                 preflight_attestation = _validate_existing_preflight_attestation(binding.preflight_run_dir, spec)
-                _validate_prior_outcome(
-                    binding.preflight_run_dir, "preflight", spec, preflight_attestation, binding
-                )
+                _validate_prior_outcome(binding.preflight_run_dir, "preflight", spec, preflight_attestation, binding)
                 _validate_prior_outcome(private_run_dir, "score-direct", spec, preflight_attestation, binding)
             _validate_credentials(spec.credentials, upstream_authenticated=spec.model.upstream_authenticated)
             model_session = _begin_model_evidence(runner, spec, stage, private_run_dir, binding)
@@ -830,9 +818,7 @@ def supervise_qualification_runtime(
             ):
                 raise QualificationRuntimeFailure("runtime_model_identity_mismatch")
             if stage == "score-proxy":
-                _require_distinct_scored_model_instance(
-                    private_run_dir, spec, stage, model_session, binding
-                )
+                _require_distinct_scored_model_instance(private_run_dir, spec, stage, model_session, binding)
             _assert_port_available(spec.proxy.host, spec.proxy.port, "proxy_port_unavailable")
             _assert_port_available(spec.observer.host, spec.observer.port, "observer_port_unavailable")
             instance = _instance_token(spec.manifest_sha256, stage)
@@ -905,9 +891,7 @@ def supervise_qualification_runtime(
                         raise
             if action_exit_code == 0:
                 if stage == "score-proxy" and (
-                    reconciliation_session is None
-                    or model_summary is None
-                    or proxy_reconciliation_sha256 is None
+                    reconciliation_session is None or model_summary is None or proxy_reconciliation_sha256 is None
                 ):
                     raise QualificationRuntimeFailure("runtime_reconciliation_invalid")
                 _require_complete_output(lease.output_ledger, stage, spec)
@@ -1034,9 +1018,11 @@ class QualificationCampaignStageRunner:
             return StageInspection("absent", None)
         reserved = _reserved_stage_paths(request.private_run_dir, request.stage, binding)
         if not (request.outcome_path.exists() or request.outcome_path.is_symlink()):
-            return StageInspection("partial", None) if any(
-                path.exists() or path.is_symlink() for path in reserved
-            ) else StageInspection("absent", None)
+            return (
+                StageInspection("partial", None)
+                if any(path.exists() or path.is_symlink() for path in reserved)
+                else StageInspection("absent", None)
+            )
         result = _inspect_durable_stage_outcome(request, spec, binding)
         return StageInspection("complete", result) if result is not None else StageInspection("partial", None)
 
@@ -1116,9 +1102,7 @@ def _model_readiness_state(
     raise QualificationRuntimeFailure("model_listener_probe_failed")
 
 
-def _reserved_stage_paths(
-    private_run_dir: Path, stage: RuntimeStage, binding: _StageBinding
-) -> tuple[Path, ...]:
+def _reserved_stage_paths(private_run_dir: Path, stage: RuntimeStage, binding: _StageBinding) -> tuple[Path, ...]:
     paths: list[Path] = [
         _outcome_path(private_run_dir, stage),
         _scored_ledger_path(private_run_dir, stage),
@@ -1139,13 +1123,16 @@ def _reserved_stage_paths(
             )
         )
     if stage == "score-proxy":
-        paths.append(_proxy_reconciliation_path(private_run_dir))
+        paths.extend(
+            (
+                _proxy_timing_ledger_path(private_run_dir, stage),
+                _proxy_reconciliation_path(private_run_dir),
+            )
+        )
     return tuple(paths)
 
 
-def _stage_attestation_path(
-    private_run_dir: Path, stage: RuntimeStage, binding: _StageBinding
-) -> Path:
+def _stage_attestation_path(private_run_dir: Path, stage: RuntimeStage, binding: _StageBinding) -> Path:
     return (
         _attestation_path(private_run_dir, stage)
         if stage != "score-direct"
@@ -1179,11 +1166,14 @@ def _inspect_durable_stage_outcome(
     try:
         attestation_path = _stage_attestation_path(request.private_run_dir, request.stage, binding)
         model_identity_sha256 = _attestation_model_identity(attestation_path)
-        evidence_stage = cast(Literal["preflight", "score-direct", "score-proxy"], {
-            "preflight": "preflight",
-            "score-direct": "score-direct",
-            "score-proxy": "score-proxy",
-        }[request.stage])
+        evidence_stage = cast(
+            Literal["preflight", "score-direct", "score-proxy"],
+            {
+                "preflight": "preflight",
+                "score-direct": "score-direct",
+                "score-proxy": "score-proxy",
+            }[request.stage],
+        )
         model_evidence = load_model_evidence(
             _model_evidence_path(request.private_run_dir, request.stage),
             expected_stage=evidence_stage,
@@ -1198,13 +1188,9 @@ def _inspect_durable_stage_outcome(
             model_evidence=_model_evidence_path(request.private_run_dir, request.stage),
             model_identity_sha256=model_identity_sha256,
             output_ledger=_scored_ledger_path(request.private_run_dir, request.stage),
-            expected_output_record_count=(
-                5 if request.stage == "preflight" else spec.benchmark.scenario_count
-            ),
+            expected_output_record_count=(5 if request.stage == "preflight" else spec.benchmark.scenario_count),
             proxy_reconciliation=(
-                _proxy_reconciliation_path(request.private_run_dir)
-                if request.stage == "score-proxy"
-                else None
+                _proxy_reconciliation_path(request.private_run_dir) if request.stage == "score-proxy" else None
             ),
             campaign_id_sha256=binding.campaign_id_sha256,
             slot_ordinal=binding.slot_ordinal,
@@ -2344,6 +2330,7 @@ def _proxy_lease(
         preflight_ledger=_scored_ledger_path(binding.preflight_run_dir, "preflight"),
         output_ledger=_scored_ledger_path(private_run_dir, stage),
         attestation_path=attestation_path,
+        proxy_timing_ledger=_proxy_timing_ledger_path(private_run_dir, stage) if stage == "score-proxy" else None,
     )
 
 
@@ -2390,9 +2377,7 @@ def _direct_lease(
     )
 
 
-def _model_evidence_contract(
-    spec: _RuntimeSpec, stage: RuntimeStage, binding: _StageBinding
-) -> ModelEvidenceContract:
+def _model_evidence_contract(spec: _RuntimeSpec, stage: RuntimeStage, binding: _StageBinding) -> ModelEvidenceContract:
     """Construct C1's private contract from the strict manifest without exposing it."""
 
     parsed = urlsplit(spec.model.upstream_url)
@@ -2593,9 +2578,7 @@ def _begin_proxy_reconciliation(
             slot_ordinal=binding.slot_ordinal,
             cache_lane=cache_lane,
             pair_index=binding.pair_index,
-            attestation_sha256=_private_file_sha256(
-                attestation_path, "runtime_reconciliation_invalid"
-            ),
+            attestation_sha256=_private_file_sha256(attestation_path, "runtime_reconciliation_invalid"),
         )
         return ProxyReconciliationSession.begin(
             identity,
@@ -2625,34 +2608,38 @@ def _complete_proxy_reconciliation(
     cache_lane = cast(Literal["cold", "warm-prefix"], binding.cache_lane)
     observer_path = _observer_ledger_path(private_run_dir, "score-proxy")
     request_path = _proxy_request_ledger_path(private_run_dir, "score-proxy")
+    timing_path = _proxy_timing_ledger_path(private_run_dir, "score-proxy")
     evidence_path = _model_evidence_path(private_run_dir, "score-proxy")
     try:
+        observer_records = read_model_boundary_observer_records(observer_path)
+        request_records = read_request_accounting_ledger(request_path)
+        timing_rows = read_timing_ledger(timing_path)
+        verify_timing_ledger_linkage(
+            timing_rows,
+            [request_accounting_record_payload(record) for record in request_records],
+            [record.to_dict() for record in observer_records],
+        )
         context = ReconciliationContext(
             run_manifest_sha256=spec.manifest_sha256,
             campaign_id_sha256=binding.campaign_id_sha256,
             slot_ordinal=binding.slot_ordinal,
             cache_lane=cache_lane,
             pair_index=binding.pair_index,
-            attestation_sha256=_private_file_sha256(
-                attestation_path, "runtime_reconciliation_invalid"
-            ),
-            model_evidence_sha256=_private_file_sha256(
-                evidence_path, "runtime_reconciliation_invalid"
-            ),
-            observer_ledger_sha256=_private_file_sha256(
-                observer_path, "runtime_reconciliation_invalid"
-            ),
-            request_ledger_sha256=_private_file_sha256(
-                request_path, "runtime_reconciliation_invalid"
-            ),
+            attestation_sha256=_private_file_sha256(attestation_path, "runtime_reconciliation_invalid"),
+            model_evidence_sha256=_private_file_sha256(evidence_path, "runtime_reconciliation_invalid"),
+            observer_ledger_sha256=_private_file_sha256(observer_path, "runtime_reconciliation_invalid"),
+            request_ledger_sha256=_private_file_sha256(request_path, "runtime_reconciliation_invalid"),
+            timing_ledger_sha256=_private_file_sha256(timing_path, "runtime_timing_ledger_invalid"),
         )
         result = session.complete(
             context,
-            read_model_boundary_observer_records(observer_path),
-            read_request_accounting_ledger(request_path),
+            observer_records,
+            request_records,
             model_summary,
             _proxy_reconciliation_path(private_run_dir),
         )
+    except TimingFailure:
+        raise QualificationRuntimeFailure("runtime_timing_ledger_invalid") from None
     except (ReconciliationFailure, QualificationRuntimeFailure) as error:
         raise QualificationRuntimeFailure(error.category) from None
     except PreflightFailure:
@@ -2815,16 +2802,18 @@ def _read_private_file(path: Path, category: str) -> bytes:
 def _atomic_write_no_clobber(path: Path, record: dict[str, Any]) -> None:
     if path.exists() or path.is_symlink():
         raise QualificationRuntimeFailure("runtime_evidence_exists")
-    payload = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    payload = (json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    descriptor: int | None = None
+    temporary: Path | None = None
     try:
         descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         temporary = Path(temporary_name)
         try:
             os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
+            _write_all(descriptor, payload)
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
             os.link(temporary, path)
             temporary.unlink()
             directory = os.open(path.parent, os.O_RDONLY)
@@ -2840,15 +2829,22 @@ def _atomic_write_no_clobber(path: Path, record: dict[str, Any]) -> None:
             raise
     except OSError as error:
         raise QualificationRuntimeFailure("runtime_evidence_write_failed") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
-def _validate_stage_evidence_absent(
-    private_run_dir: Path, stage: RuntimeStage, binding: _StageBinding
-) -> None:
-    if any(
-        path.exists() or path.is_symlink()
-        for path in _reserved_stage_paths(private_run_dir, stage, binding)
-    ):
+def _write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise OSError("private evidence partial write")
+        offset += written
+
+
+def _validate_stage_evidence_absent(private_run_dir: Path, stage: RuntimeStage, binding: _StageBinding) -> None:
+    if any(path.exists() or path.is_symlink() for path in _reserved_stage_paths(private_run_dir, stage, binding)):
         raise QualificationRuntimeFailure("runtime_evidence_exists")
 
 
@@ -3246,6 +3242,14 @@ def _proxy_request_ledger_path(private_run_dir: Path, stage: RuntimeStage) -> Pa
 
 def _proxy_reconciliation_path(private_run_dir: Path) -> Path:
     return private_run_dir / "scored-proxy-reconciliation.json"
+
+
+def _proxy_timing_ledger_path(private_run_dir: Path, stage: RuntimeStage) -> Path:
+    """Return the final sink-bound timing ledger for the scored proxy only."""
+
+    if stage != "score-proxy":
+        raise QualificationRuntimeFailure("runtime_stage_invalid")
+    return private_run_dir / "scored-proxy-timing.jsonl"
 
 
 def _direct_attempt_ledger_path(private_run_dir: Path, stage: RuntimeStage) -> Path | None:

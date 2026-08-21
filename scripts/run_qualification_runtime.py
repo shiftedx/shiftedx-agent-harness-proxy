@@ -104,6 +104,7 @@ def paired_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
             attestation_path,
         ) = _require_proxy_lease(lease)
         proxy_request_ledger = _require_proxy_request_ledger(lease)
+        proxy_timing_ledger = _require_proxy_timing_ledger(lease)
         argv = [
             *common,
             "--base-url",
@@ -117,6 +118,8 @@ def paired_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
             str(observer_ledger),
             "--proxy-request-ledger",
             str(proxy_request_ledger),
+            "--proxy-timing-ledger",
+            str(proxy_timing_ledger),
             "--preflight-ledger",
             str(lease.preflight_ledger),
             "--runtime-attestation",
@@ -267,6 +270,12 @@ def _require_proxy_request_ledger(lease: RuntimeLease) -> Path:
     if lease.proxy_request_ledger is None:
         raise ValueError("proxy lease is missing its request-accounting ledger")
     return lease.proxy_request_ledger
+
+
+def _require_proxy_timing_ledger(lease: RuntimeLease) -> Path:
+    if lease.proxy_timing_ledger is None:
+        raise ValueError("proxy lease is missing its timing ledger")
+    return lease.proxy_timing_ledger
 
 
 if __name__ == "__main__":
