@@ -264,8 +264,16 @@ class ChatService:
             issue = harness.terminal_issue(content)
             if issue is None:
                 if phase == "acquisition":
-                    phase = "finalization"
-                    continue
+                    return ChatResult(
+                        _without_reserved_projection_marker(response),
+                        _telemetry(
+                            started,
+                            harness,
+                            upstream_calls,
+                            rebuilt,
+                            policy_extensions_used=int(policy_extension_used),
+                        ),
+                    )
                 return ChatResult(
                     _without_reserved_projection_marker(response),
                     _telemetry(

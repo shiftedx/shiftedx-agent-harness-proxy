@@ -292,12 +292,35 @@ async def test_phase_split_builds_a_fresh_outbound_payload_for_each_attempt() ->
 
 
 @pytest.mark.asyncio
+async def test_phase_split_releases_a_valid_receipt_backed_acquisition_terminal_without_finalization() -> None:
+    upstream = ScriptedUpstream([completion(content='{"status":"done"}')])
+    payload = request(
+        [
+            {"role": "user", "content": "inspect"},
+            {"role": "assistant", "tool_calls": [call("old", "read_file", '{"path":"a.py"}')]},
+            {"role": "tool", "tool_call_id": "old", "content": "source"},
+        ]
+    )
+    payload["response_format"] = strict_schema()
+
+    result = await ChatService(
+        Settings(upstream_base_url="http://upstream/v1", upstream_tool_response_capability_mode="phase_split"),
+        upstream,
+    ).complete(payload, {})
+
+    assert result.body["choices"][0]["message"]["content"] == '{"status":"done"}'
+    assert result.telemetry.upstream_calls == 1
+    assert len(upstream.requests) == 1
+    assert "tools" in upstream.requests[0]
+    assert "response_format" not in upstream.requests[0]
+
+
+@pytest.mark.asyncio
 async def test_phase_split_keeps_receipt_free_and_invalid_terminals_in_acquisition_until_success() -> None:
     upstream = ScriptedUpstream(
         [
             completion(content="not json"),
             completion(content='{"status":"acquired"}'),
-            completion(content='{"status":"final"}'),
         ]
     )
     payload = request([{"role": "user", "content": "answer"}])
@@ -309,10 +332,10 @@ async def test_phase_split_keeps_receipt_free_and_invalid_terminals_in_acquisiti
         upstream,
     ).complete(payload, {}, policy_extensions_allowed=True)
 
-    assert all("response_format" not in sent and "tools" in sent for sent in upstream.requests[:2])
-    assert "response_format" in upstream.requests[2]
-    assert "tools" not in upstream.requests[2]
-    assert result.body["choices"][0]["message"]["content"] == '{"status":"final"}'
+    assert all("response_format" not in sent and "tools" in sent for sent in upstream.requests)
+    assert result.telemetry.upstream_calls == 2
+    assert result.telemetry.corrections == 1
+    assert result.body["choices"][0]["message"]["content"] == '{"status":"acquired"}'
 
 
 @pytest.mark.asyncio
