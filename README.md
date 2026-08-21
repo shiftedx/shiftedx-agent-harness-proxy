@@ -15,7 +15,8 @@ within fixed retry limits. It never executes tools or changes model weights.
 
 ## Stock MTPLX performance
 
-No MTPLX fork is required. The validated M4 Max 64 GiB profile used stock MTPLX `2.7.1`:
+No MTPLX fork is required. Latest supported: stock MTPLX `2.9.0`. The retained M4 Max
+64 GiB benchmark used `2.7.1`; its numbers are not yet a `2.9.0` performance claim:
 
 | Claim | Retained data |
 |---|---:|
@@ -25,9 +26,13 @@ No MTPLX fork is required. The validated M4 Max 64 GiB profile used stock MTPLX 
 | Remaining latency gap | Agentic p95 `170.5%` cold; `145.6%` warm (`125%` gate not passed) |
 
 ```bash
+python3 -m venv .venv-mtplx
+.venv-mtplx/bin/python -m pip install 'mtplx==2.9.0'
+
 MODEL=/path/to/qwen3.8-27b-aeon-nvidia-style-vision-mtplx
 SERVED_MODEL=your-openai-model-id
-mtplx quickstart --model "$MODEL" --model-id "$SERVED_MODEL" --host 127.0.0.1 --port 8000 \
+.venv-mtplx/bin/mtplx quickstart --model "$MODEL" --model-id "$SERVED_MODEL" \
+  --host 127.0.0.1 --port 8000 \
   --profile turbo --mtp --depth 3 --scheduler-mode serial --batching-preset latency \
   --mtp-batch-numerics throughput --tool-prompt-mode native --paged-kv-quantization off \
   --ssd-session-cache off --reasoning on --reasoning-effort medium --max-tokens 1024 \
