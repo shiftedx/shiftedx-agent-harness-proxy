@@ -759,6 +759,11 @@ def finalize_timing_evidence(
         for sequence, (capture, client, provisional_request) in enumerate(
             zip(captures, provisional, accounting, strict=True), 1
         ):
+            # Client and runner accounting states are independently captured;
+            # neither may silently disagree with the raw server terminal
+            # outcome that becomes the final request record.
+            if client["outcome"] != capture["outcome"] or provisional_request.outcome != capture["outcome"]:
+                raise TimingFailure("qualification_timing_ledger_invalid")
             selected = _provisional_observer_slice(client, observers, next_observer)
             next_observer += len(selected)
             raw_attempts = capture.get("attempts")

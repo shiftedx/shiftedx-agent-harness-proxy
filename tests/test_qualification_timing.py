@@ -8,12 +8,17 @@ from pathlib import Path
 
 import pytest
 
+from shiftedx_harness_proxy.qualification_reconciliation import (
+    RequestAccountingRecord,
+    write_request_accounting_ledger,
+)
 from shiftedx_harness_proxy.qualification_timing import (
     PrivateTimingSink,
     RequestTiming,
     TimingFailure,
     bind_capture_row,
     canonical_json,
+    finalize_timing_evidence,
     observer_slice_sha256,
     read_timing_capture_ledger,
     request_accounting_row_sha256,
@@ -225,6 +230,86 @@ def test_timing_ledger_accepts_exact_monotonic_nanosecond_partition(tmp_path: Pa
     write_timing_ledger(path, [row])
     assert read_timing_ledger(path) == (row,)
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize(
+    ("capture_outcome", "client_outcome", "accounting_outcome"),
+    [
+        ("succeeded", "failed", "succeeded"),
+        ("failed", "succeeded", "failed"),
+        ("cancelled", "cancelled", "deadline"),
+        ("deadline", "cancelled", "deadline"),
+    ],
+)
+def test_proxy_finalization_rejects_outcome_join_mismatch_without_final_artifacts(
+    tmp_path: Path, capture_outcome: str, client_outcome: str, accounting_outcome: str
+) -> None:
+    raw = tmp_path / "raw.jsonl"
+    provisional = tmp_path / "provisional.jsonl"
+    provisional_accounting = tmp_path / "provisional-accounting.jsonl"
+    final_timing = tmp_path / "final-timing.jsonl"
+    final_request = tmp_path / "final-request.jsonl"
+    failed = capture_outcome != "succeeded"
+    observer = _observer(status=500 if failed else 200)
+    capture = _capture(
+        attempts=[{**_capture_attempt(), "status": capture_outcome if failed else "succeeded"}],
+        outcome=capture_outcome,
+    )
+    raw.write_bytes(canonical_json(capture) + b"\n")
+    raw.chmod(0o600)
+    provisional.write_text(
+        json.dumps(
+            {
+                "pair_ordinal": 1,
+                "arm": "proxy",
+                "cache_lane": "cold",
+                "client_wall_ns": capture["downstream_wall_ns"],
+                "outcome": client_outcome,
+                "observer_sequence_start": 1,
+                "observer_sequence_end": 1,
+                "observer_record_count": 1,
+                "direct_attempt_wall_ns": [],
+                "downstream_request_sha256": "d" * 64,
+            },
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    provisional.chmod(0o600)
+    write_request_accounting_ledger(
+        provisional_accounting,
+        (
+            RequestAccountingRecord(
+                sequence=1,
+                outcome=accounting_outcome,  # type: ignore[arg-type]
+                local_projection=False,
+                attempt_sequence_start=1,
+                attempt_sequence_end=1,
+                attempt_count=1,
+                successful_attempt_count=0 if failed else 1,
+                phase_counts={"acquisition": 1, "finalization": 0},
+                retry_attempt_count=0,
+                blocked_duplicate_count=0,
+                blocked_stall_count=0,
+            ),
+        ),
+    )
+
+    with pytest.raises(TimingFailure, match="^qualification_timing_ledger_invalid$"):
+        finalize_timing_evidence(
+            arm="proxy",
+            cache_lane="cold",
+            provisional_client_path=provisional,
+            provisional_request_path=provisional_accounting,
+            final_request_path=final_request,
+            raw_capture_path=raw,
+            timing_path=final_timing,
+            observer_records=[observer],
+        )
+
+    assert not final_request.exists()
+    assert not final_timing.exists()
 
 
 @pytest.mark.parametrize(
