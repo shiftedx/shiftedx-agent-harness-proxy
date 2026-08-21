@@ -331,8 +331,10 @@ def test_client_failure_is_recorded_without_response_body_and_run_continues(monk
             str(direct_outcome),
             "--proxy-observer-ledger",
             str(tmp_path / "scored-observer.jsonl"),
-            "--proxy-request-ledger",
-            str(tmp_path / "scored-proxy-requests.jsonl"),
+                "--proxy-request-ledger",
+                str(tmp_path / "scored-proxy-requests.jsonl"),
+                "--proxy-provisional-request-ledger",
+                str(tmp_path / "scored-proxy-provisional.jsonl"),
         ],
     )
 
@@ -1682,6 +1684,110 @@ def test_private_api_key_reader_rejects_symlink_and_non_private_mode(monkeypatch
         runner._read_key(target)
 
 
+def test_provisional_client_timing_records_safe_matching_digests_and_terminal_outcomes(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    observer_path = tmp_path / "observer.jsonl"
+    direct_payload = runner.request_payload(scenario, model="private-model", proxy_policy=False)
+    proxy_payload = runner.request_payload(scenario, model="private-model", proxy_policy=True)
+    mismatched_payload = copy.deepcopy(proxy_payload)
+    mismatched_payload["top_k"] = 99
+
+    assert runner.downstream_request_sha256(direct_payload) == runner.downstream_request_sha256(proxy_payload)
+    assert runner.downstream_request_sha256(direct_payload) != runner.downstream_request_sha256(mismatched_payload)
+
+    planner = runner.PhasePlanner()
+
+    class Proxy:
+        def complete(self, payload, *, stream=False):
+            assert stream is False
+            observed = planner.plan(payload, phase="acquisition")
+            observed["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
+            _append_observer_record(runner, observer_path, observed, 1)
+            raise TimeoutError("private deadline")
+
+    clock = iter((100, 180))
+    monkeypatch.setattr(runner.time, "perf_counter_ns", lambda: next(clock))
+    ledger = runner.ProvisionalClientTimingLedger(cache_lane="warm-prefix")
+    client = runner.CompatibilityClient(
+        Proxy(),
+        arm="proxy",
+        scenario_order=[scenario.case_id],
+        proxy_policy=True,
+        observer=runner.ModelBoundaryObserverCursor(observer_path, [scenario.case_id]),
+        provisional_timing=ledger,
+    )
+
+    with pytest.raises(TimeoutError):
+        client.complete(proxy_payload)
+
+    assert ledger.records == (
+        runner.ProvisionalClientTimingRecord(
+            pair_ordinal=1,
+            arm="proxy",
+            cache_lane="warm-prefix",
+            client_wall_ns=80,
+            outcome="deadline",
+            observer_sequence_start=1,
+            observer_sequence_end=1,
+            observer_record_count=1,
+            downstream_request_sha256=runner.downstream_request_sha256(direct_payload),
+        ),
+    )
+    output = tmp_path / "provisional.jsonl"
+    runner.write_provisional_client_timing_ledger(output, ledger.records)
+    serialized = output.read_text(encoding="utf-8")
+    assert "private-model" not in serialized
+    assert "private deadline" not in serialized
+    assert "private prompt marker" not in serialized
+    assert output.stat().st_mode & 0o777 == 0o600
+    with pytest.raises(runner.ProvisionalTimingLedgerFailure, match="provisional_request_ledger_exists"):
+        runner.write_provisional_client_timing_ledger(output, ledger.records)
+
+
+def test_provisional_client_timing_records_success_failure_and_cancellation_in_invocation_order(monkeypatch):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    payload = runner._preflight_payload(scenario, model="model", proxy_policy=False, no_tools=True)
+    outcomes: list[object] = [
+        {"content": '{"status":"passed"}', "tool_calls": []},
+        ConnectionError("private transport"),
+        asyncio.CancelledError("private cancellation"),
+    ]
+
+    class Direct:
+        def complete(self, _payload, *, stream=False):
+            assert stream is False
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+    clock = iter((10, 20, 30, 50, 60, 90))
+    monkeypatch.setattr(runner.time, "perf_counter_ns", lambda: next(clock))
+    ledger = runner.ProvisionalClientTimingLedger(cache_lane="cold")
+    client = runner.CompatibilityClient(
+        Direct(),
+        arm="direct",
+        scenario_order=[scenario.case_id],
+        proxy_policy=False,
+        provisional_timing=ledger,
+    )
+
+    client.complete(payload)
+    with pytest.raises(ConnectionError):
+        client.complete(payload)
+    with pytest.raises(asyncio.CancelledError):
+        client.complete(payload)
+
+    assert [(record.pair_ordinal, record.outcome, record.client_wall_ns) for record in ledger.records] == [
+        (1, "succeeded", 10),
+        (2, "failed", 20),
+        (3, "cancelled", 30),
+    ]
+    assert all(record.observer_record_count == 0 for record in ledger.records)
+
+
 def test_scored_direct_run_writes_actual_attempt_ledger_atomically(monkeypatch, tmp_path):
     runner = load_runner(monkeypatch)
     source_commit = _source_commit()
@@ -1691,6 +1797,7 @@ def test_scored_direct_run_writes_actual_attempt_ledger_atomically(monkeypatch, 
     preflight_outcome, _direct_outcome = _write_passing_scored_prerequisites(tmp_path, preflight, preflight_attestation)
     output = tmp_path / "direct-live.jsonl"
     attempts = tmp_path / "direct-attempts.jsonl"
+    provisional = tmp_path / "direct-provisional.jsonl"
 
     class DirectClient:
         def __init__(self, *_args, **_kwargs):
@@ -1736,8 +1843,10 @@ def test_scored_direct_run_writes_actual_attempt_ledger_atomically(monkeypatch, 
             str(preflight_attestation),
             "--preflight-runtime-outcome",
             str(preflight_outcome),
-            "--direct-model-attempt-ledger",
-            str(attempts),
+                "--direct-model-attempt-ledger",
+                str(attempts),
+                "--direct-provisional-request-ledger",
+                str(provisional),
         ],
     )
 
@@ -1747,6 +1856,9 @@ def test_scored_direct_run_writes_actual_attempt_ledger_atomically(monkeypatch, 
     assert [record.sequence for record in records] == [1, 2]
     assert all(record.cache is not None for record in records)
     assert attempts.stat().st_mode & 0o777 == 0o600
+    provisional_rows = [json.loads(line) for line in provisional.read_text(encoding="utf-8").splitlines()]
+    assert [row["pair_ordinal"] for row in provisional_rows] == [1, 2]
+    assert all(row["outcome"] == "succeeded" for row in provisional_rows)
 
 
 def _cache_response(*, content="", tool_calls=None, bypass=False):
@@ -2779,6 +2891,7 @@ def test_scored_proxy_rows_use_actual_observer_fingerprints_and_failures_keep_sa
     preflight = tmp_path / "preflight.jsonl"
     observer_path = tmp_path / "scored-observer.jsonl"
     request_path = tmp_path / "scored-proxy-requests.jsonl"
+    provisional_path = tmp_path / "scored-proxy-provisional.jsonl"
     output = tmp_path / "scored.jsonl"
     preflight_attestation = _write_passing_preflight(runner, preflight, source_commit, image_digest)
     preflight_outcome, direct_outcome = _write_passing_scored_prerequisites(tmp_path, preflight, preflight_attestation)
@@ -2855,8 +2968,10 @@ def test_scored_proxy_rows_use_actual_observer_fingerprints_and_failures_keep_sa
             str(direct_outcome),
             "--proxy-observer-ledger",
             str(observer_path),
-            "--proxy-request-ledger",
-            str(request_path),
+                "--proxy-request-ledger",
+                str(request_path),
+                "--proxy-provisional-request-ledger",
+                str(provisional_path),
         ],
     )
 
@@ -2879,6 +2994,12 @@ def test_scored_proxy_rows_use_actual_observer_fingerprints_and_failures_keep_sa
         (1, 1),
         (2, 2),
     ]
+    provisional_rows = [json.loads(line) for line in provisional_path.read_text(encoding="utf-8").splitlines()]
+    assert [row["pair_ordinal"] for row in provisional_rows] == [1, 2]
+    assert [(row["observer_sequence_start"], row["observer_record_count"]) for row in provisional_rows] == [
+        (1, 1),
+        (2, 1),
+    ]
 
 
 def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_records(monkeypatch, tmp_path):
@@ -2889,6 +3010,7 @@ def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_re
     observer_path = tmp_path / "scored-observer.jsonl"
     output = tmp_path / "scored.jsonl"
     request_path = tmp_path / "scored-proxy-requests.jsonl"
+    provisional_path = tmp_path / "scored-proxy-provisional.jsonl"
     preflight_attestation = _write_passing_preflight(runner, preflight, source_commit, image_digest)
     preflight_outcome, direct_outcome = _write_passing_scored_prerequisites(tmp_path, preflight, preflight_attestation)
     runtime_attestation = _write_runtime_attestation(
@@ -2954,12 +3076,17 @@ def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_re
             str(direct_outcome),
             "--proxy-observer-ledger",
             str(observer_path),
-            "--proxy-request-ledger",
-            str(request_path),
+                "--proxy-request-ledger",
+                str(request_path),
+                "--proxy-provisional-request-ledger",
+                str(provisional_path),
         ],
     )
 
     runner.main()
+
+    provisional_rows = [json.loads(line) for line in provisional_path.read_text(encoding="utf-8").splitlines()]
+    assert all(row["observer_record_count"] == 0 for row in provisional_rows)
 
     rows = [json.loads(line) for line in output.read_text().splitlines()]
     assert [row["case_id"] for row in rows] == ["case-1", "case-2"]
