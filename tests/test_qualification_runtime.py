@@ -37,15 +37,12 @@ from shiftedx_harness_proxy.qualification_contract import (
 from shiftedx_harness_proxy.qualification_model_evidence import model_endpoint_contract_hashes
 from shiftedx_harness_proxy.qualification_reconciliation import (
     RequestAccountingRecord,
-    request_accounting_record_payload,
     write_request_accounting_ledger,
 )
 from shiftedx_harness_proxy.qualification_runtime import RuntimeLease
 from shiftedx_harness_proxy.qualification_timing import (
-    bind_capture_row,
     unavailable,
     unavailable_transport,
-    write_timing_ledger,
 )
 
 
@@ -1280,10 +1277,16 @@ def _write_complete_ledger(lease: RuntimeLease) -> int:
     if lease.direct_model_attempt_ledger is not None:
         lease.direct_model_attempt_ledger.write_text("", encoding="utf-8")
         lease.direct_model_attempt_ledger.chmod(0o600)
-    if lease.proxy_request_ledger is not None:
+    if lease.proxy_request_accounting_provisional_ledger is not None:
+        write_request_accounting_ledger(lease.proxy_request_accounting_provisional_ledger, ())
+    elif lease.proxy_request_ledger is not None:
         write_request_accounting_ledger(lease.proxy_request_ledger, ())
-    if lease.proxy_timing_ledger is not None:
-        write_timing_ledger(lease.proxy_timing_ledger, [])
+    if lease.direct_provisional_request_ledger is not None:
+        lease.direct_provisional_request_ledger.write_text("", encoding="utf-8")
+        lease.direct_provisional_request_ledger.chmod(0o600)
+    if lease.proxy_provisional_request_ledger is not None:
+        lease.proxy_provisional_request_ledger.write_text("", encoding="utf-8")
+        lease.proxy_provisional_request_ledger.chmod(0o600)
     return 0
 
 
@@ -1302,8 +1305,10 @@ def _write_proxy_timing(
 ) -> None:
     """Write deterministic, exact test-only sink evidence through public seams."""
 
-    assert lease.proxy_timing_ledger is not None
-    rows: list[dict[str, object]] = []
+    assert lease.proxy_raw_timing_capture is not None
+    assert lease.proxy_provisional_request_ledger is not None
+    assert lease.proxy_request_accounting_provisional_ledger is not None
+    captures: list[dict[str, object]] = []
     observer_rows = tuple(record.to_dict() for record in observers)
     for request in requests:
         if request.attempt_count:
@@ -1353,19 +1358,31 @@ def _write_proxy_timing(
             "retry_attempt_count": request.retry_attempt_count,
             "phase_counts": phase_counts,
         }
-        rows.append(
-            bind_capture_row(
-                capture,
-                sequence=request.sequence,
-                pair_ordinal=request.sequence,
-                arm="proxy",
-                request_accounting_row=request_accounting_record_payload(request),
-                observer_rows=selected,
-                cache_lane="warm-prefix" if lease.cache_lane == "warm-prefix" else "cold",
-                intervention_class="projection" if request.local_projection else "pass_through",
-            )
-        )
-    write_timing_ledger(lease.proxy_timing_ledger, rows)
+        captures.append(capture)
+    lease.proxy_raw_timing_capture.write_text(
+        "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in captures), encoding="utf-8"
+    )
+    lease.proxy_raw_timing_capture.chmod(0o600)
+    write_request_accounting_ledger(lease.proxy_request_accounting_provisional_ledger, requests)
+    provisional = [
+        {
+            "pair_ordinal": request.sequence,
+            "arm": "proxy",
+            "cache_lane": "warm-prefix" if lease.cache_lane == "warm-prefix" else "cold",
+            "client_wall_ns": request.attempt_count + 1,
+            "outcome": request.outcome,
+            "observer_sequence_start": request.attempt_sequence_start,
+            "observer_sequence_end": request.attempt_sequence_end,
+            "observer_record_count": request.attempt_count,
+            "direct_attempt_wall_ns": [],
+            "downstream_request_sha256": "a" * 64,
+        }
+        for request in requests
+    ]
+    lease.proxy_provisional_request_ledger.write_text(
+        "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in provisional), encoding="utf-8"
+    )
+    lease.proxy_provisional_request_ledger.chmod(0o600)
 
 
 def _model_attempt(
@@ -1602,7 +1619,7 @@ def test_scored_treatment_needs_every_manifest_scenario_before_its_outcome_can_p
     )
 
     assert direct.status == "failed"
-    assert direct.failure_category == "runtime_output_ledger_incomplete"
+    assert direct.failure_category == "runtime_timing_ledger_invalid"
     assert direct.outcome_path is not None
     outcome = json.loads(direct.outcome_path.read_text(encoding="utf-8"))
     assert outcome["status"] == "failed"
@@ -3300,6 +3317,19 @@ def _lease(stage: str) -> RuntimeLease:
         output_ledger=Path(f"/private/{stage}.jsonl"),
         attestation_path=Path("/private/runtime-attestation.json"),
         proxy_timing_ledger=Path("/private/scored-proxy-timing.jsonl") if stage == "score-proxy" else None,
+        direct_timing_ledger=Path("/private/scored-direct-timing.jsonl") if stage == "score-direct" else None,
+        proxy_raw_timing_capture=Path("/private/scored-proxy-raw-timing-capture.jsonl")
+        if stage == "score-proxy"
+        else None,
+        proxy_provisional_request_ledger=Path("/private/scored-proxy-provisional-requests.jsonl")
+        if stage == "score-proxy"
+        else None,
+        direct_provisional_request_ledger=Path("/private/scored-direct-provisional-requests.jsonl")
+        if stage == "score-direct"
+        else None,
+        proxy_request_accounting_provisional_ledger=Path("/private/scored-proxy-provisional-accounting.jsonl")
+        if stage == "score-proxy"
+        else None,
     )
 
 
@@ -3318,7 +3348,10 @@ def test_thin_cli_derives_fixed_child_argv_without_secret_values(stage) -> None:
     assert argv[argv.index("--run-id") + 1] == "qualified-run"
     assert argv[argv.index("--cache-mode") + 1] == ("bypass" if stage == "preflight" else "warm-prefix")
     if stage == "score-proxy":
-        assert argv[argv.index("--proxy-timing-ledger") + 1] == "/private/scored-proxy-timing.jsonl"
+        assert (
+            argv[argv.index("--proxy-provisional-request-ledger") + 1]
+            == "/private/scored-proxy-provisional-requests.jsonl"
+        )
     assert "private-secret-value" not in serialized
     assert "--model" in argv
     if stage == "preflight":
@@ -3333,6 +3366,10 @@ def test_thin_cli_derives_fixed_child_argv_without_secret_values(stage) -> None:
         assert "--proxy-policy" not in argv
         assert "--base-url" in argv
         assert argv[argv.index("--direct-model-attempt-ledger") + 1] == ("/private/scored-direct-model-boundary.jsonl")
+        assert (
+            argv[argv.index("--direct-provisional-request-ledger") + 1]
+            == "/private/scored-direct-provisional-requests.jsonl"
+        )
         assert argv[argv.index("--variant") + 1] == "warm-prefix-pair2-direct-expanded"
         assert argv[argv.index("--preflight-runtime-outcome") + 1] == "/private/preflight-runtime-outcome.json"
     else:

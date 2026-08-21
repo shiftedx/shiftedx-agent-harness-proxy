@@ -96,7 +96,7 @@ def _request(
     components = 1 + 2 + 3 + 4 + other_measured_ns
     wall = components + sum(int(attempt["wall_ns"]) for attempt in selected)
     return {
-        "schema_version": "2.0",
+        "schema_version": "2.1",
         "sequence": sequence,
         "pair_ordinal": pair_ordinal,
         "arm": arm,
@@ -105,6 +105,8 @@ def _request(
         "outcome": outcome,
         "intervention_class": intervention,
         "cache_lane": cache_lane,
+        "client_wall_ns": wall,
+        "downstream_request_sha256": "c" * 64,
         "downstream_wall_ns": wall,
         "admission_wait_ns": 1,
         "body_read_ns": 2,

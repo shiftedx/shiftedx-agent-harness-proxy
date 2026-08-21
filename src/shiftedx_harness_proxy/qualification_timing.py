@@ -33,7 +33,7 @@ import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, TypeGuard
+from typing import Any, Literal, TypeGuard, cast
 
 _MAX_BYTES = 1024 * 1024
 _MAX_ROWS = 10_000
@@ -69,6 +69,8 @@ _REQUEST_KEYS = frozenset(
         "outcome",
         "intervention_class",
         "cache_lane",
+        "client_wall_ns",
+        "downstream_request_sha256",
         "downstream_wall_ns",
         "admission_wait_ns",
         "body_read_ns",
@@ -417,7 +419,7 @@ class RequestTiming:
         if known > wall:
             raise TimingFailure("qualification_timing_unexplained_delta")
         return {
-            "schema_version": "2.0",
+            "schema_version": "2.1",
             "record_type": "qualification_timing_capture",
             "sequence": 0,
             "outcome": selected_outcome,
@@ -561,6 +563,63 @@ def read_timing_ledger(path: Path) -> tuple[dict[str, object], ...]:
         raise TimingFailure("qualification_timing_ledger_invalid") from None
 
 
+def read_provisional_client_timing_ledger(path: Path) -> tuple[dict[str, object], ...]:
+    """Read strict payload-free runner timing samples; they are never final rows."""
+
+    keys = frozenset(
+        {
+            "pair_ordinal",
+            "arm",
+            "cache_lane",
+            "client_wall_ns",
+            "outcome",
+            "observer_sequence_start",
+            "observer_sequence_end",
+            "observer_record_count",
+            "direct_attempt_wall_ns",
+            "downstream_request_sha256",
+        }
+    )
+    try:
+        payload = _read_private(path)
+        if payload and not payload.endswith(b"\n"):
+            raise ValueError
+        rows = [json.loads(line, object_pairs_hook=_unique_object) for line in payload.splitlines()]
+        if len(rows) > _MAX_ROWS:
+            raise ValueError
+        for ordinal, row in enumerate(rows, 1):
+            if not isinstance(row, dict) or set(row) != keys or row.get("pair_ordinal") != ordinal:
+                raise ValueError
+            if row.get("arm") not in _ARMS or row.get("cache_lane") not in {"cold", "warm-prefix"}:
+                raise ValueError
+            if row.get("outcome") not in _OUTCOMES or not _nonnegative(row.get("client_wall_ns")):
+                raise ValueError
+            if not _sha256(row.get("downstream_request_sha256")):
+                raise ValueError
+            count, start, end = (
+                row.get("observer_record_count"),
+                row.get("observer_sequence_start"),
+                row.get("observer_sequence_end"),
+            )
+            walls = row.get("direct_attempt_wall_ns")
+            if (
+                not _nonnegative(count)
+                or not isinstance(walls, list)
+                or any(not _nonnegative(value) for value in walls)
+            ):
+                raise ValueError
+            if count:
+                if not _positive(start) or not _positive(end) or _integer(end) - _integer(start) + 1 != count:
+                    raise ValueError
+            elif start is not None or end is not None:
+                raise ValueError
+            if (row["arm"] == "direct" and len(walls) != count) or (row["arm"] == "proxy" and walls):
+                raise ValueError
+        return tuple(rows)
+    except (OSError, UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError):
+        raise TimingFailure("qualification_timing_ledger_invalid") from None
+
+
 def bind_capture_row(
     capture: Mapping[str, object],
     *,
@@ -571,6 +630,8 @@ def bind_capture_row(
     observer_rows: Sequence[Mapping[str, object]],
     cache_lane: str,
     intervention_class: str,
+    client_wall_ns: int | None = None,
+    downstream_request_sha256: str | None = None,
     model_time_avoided_ns: int | None = None,
     model_time_avoided_source: str = "not_observable",
 ) -> dict[str, object]:
@@ -607,7 +668,7 @@ def bind_capture_row(
             }
         )
     row = {
-        "schema_version": "2.0",
+        "schema_version": "2.1",
         "sequence": sequence,
         "pair_ordinal": pair_ordinal,
         "arm": arm,
@@ -616,6 +677,8 @@ def bind_capture_row(
         "outcome": raw["outcome"],
         "intervention_class": intervention_class,
         "cache_lane": cache_lane,
+        "client_wall_ns": raw["downstream_wall_ns"] if client_wall_ns is None else client_wall_ns,
+        "downstream_request_sha256": "0" * 64 if downstream_request_sha256 is None else downstream_request_sha256,
         "downstream_wall_ns": raw["downstream_wall_ns"],
         "admission_wait_ns": raw["admission_wait_ns"],
         "body_read_ns": raw["body_read_ns"],
@@ -637,6 +700,207 @@ def bind_capture_row(
     }
     _validate_row(row)
     return row
+
+
+def finalize_timing_evidence(
+    *,
+    arm: Literal["direct", "proxy"],
+    cache_lane: Literal["cold", "warm-prefix"],
+    provisional_client_path: Path,
+    timing_path: Path,
+    observer_records: Sequence[Mapping[str, object]],
+    raw_capture_path: Path | None = None,
+    provisional_request_path: Path | None = None,
+    final_request_path: Path | None = None,
+) -> tuple[dict[str, object], ...]:
+    """Turn independently-written runtime evidence into the final v2.1 ledger.
+
+    This intentionally performs the whole cross-ledger join at one supervisor
+    seam.  It never accepts reconciliation data, so the resulting hash graph
+    remains acyclic.
+    """
+
+    # Imports stay local: reconciliation deliberately does not depend on this
+    # timing module, while the supervisor can use both deep modules.
+    from .qualification_reconciliation import (
+        RequestAccountingRecord,
+        read_request_accounting_ledger,
+        request_accounting_record_payload,
+        write_request_accounting_ledger,
+    )
+
+    provisional = read_provisional_client_timing_ledger(provisional_client_path)
+    observers = tuple(dict(record) for record in observer_records)
+    if any(record.get("sequence") != index for index, record in enumerate(observers, 1)):
+        raise TimingFailure("qualification_timing_ledger_invalid")
+    if any(row["arm"] != arm or row["cache_lane"] != cache_lane for row in provisional):
+        raise TimingFailure("qualification_timing_ledger_invalid")
+
+    rows: list[dict[str, object]] = []
+    if arm == "proxy":
+        if raw_capture_path is None or provisional_request_path is None or final_request_path is None:
+            raise TimingFailure("qualification_timing_ledger_invalid")
+        captures = read_timing_capture_ledger(raw_capture_path)
+        accounting = read_request_accounting_ledger(provisional_request_path)
+        if len(captures) != len(provisional) or len(accounting) != len(provisional):
+            raise TimingFailure("qualification_timing_ledger_invalid")
+        final_requests: list[RequestAccountingRecord] = []
+        next_observer = 1
+        for sequence, (capture, client, provisional_request) in enumerate(
+            zip(captures, provisional, accounting, strict=True), 1
+        ):
+            selected = _provisional_observer_slice(client, observers, next_observer)
+            next_observer += len(selected)
+            raw_attempts = capture.get("attempts")
+            if not isinstance(raw_attempts, list) or len(raw_attempts) != len(selected):
+                raise TimingFailure("qualification_timing_ledger_invalid")
+            raw_phases = capture.get("phase_counts")
+            if not isinstance(raw_phases, Mapping) or raw_phases.get("terminal", 0) != 0:
+                raise TimingFailure("qualification_timing_ledger_invalid")
+            phase_counts = {name: _integer(raw_phases.get(name)) for name in ("acquisition", "finalization")}
+            final_request = RequestAccountingRecord(
+                sequence=sequence,
+                outcome=cast(Literal["succeeded", "failed", "cancelled", "deadline"], capture["outcome"]),
+                local_projection=bool(capture["local_projection"]),
+                attempt_sequence_start=_integer(selected[0]["sequence"]) if selected else None,
+                attempt_sequence_end=_integer(selected[-1]["sequence"]) if selected else None,
+                attempt_count=len(selected),
+                successful_attempt_count=sum(
+                    _observer_status(item.get("response")) == "succeeded" for item in selected
+                ),
+                phase_counts=phase_counts,
+                retry_attempt_count=_integer(capture["retry_attempt_count"]),
+                correction_count=_integer(capture["correction_count"]),
+                blocked_duplicate_count=_integer(capture["blocked_duplicate_count"]),
+                blocked_stall_count=_integer(capture["blocked_stall_count"]),
+                avoided_immediate_upstream_calls=_integer(capture["avoided_immediate_upstream_calls"]),
+            )
+            # A runner accounting row is only a cross-check; it cannot
+            # overwrite server-observed terminal/intervention counters.
+            if provisional_request.sequence != sequence:
+                raise TimingFailure("qualification_timing_ledger_invalid")
+            final_requests.append(final_request)
+            rows.append(
+                bind_capture_row(
+                    capture,
+                    sequence=sequence,
+                    pair_ordinal=_integer(client["pair_ordinal"]),
+                    arm="proxy",
+                    request_accounting_row=request_accounting_record_payload(final_request),
+                    observer_rows=selected,
+                    cache_lane=cache_lane,
+                    intervention_class=_intervention_class(capture),
+                    client_wall_ns=_integer(client["client_wall_ns"]),
+                    downstream_request_sha256=str(client["downstream_request_sha256"]),
+                )
+            )
+        if next_observer != len(observers) + 1:
+            raise TimingFailure("qualification_timing_ledger_invalid")
+        try:
+            write_request_accounting_ledger(final_request_path, final_requests)
+        except Exception as error:
+            raise TimingFailure("qualification_timing_ledger_invalid") from error
+    else:
+        next_observer = 1
+        for sequence, client in enumerate(provisional, 1):
+            selected = _provisional_observer_slice(client, observers, next_observer)
+            next_observer += len(selected)
+            walls = client["direct_attempt_wall_ns"]
+            assert isinstance(walls, list)
+            attempt_total = sum(_integer(value) for value in walls)
+            client_wall = _integer(client["client_wall_ns"])
+            if attempt_total > client_wall:
+                raise TimingFailure("qualification_timing_unexplained_delta")
+            phase_counts = {phase: 0 for phase in _PHASES}
+            attempts: list[dict[str, object]] = []
+            for ordinal, (observer, wall) in enumerate(zip(selected, walls, strict=True), 1):
+                phase = _observer_phase(observer.get("fields"))
+                phase_counts[phase] += 1
+                attempts.append(
+                    {
+                        "sequence": ordinal,
+                        "phase": phase,
+                        "status": _observer_status(observer.get("response")),
+                        "wall_ns": wall,
+                        "upstream_slot_wait_ns": 0,
+                        "transport": unavailable_transport(_integer(wall)),
+                        "ttft_ns": None,
+                        "ttft_availability": unavailable("non_streaming_response"),
+                        "model_time_ns": None,
+                        "model_time_availability": unavailable("model_boundary_unavailable"),
+                        "decode_ns": None,
+                        "decode_availability": unavailable("model_boundary_unavailable"),
+                    }
+                )
+            projection = not selected and client["outcome"] == "succeeded"
+            capture = {
+                "schema_version": "2.1",
+                "record_type": "qualification_timing_capture",
+                "sequence": sequence,
+                "outcome": client["outcome"],
+                "downstream_wall_ns": client_wall,
+                "admission_wait_ns": 0,
+                "body_read_ns": 0,
+                "policy_exclusive_ns": 0,
+                "response_finalize_ns": 0,
+                "other_measured_ns": client_wall - attempt_total,
+                "attempts": attempts,
+                "local_projection": projection,
+                "avoided_immediate_upstream_calls": 1 if projection else 0,
+                "correction_count": 0,
+                "blocked_duplicate_count": 0,
+                "blocked_stall_count": 0,
+                "retry_attempt_count": 0,
+                "phase_counts": phase_counts,
+            }
+            rows.append(
+                bind_capture_row(
+                    capture,
+                    sequence=sequence,
+                    pair_ordinal=_integer(client["pair_ordinal"]),
+                    arm="direct",
+                    request_accounting_row=client,
+                    observer_rows=selected,
+                    cache_lane=cache_lane,
+                    intervention_class="projection" if projection else "pass_through",
+                    client_wall_ns=client_wall,
+                    downstream_request_sha256=str(client["downstream_request_sha256"]),
+                )
+            )
+        if next_observer != len(observers) + 1:
+            raise TimingFailure("qualification_timing_ledger_invalid")
+    write_timing_ledger(timing_path, rows)
+    return tuple(rows)
+
+
+def _provisional_observer_slice(
+    client: Mapping[str, object], observers: Sequence[Mapping[str, object]], next_sequence: int
+) -> tuple[Mapping[str, object], ...]:
+    count = _integer(client["observer_record_count"])
+    if count == 0:
+        return ()
+    start, end = client.get("observer_sequence_start"), client.get("observer_sequence_end")
+    if start != next_sequence or end != next_sequence + count - 1:
+        raise TimingFailure("qualification_timing_ledger_invalid")
+    selected = tuple(observers[next_sequence - 1 : next_sequence - 1 + count])
+    if len(selected) != count or any(
+        item.get("sequence") != index for index, item in enumerate(selected, next_sequence)
+    ):
+        raise TimingFailure("qualification_timing_ledger_invalid")
+    return selected
+
+
+def _intervention_class(capture: Mapping[str, object]) -> str:
+    if capture.get("local_projection"):
+        return "projection"
+    if _integer(capture["blocked_duplicate_count"]) or _integer(capture["blocked_stall_count"]):
+        return "blocked_call_recovery"
+    if _integer(capture["correction_count"]):
+        return "correction"
+    phases = capture.get("phase_counts")
+    if isinstance(phases, Mapping) and _integer(phases.get("finalization", 0)):
+        return "phase_split"
+    return "bounded_failure" if capture.get("outcome") != "succeeded" else "pass_through"
 
 
 def verify_timing_ledger_linkage(
@@ -901,21 +1165,36 @@ def _matched_pass_through(
             "model_time_added_ns": _unavailable_value("direct_timing_ledger_unavailable"),
         }
     direct = {
-        (_integer(row["pair_ordinal"]), str(row["cache_lane"])): row
+        (
+            _integer(row["pair_ordinal"]),
+            str(row["cache_lane"]),
+            str(row["downstream_request_sha256"]),
+        ): row
         for row in direct_rows
         if row["arm"] == "direct" and row["intervention_class"] == "pass_through"
     }
     pairs = [
-        (row, direct[(_integer(row["pair_ordinal"]), str(row["cache_lane"]))])
+        (
+            row,
+            direct[
+                (
+                    _integer(row["pair_ordinal"]),
+                    str(row["cache_lane"]),
+                    str(row["downstream_request_sha256"]),
+                )
+            ],
+        )
         for row in proxy_rows
         if row["arm"] == "proxy"
         and row["intervention_class"] == "pass_through"
-        and (_integer(row["pair_ordinal"]), str(row["cache_lane"])) in direct
+        and (
+            _integer(row["pair_ordinal"]),
+            str(row["cache_lane"]),
+            str(row["downstream_request_sha256"]),
+        )
+        in direct
     ]
-    walls = [
-        _integer(proxy["downstream_wall_ns"]) - _integer(direct_row["downstream_wall_ns"])
-        for proxy, direct_row in pairs
-    ]
+    walls = [_integer(proxy["client_wall_ns"]) - _integer(direct_row["client_wall_ns"]) for proxy, direct_row in pairs]
     ttft: list[int] = []
     model: list[int] = []
     for proxy, direct_row in pairs:
@@ -1021,7 +1300,7 @@ def _validate_rows(rows: list[dict[str, object]]) -> None:
 def _validate_row(row: Mapping[str, object]) -> None:
     if (
         set(row) != _REQUEST_KEYS
-        or row.get("schema_version") != "2.0"
+        or row.get("schema_version") != "2.1"
         or row.get("arm") not in _ARMS
         or row.get("outcome") not in _OUTCOMES
         or row.get("intervention_class") not in _INTERVENTIONS
@@ -1031,10 +1310,12 @@ def _validate_row(row: Mapping[str, object]) -> None:
         or not _positive(row.get("pair_ordinal"))
         or not _sha256(row.get("request_accounting_row_sha256"))
         or not _sha256(row.get("observer_slice_sha256"))
+        or not _sha256(row.get("downstream_request_sha256"))
     ):
         raise TimingFailure("qualification_timing_ledger_invalid")
     number_keys = (
         "downstream_wall_ns",
+        "client_wall_ns",
         "admission_wait_ns",
         "body_read_ns",
         "policy_exclusive_ns",
@@ -1159,7 +1440,7 @@ def _validate_transport(value: object) -> None:
 def _validate_capture_row(row: Mapping[str, object]) -> None:
     if (
         set(row) != _CAPTURE_KEYS
-        or row.get("schema_version") != "2.0"
+        or row.get("schema_version") not in {"2.0", "2.1"}
         or row.get("record_type") != "qualification_timing_capture"
         or not _nonnegative(row.get("sequence"))
         or row.get("outcome") not in _OUTCOMES
@@ -1171,7 +1452,7 @@ def _validate_capture_row(row: Mapping[str, object]) -> None:
     ):
         raise TimingFailure("qualification_timing_ledger_invalid")
     final = {
-        "schema_version": "2.0",
+        "schema_version": "2.1",
         "sequence": 1,
         "pair_ordinal": 1,
         "arm": "proxy",
@@ -1180,6 +1461,8 @@ def _validate_capture_row(row: Mapping[str, object]) -> None:
         "outcome": row["outcome"],
         "intervention_class": "projection" if row.get("local_projection") else "pass_through",
         "cache_lane": "cold",
+        "client_wall_ns": row.get("downstream_wall_ns"),
+        "downstream_request_sha256": "0" * 64,
         "downstream_wall_ns": row.get("downstream_wall_ns"),
         "admission_wait_ns": row.get("admission_wait_ns"),
         "body_read_ns": row.get("body_read_ns"),

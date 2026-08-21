@@ -91,6 +91,8 @@ def paired_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
             str(lease.preflight_ledger.with_name("preflight-runtime-outcome.json")),
             "--direct-model-attempt-ledger",
             str(direct_attempt_ledger),
+            "--direct-provisional-request-ledger",
+            str(_require_direct_provisional_request_ledger(lease)),
         ]
         if lease.direct_api_key_file is not None:
             argv.extend(("--api-key-file", str(lease.direct_api_key_file)))
@@ -103,8 +105,7 @@ def paired_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
             observer_ledger,
             attestation_path,
         ) = _require_proxy_lease(lease)
-        proxy_request_ledger = _require_proxy_request_ledger(lease)
-        proxy_timing_ledger = _require_proxy_timing_ledger(lease)
+        proxy_request_ledger = _require_proxy_request_accounting_provisional_ledger(lease)
         argv = [
             *common,
             "--base-url",
@@ -118,8 +119,8 @@ def paired_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
             str(observer_ledger),
             "--proxy-request-ledger",
             str(proxy_request_ledger),
-            "--proxy-timing-ledger",
-            str(proxy_timing_ledger),
+            "--proxy-provisional-request-ledger",
+            str(_require_proxy_provisional_request_ledger(lease)),
             "--preflight-ledger",
             str(lease.preflight_ledger),
             "--runtime-attestation",
@@ -272,10 +273,22 @@ def _require_proxy_request_ledger(lease: RuntimeLease) -> Path:
     return lease.proxy_request_ledger
 
 
-def _require_proxy_timing_ledger(lease: RuntimeLease) -> Path:
-    if lease.proxy_timing_ledger is None:
-        raise ValueError("proxy lease is missing its timing ledger")
-    return lease.proxy_timing_ledger
+def _require_proxy_provisional_request_ledger(lease: RuntimeLease) -> Path:
+    if lease.proxy_provisional_request_ledger is None:
+        raise ValueError("proxy lease is missing its provisional request ledger")
+    return lease.proxy_provisional_request_ledger
+
+
+def _require_direct_provisional_request_ledger(lease: RuntimeLease) -> Path:
+    if lease.direct_provisional_request_ledger is None:
+        raise ValueError("direct lease is missing its provisional request ledger")
+    return lease.direct_provisional_request_ledger
+
+
+def _require_proxy_request_accounting_provisional_ledger(lease: RuntimeLease) -> Path:
+    if lease.proxy_request_accounting_provisional_ledger is None:
+        raise ValueError("proxy lease is missing its provisional accounting ledger")
+    return lease.proxy_request_accounting_provisional_ledger
 
 
 if __name__ == "__main__":
