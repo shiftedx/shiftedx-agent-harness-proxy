@@ -10,7 +10,10 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .projection import ProjectionDecision
 
 HARNESS_PROFILE = "shiftedx-harness-v1"
 HARNESS_SYSTEM_SUFFIX = (
@@ -184,35 +187,28 @@ class AgentHarness:
     open_failures: dict[str, int] = field(default_factory=dict)
     investigations_since_failed_verification: int = 0
 
-    def project_final(self, name: str, result: str) -> str | None:
-        if (
-            self.open_failures
-            or self.pending_verification
-            or not self.receipts
-            or self.receipts[-1].status != "success"
-        ):
-            return None
-        if name in self.roles.verification and self.required_json_keys == ("status", "tests"):
-            match = re.fullmatch(r"\s*(\d+)\s+passed\s*", result, re.IGNORECASE)
-            if match is not None:
-                return json.dumps(
-                    {"status": "passed", "tests": int(match.group(1))}, separators=(",", ":")
-                )
-        try:
-            value = json.loads(result)
-        except (json.JSONDecodeError, TypeError):
-            return None
-        if not isinstance(value, dict) or self.required_json_keys is None:
-            return None
-        if not set(self.required_json_keys).issubset(value):
-            return None
-        projected = {key: value[key] for key in self.required_json_keys}
-        content = json.dumps(projected, separators=(",", ":"))
-        return (
-            None
-            if bare_json_issue(content, self.required_json_keys, self.required_json_types)
-            else content
+    def projection_decision(
+        self,
+        name: str,
+        result: str,
+        *,
+        transcript_degraded: bool = False,
+        blocked_unresolved_action: bool = False,
+    ) -> ProjectionDecision:
+        """Evaluate Local Projection without changing harness state."""
+        from .projection import decide_local_projection
+
+        return decide_local_projection(
+            self,
+            name,
+            result,
+            transcript_degraded=transcript_degraded,
+            blocked_unresolved_action=blocked_unresolved_action,
         )
+
+    def project_final(self, name: str, result: str) -> str | None:
+        decision = self.projection_decision(name, result)
+        return decision.candidate.content() if decision.eligible and decision.candidate is not None else None
 
     def duplicate(self, name: str, arguments: dict[str, Any]) -> Receipt | None:
         signature = canonical_signature(name, arguments)

@@ -647,16 +647,78 @@ def _rejected_results(calls: list[Any], harness: AgentHarness) -> dict[int, str]
 
 
 def _project_latest_if_current(messages: Any, rebuilt: Reconstruction) -> str | None:
-    if (
-        not isinstance(messages, list)
-        or not messages
-        or not isinstance(messages[-1], dict)
-        or messages[-1].get("role") != "tool"
-        or rebuilt.latest_tool is None
-        or rebuilt.latest_result is None
-    ):
+    latest = _latest_exact_paired_tool_result(messages)
+    if latest is None or rebuilt.latest_tool is None or rebuilt.latest_result is None:
         return None
-    return rebuilt.harness.project_final(rebuilt.latest_tool, rebuilt.latest_result)
+    name, result = latest
+    if (name, result) != (rebuilt.latest_tool, rebuilt.latest_result):
+        return None
+    decision = rebuilt.harness.projection_decision(
+        name,
+        result,
+        transcript_degraded=rebuilt.degraded,
+        blocked_unresolved_action=_has_blocked_unresolved_action(messages),
+    )
+    return decision.candidate.content() if decision.eligible and decision.candidate is not None else None
+
+
+def _latest_exact_paired_tool_result(messages: Any) -> tuple[str, str] | None:
+    """Accept only a final string tool result paired to a visible preceding call."""
+    if not isinstance(messages, list) or not messages or not isinstance(messages[-1], dict):
+        return None
+    final = messages[-1]
+    if final.get("role") != "tool" or not isinstance(final.get("content"), str):
+        return None
+    pending: dict[str, str] = {}
+    for message in messages[:-1]:
+        if not isinstance(message, dict):
+            return None
+        if message.get("role") == "assistant":
+            calls = message.get("tool_calls") or []
+            if not isinstance(calls, list):
+                return None
+            for call in calls:
+                if not isinstance(call, dict):
+                    return None
+                call_id = call.get("id")
+                function = call.get("function")
+                name = function.get("name") if isinstance(function, dict) else None
+                if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or call_id in pending:
+                    return None
+                pending[call_id] = name
+        elif message.get("role") == "tool":
+            call_id = message.get("tool_call_id")
+            if not isinstance(call_id, str) or call_id not in pending:
+                return None
+            pending.pop(call_id)
+    call_id = final.get("tool_call_id")
+    if not isinstance(call_id, str) or call_id not in pending:
+        return None
+    return pending[call_id], final["content"]
+
+
+def _has_blocked_unresolved_action(messages: Any) -> bool:
+    if not isinstance(messages, list):
+        return True
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        try:
+            value = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value.get("shiftedx_harness") in {
+            "duplicate_call_blocked",
+            "stalled_investigation_blocked",
+            "invalid_tool_call",
+            "invalid_tool_arguments",
+            "response_withheld_due_to_blocked_sibling",
+        }:
+            return True
+    return False
 
 
 def _projected_response(model: str, content: str) -> JsonObject:

@@ -614,6 +614,53 @@ async def test_complete_typed_latest_receipt_projects_without_upstream_call() ->
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [
+            {"role": "user", "content": "report"},
+            {"role": "assistant", "tool_calls": [call("old", "read_file", '{"path":"a.py"}')]},
+            {"role": "tool", "tool_call_id": "old", "content": '{"status":"nominal"}'},
+            {"role": "user", "content": "continue"},
+        ],
+        [
+            {"role": "user", "content": "report"},
+            {"role": "assistant", "tool_calls": [call("old", "read_file", '{"path":"a.py"}')]},
+            {"role": "tool", "tool_call_id": "orphan", "content": '{"status":"nominal"}'},
+        ],
+        [
+            {"role": "user", "content": "report"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    call("first", "read_file", '{"path":"a.py"}'),
+                    call("withheld", "read_file", '{"path":"b.py"}'),
+                ],
+            },
+            {"role": "tool", "tool_call_id": "first", "content": '{"status":"nominal"}'},
+        ],
+        [
+            {"role": "user", "content": "report"},
+            {"role": "assistant", "tool_calls": [call("verify", "run_tests", "{}")]},
+            {"role": "tool", "tool_call_id": "verify", "content": "2 passed"},
+            {"role": "assistant", "tool_calls": [call("mutate", "apply_patch", "{}")]},
+            {"role": "tool", "tool_call_id": "mutate", "content": "ok"},
+        ],
+    ],
+)
+async def test_only_the_exact_current_paired_receipt_can_project(messages: list[dict[str, Any]]) -> None:
+    upstream = ScriptedUpstream([completion(calls=[call("upstream", "run_tests", "{}")])])
+    payload = request(messages)
+    payload["response_format"] = strict_schema()
+
+    result = await ChatService(Settings(upstream_base_url="http://upstream/v1"), upstream).complete(payload, {})
+
+    assert result.telemetry.receipt_projections == 0
+    assert result.telemetry.upstream_calls == 1
+    assert upstream.requests
+
+
+@pytest.mark.asyncio
 async def test_blocked_parallel_sibling_is_withheld_then_can_be_reissued_unchanged() -> None:
     first_allowed = call("allowed-first", "read_file", '{"path":"b.py"}')
     blocked = call("blocked", "read_file", '{"path":"a.py"}')
