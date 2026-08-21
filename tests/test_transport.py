@@ -4,6 +4,7 @@ from pydantic import SecretStr
 
 from shiftedx_harness_proxy.config import Settings
 from shiftedx_harness_proxy.errors import UpstreamFailure, UpstreamTimeout
+from shiftedx_harness_proxy.provider_capabilities import COMBINED_TOOL_TERMINAL_CONTRACT_ID
 from shiftedx_harness_proxy.transport import HttpxUpstream
 
 
@@ -31,6 +32,63 @@ async def test_malformed_upstream_json_is_rejected() -> None:
     with pytest.raises(UpstreamFailure) as raised:
         await upstream.chat({"messages": []}, {})
     assert raised.value.code == "upstream_malformed_json"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_combined_capability_probe_is_bounded_and_does_not_forward_request_headers() -> None:
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured.update(request.headers)
+        return httpx.Response(
+            200,
+            json={
+                "features": {
+                    "combined_tool_terminal_schema": {
+                        "supported": True,
+                        "contract_id": COMBINED_TOOL_TERMINAL_CONTRACT_ID,
+                    }
+                }
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    upstream = HttpxUpstream(Settings(upstream_base_url="http://upstream/v1"), client)
+
+    assert await upstream.combined_tool_terminal_schema_supported()
+    assert captured["path"] == "/v1/mtplx/app/capabilities"
+    assert "x-request-id" not in captured
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "document",
+    [
+        {},
+        {"features": {"combined_tool_terminal_schema": {"supported": False}}},
+        {
+            "features": {
+                "combined_tool_terminal_schema": {
+                    "supported": True,
+                    "contract_id": "native_tool_or_strict_json_schema:v2",
+                }
+            }
+        },
+        {"features": {"combined_tool_terminal_schema": []}},
+    ],
+)
+async def test_combined_capability_probe_fails_closed_for_unusable_documents(
+    document: dict[str, object],
+) -> None:
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=document))
+    )
+    upstream = HttpxUpstream(Settings(upstream_base_url="http://upstream/v1"), client)
+
+    assert not await upstream.combined_tool_terminal_schema_supported()
     await client.aclose()
 
 

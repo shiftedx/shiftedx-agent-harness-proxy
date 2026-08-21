@@ -18,7 +18,13 @@ from .config import Settings, configured_roles
 from .core import HARNESS_SYSTEM_SUFFIX, AgentHarness, bare_json_issue, normalize_bare_json
 from .errors import ProxyError, UpstreamFailure
 from .projection_accounting import LOCAL_PROJECTION_EXTENSION, local_projection_accounting
-from .provider_capabilities import CapabilityPhase, outbound_payload, requires_phase_split, upstream_phase
+from .provider_capabilities import (
+    CapabilityPhase,
+    outbound_payload,
+    requires_combined_capability,
+    requires_phase_split,
+    upstream_phase,
+)
 from .transcript import (
     PolicyAnnotationError,
     Reconstruction,
@@ -141,6 +147,17 @@ class ChatService:
             has_response_format="response_format" in forwarded,
             strict_schema_supported=contract.strict_primitive_object,
         )
+        use_combined = requires_combined_capability(
+            self.settings.upstream_tool_response_capability_mode,
+            has_tools=bool(tools),
+            has_response_format="response_format" in forwarded,
+        )
+        if use_combined and not await self.upstream.combined_tool_terminal_schema_supported():
+            raise ProxyError(
+                503,
+                "upstream_combined_capability_unavailable",
+                "The configured upstream combined capability is unavailable.",
+            )
         if not harness_enabled:
             if use_phase_split:
                 return await self._complete_phase_split_without_harness(

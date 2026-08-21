@@ -205,9 +205,18 @@ class BoundedUpstream:
         async with self._admission.upstream_slot():
             return await self._upstream.models(request_headers)
 
+    async def combined_tool_terminal_schema_supported(self) -> bool:
+        async with self._admission.upstream_slot():
+            return await self._upstream.combined_tool_terminal_schema_supported()
+
     async def ready(self) -> bool:
         async with self._admission.upstream_slot():
-            return await self._upstream.ready()
+            upstream_ready = await self._upstream.ready()
+        if not upstream_ready:
+            return False
+        if self._admission.settings.upstream_tool_response_capability_mode == "combined_v1":
+            return await self.combined_tool_terminal_schema_supported()
+        return True
 
     async def close(self) -> None:
         await self._upstream.close()

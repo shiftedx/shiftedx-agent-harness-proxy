@@ -28,11 +28,25 @@ class EchoUpstream:
     async def models(self, request_headers: dict[str, str]) -> dict[str, Any]:
         return {"object": "list", "data": [{"id": "model", "object": "model"}]}
 
+    async def combined_tool_terminal_schema_supported(self) -> bool:
+        return False
+
     async def ready(self) -> bool:
         return True
 
     async def close(self) -> None:
         return None
+
+
+class CombinedCapabilityUpstream(EchoUpstream):
+    def __init__(self, *, supported: bool) -> None:
+        super().__init__()
+        self.supported = supported
+        self.capability_probes = 0
+
+    async def combined_tool_terminal_schema_supported(self) -> bool:
+        self.capability_probes += 1
+        return self.supported
 
 
 class PhaseSplitUpstream(EchoUpstream):
@@ -77,6 +91,30 @@ class ObjectFinalizationUpstream(EchoUpstream):
         self.requests.append(payload)
         content: Any = "acquisition terminal" if "tools" in payload else {"status": "done"}
         return {"id": "chatcmpl", "choices": [{"message": {"role": "assistant", "content": content}}]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("supported", [True, False])
+async def test_combined_mode_readiness_requires_exact_capability_support(supported: bool) -> None:
+    upstream = CombinedCapabilityUpstream(supported=supported)
+    app = create_app(
+        Settings(
+            upstream_base_url="http://upstream/v1",
+            upstream_tool_response_capability_mode="combined_v1",
+        ),
+        upstream,
+    )
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
+            response = await client.get("/readyz")
+
+    assert response.status_code == (200 if supported else 503)
+    assert upstream.capability_probes == 1
+    if supported:
+        assert response.json() == {"status": "ready"}
+    else:
+        assert response.json()["error"]["code"] == "upstream_not_ready"
 
 
 @pytest.mark.asyncio

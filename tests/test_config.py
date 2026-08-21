@@ -89,6 +89,13 @@ def test_tool_response_capability_mode_is_process_fixed_and_rejects_invalid_valu
         ).upstream_tool_response_capability_mode
         == "phase_split"
     )
+    assert (
+        Settings(
+            upstream_base_url="http://model/v1",
+            upstream_tool_response_capability_mode="combined_v1",
+        ).upstream_tool_response_capability_mode
+        == "combined_v1"
+    )
     with pytest.raises(ValidationError):
         Settings(
             upstream_base_url="http://model/v1",

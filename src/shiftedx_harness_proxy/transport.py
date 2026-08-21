@@ -10,6 +10,7 @@ import httpx
 
 from .config import Settings
 from .errors import UpstreamFailure, UpstreamTimeout
+from .provider_capabilities import combined_tool_terminal_schema_supported
 
 JsonObject = dict[str, Any]
 FORWARDED_REQUEST_HEADERS = frozenset({"x-request-id"})
@@ -67,6 +68,8 @@ class Upstream(Protocol):
     async def chat(self, payload: JsonObject, request_headers: dict[str, str]) -> JsonObject: ...
 
     async def models(self, request_headers: dict[str, str]) -> JsonObject: ...
+
+    async def combined_tool_terminal_schema_supported(self) -> bool: ...
 
     async def ready(self) -> bool: ...
 
@@ -131,6 +134,14 @@ class HttpxUpstream:
 
     async def models(self, request_headers: dict[str, str]) -> JsonObject:
         return await self._request("GET", "models", headers=self._headers(request_headers))
+
+    async def combined_tool_terminal_schema_supported(self) -> bool:
+        """Probe the non-public upstream capability document without exposing it downstream."""
+        try:
+            document = await self._request("GET", "mtplx/app/capabilities", headers=self._headers({}))
+        except (UpstreamFailure, UpstreamTimeout):
+            return False
+        return combined_tool_terminal_schema_supported(document)
 
     async def ready(self) -> bool:
         try:

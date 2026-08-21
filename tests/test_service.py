@@ -59,6 +59,9 @@ class ScriptedUpstream:
     async def models(self, request_headers: dict[str, str]) -> dict[str, Any]:
         return {"object": "list", "data": []}
 
+    async def combined_tool_terminal_schema_supported(self) -> bool:
+        return False
+
     async def ready(self) -> bool:
         return True
 
@@ -92,6 +95,56 @@ def strict_schema() -> dict[str, Any]:
             },
         },
     }
+
+
+class CombinedScriptedUpstream(ScriptedUpstream):
+    def __init__(self, responses: list[dict[str, Any]], *, supported: bool) -> None:
+        super().__init__(responses)
+        self.supported = supported
+        self.capability_probes = 0
+
+    async def combined_tool_terminal_schema_supported(self) -> bool:
+        self.capability_probes += 1
+        return self.supported
+
+
+@pytest.mark.asyncio
+async def test_combined_mode_forwards_tools_and_strict_schema_together() -> None:
+    upstream = CombinedScriptedUpstream([completion(content='{"status":"done"}')], supported=True)
+    payload = request([{"role": "user", "content": "inspect"}])
+    payload["response_format"] = strict_schema()
+
+    await ChatService(
+        Settings(
+            upstream_base_url="http://upstream/v1",
+            upstream_tool_response_capability_mode="combined_v1",
+        ),
+        upstream,
+    ).complete(payload, {}, harness_enabled=False)
+
+    assert upstream.capability_probes == 1
+    assert upstream.requests[0]["tools"] == payload["tools"]
+    assert upstream.requests[0]["response_format"] == payload["response_format"]
+
+
+@pytest.mark.asyncio
+async def test_combined_mode_fails_closed_without_upstream_chat_when_capability_is_unavailable() -> None:
+    upstream = CombinedScriptedUpstream([completion(content='{"status":"done"}')], supported=False)
+    payload = request([{"role": "user", "content": "inspect"}])
+    payload["response_format"] = strict_schema()
+
+    with pytest.raises(ProxyError, match="combined capability") as raised:
+        await ChatService(
+            Settings(
+                upstream_base_url="http://upstream/v1",
+                upstream_tool_response_capability_mode="combined_v1",
+            ),
+            upstream,
+        ).complete(payload, {})
+
+    assert raised.value.code == "upstream_combined_capability_unavailable"
+    assert upstream.capability_probes == 1
+    assert upstream.requests == []
 
 
 @pytest.mark.asyncio
