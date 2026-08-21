@@ -7,6 +7,7 @@ from pydantic import SecretStr
 
 from shiftedx_harness_proxy.api import create_app
 from shiftedx_harness_proxy.config import Settings
+from shiftedx_harness_proxy.fast_path import InMemoryFastPathObserver
 from shiftedx_harness_proxy.qualification_timing import (
     PrivateTimingSink,
     read_timing_capture_ledger,
@@ -96,6 +97,45 @@ class ObjectFinalizationUpstream(EchoUpstream):
         self.requests.append(payload)
         content: Any = "acquisition terminal" if "tools" in payload else {"status": "done"}
         return {"id": "chatcmpl", "choices": [{"message": {"role": "assistant", "content": content}}]}
+
+
+def test_shadow_fast_path_requires_an_explicit_private_observer_at_app_construction() -> None:
+    with pytest.raises(ValueError, match="intervention_fast_path_shadow_observer_required"):
+        create_app(
+            Settings(upstream_base_url="http://upstream/v1", intervention_fast_path_mode="shadow"),
+            EchoUpstream(),
+        )
+
+
+def test_shadow_fast_path_from_process_environment_cannot_start_without_observer(monkeypatch) -> None:
+    monkeypatch.setenv("INTERVENTION_FAST_PATH_MODE", "shadow")
+    settings = Settings(upstream_base_url="http://upstream/v1")
+
+    with pytest.raises(ValueError, match="intervention_fast_path_shadow_observer_required"):
+        create_app(settings, EchoUpstream())
+
+
+@pytest.mark.asyncio
+async def test_injected_fast_path_observer_records_shadow_without_public_surface() -> None:
+    observer = InMemoryFastPathObserver()
+    app = create_app(
+        Settings(upstream_base_url="http://upstream/v1", intervention_fast_path_mode="shadow"),
+        EchoUpstream(),
+        fast_path_observer=observer,
+    )
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={"model": "model", "messages": [{"role": "user", "content": "hello"}]},
+            )
+
+    assert response.status_code == 200
+    assert len(observer.records) == 1
+    assert observer.records[0].equivalent is True
+    assert not [name for name in response.headers if "fast" in name.lower()]
+    assert "fast_path" not in response.text
 
 
 @pytest.mark.asyncio

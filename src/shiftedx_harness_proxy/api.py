@@ -24,6 +24,7 @@ from .admission import AdmissionController, BoundedUpstream
 from .cache_policy import ServerCacheNamespace
 from .config import Settings
 from .errors import ProxyError
+from .fast_path import FastPathObserver
 from .provider_capabilities import CapabilityPhase
 from .qualification_timing import (
     PrivateTimingSink,
@@ -164,12 +165,15 @@ def create_app(
     upstream: Upstream | None = None,
     *,
     timing_sink: PrivateTimingSink | None = None,
+    fast_path_observer: FastPathObserver | None = None,
 ) -> FastAPI:
+    if settings.intervention_fast_path_mode == "shadow" and fast_path_observer is None:
+        raise ValueError("intervention_fast_path_shadow_observer_required")
     base_transport = upstream or HttpxUpstream(settings)
     admission = AdmissionController(settings)
     counters = Counters()
     transport = BoundedUpstream(base_transport, admission, attempt_observer=counters.observe_upstream_attempt)
-    service = ChatService(settings, transport)
+    service = ChatService(settings, transport, fast_path_observer=fast_path_observer)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
