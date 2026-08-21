@@ -185,6 +185,16 @@ terminal validation, but no harness suffix, receipt policy, or synthetic tool-re
 Its native acquisition tool calls remain unchanged. In `passthrough` mode, opt-out behavior remains
 an ordinary single upstream request.
 
+`combined_v1` is an experimental, process-fixed mode for an upstream that natively supports tools
+and a strict terminal schema in one Chat Completions request. Before forwarding such a request, the
+proxy performs a bounded authenticated `GET /v1/mtplx/app/capabilities` probe and requires exactly
+the supported `native_tool_or_strict_json_schema:v1` contract. A missing, false, malformed, or
+drifted signal fails closed with `upstream_combined_capability_unavailable`; the capability document
+is not exposed downstream. This mode is not part of the qualified MTPLX contract until a versioned
+upstream artifact and model-backed preflight prove native tool calls, terminal schema enforcement,
+reasoning/tool transcript compatibility, cache behavior, and standard Chat Completions semantics.
+Qualification therefore continues to require `phase_split`.
+
 ### Intervention fast-path shadow mode
 
 `INTERVENTION_FAST_PATH_MODE=disabled` is the default. `shadow` is a process-fixed observation mode:
