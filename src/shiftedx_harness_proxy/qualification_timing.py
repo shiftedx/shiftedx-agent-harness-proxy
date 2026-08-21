@@ -1170,6 +1170,7 @@ def summarize_timing(path: Path, *, direct_timing_path: Path | None = None) -> d
             "model_time_ns": _available_sum(model_values, "model_boundary_unavailable"),
             "model_time_avoided_ns": _available_sum(avoided_values, "paired_counterfactual"),
         },
+        "transport": _transport_summary(attempts),
         "matched_pass_through": _matched_pass_through(rows, direct_rows),
         "slowest_buckets": [
             {
@@ -1186,6 +1187,45 @@ def summarize_timing(path: Path, *, direct_timing_path: Path | None = None) -> d
                 reverse=True,
             )
         ],
+    }
+
+
+def _transport_summary(attempts: Sequence[object]) -> dict[str, object]:
+    """Aggregate only trace observability; never infer a reused connection."""
+
+    reuse_counts = {"fresh_count": 0, "reused_count": 0, "unavailable_count": 0}
+    phases = (
+        "pool_wait_ns",
+        "connect_ns",
+        "request_write_ns",
+        "response_header_wait_ns",
+        "response_read_ns",
+        "other_ns",
+    )
+    phase_counts = {phase: {"measured_count": 0, "unavailable_count": 0} for phase in phases}
+    for attempt in attempts:
+        if not isinstance(attempt, Mapping):
+            raise TimingFailure("qualification_timing_ledger_invalid")
+        transport = attempt.get("transport")
+        if not isinstance(transport, Mapping):
+            raise TimingFailure("qualification_timing_ledger_invalid")
+        reuse = transport.get("connection_reuse")
+        if reuse == "fresh":
+            reuse_counts["fresh_count"] += 1
+        elif reuse == "reused":
+            reuse_counts["reused_count"] += 1
+        else:
+            reuse_counts["unavailable_count"] += 1
+        for phase in phases:
+            availability = transport.get(f"{phase.removesuffix('_ns')}_availability")
+            if isinstance(availability, Mapping) and availability.get("state") == "measured":
+                phase_counts[phase]["measured_count"] += 1
+            else:
+                phase_counts[phase]["unavailable_count"] += 1
+    return {
+        "attempt_count": len(attempts),
+        "connection_reuse": reuse_counts,
+        "phases": phase_counts,
     }
 
 

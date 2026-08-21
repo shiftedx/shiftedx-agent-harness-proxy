@@ -585,6 +585,53 @@ def test_summary_uses_floor_percentiles_and_allowlisted_aggregate_fields(tmp_pat
         assert forbidden not in serialized
 
 
+def test_summary_counts_transport_reuse_and_phase_availability_without_exposing_attempts(tmp_path: Path) -> None:
+    from shiftedx_harness_proxy.qualification_timing import summarize_timing
+
+    fresh = unavailable_transport(20)
+    fresh.update(
+        {
+            "connect_ns": 5,
+            "other_ns": 15,
+            "connect_availability": {"state": "measured", "source": "httpcore_1_0_9_trace"},
+            "connection_reuse": "fresh",
+            "connection_reuse_availability": {"state": "measured", "source": "httpcore_1_0_9_trace"},
+        }
+    )
+    reused = unavailable_transport(20)
+    reused.update(
+        {
+            "connection_reuse": "reused",
+            "connection_reuse_availability": {"state": "measured", "source": "httpcore_1_0_9_trace"},
+        }
+    )
+    rows = [
+        _request(sequence=1, pair_ordinal=1),
+        _request(sequence=2, pair_ordinal=2, attempts=[_attempt(request_sequence=2, wall_ns=30, slot_wait_ns=10)]),
+        _request(sequence=3, pair_ordinal=3, attempts=[_attempt(request_sequence=3, wall_ns=30, slot_wait_ns=10)]),
+    ]
+    rows[1]["attempts"][0]["transport"] = fresh
+    rows[2]["attempts"][0]["transport"] = reused
+    ledger = tmp_path / "timing.jsonl"
+    write_timing_ledger(ledger, rows)
+
+    transport = summarize_timing(ledger)["transport"]
+
+    assert transport == {
+        "attempt_count": 3,
+        "connection_reuse": {"fresh_count": 1, "reused_count": 1, "unavailable_count": 1},
+        "phases": {
+            "pool_wait_ns": {"measured_count": 0, "unavailable_count": 3},
+            "connect_ns": {"measured_count": 1, "unavailable_count": 2},
+            "request_write_ns": {"measured_count": 0, "unavailable_count": 3},
+            "response_header_wait_ns": {"measured_count": 0, "unavailable_count": 3},
+            "response_read_ns": {"measured_count": 0, "unavailable_count": 3},
+            "other_ns": {"measured_count": 3, "unavailable_count": 0},
+        },
+    }
+    assert "attempts" not in json.dumps(transport)
+
+
 def test_summary_attributes_tails_with_each_cache_lanes_own_frozen_p95(tmp_path: Path) -> None:
     from shiftedx_harness_proxy.qualification_timing import summarize_timing
 

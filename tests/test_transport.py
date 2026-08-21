@@ -5,7 +5,18 @@ from pydantic import SecretStr
 from shiftedx_harness_proxy.config import Settings
 from shiftedx_harness_proxy.errors import UpstreamFailure, UpstreamTimeout
 from shiftedx_harness_proxy.provider_capabilities import COMBINED_TOOL_TERMINAL_CONTRACT_ID
-from shiftedx_harness_proxy.transport import HttpxUpstream
+from shiftedx_harness_proxy.transport import UPSTREAM_KEEPALIVE_EXPIRY_SECONDS, HttpxUpstream
+
+
+@pytest.mark.asyncio
+async def test_owned_client_declares_pinned_keepalive_expiry() -> None:
+    upstream = HttpxUpstream(Settings(upstream_base_url="http://upstream/v1"))
+
+    pool = upstream.client._transport._pool  # type: ignore[attr-defined]
+    assert UPSTREAM_KEEPALIVE_EXPIRY_SECONDS == 5.0
+    assert pool._keepalive_expiry == UPSTREAM_KEEPALIVE_EXPIRY_SECONDS  # type: ignore[attr-defined]
+
+    await upstream.close()
 
 
 @pytest.mark.asyncio

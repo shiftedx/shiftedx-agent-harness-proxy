@@ -20,6 +20,9 @@ _SAFE_REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _SAFE_ACCOUNTING = re.compile(r"[0-9]{1,12}(?:ms|s|m|h)?")
 _SAFE_RETRY_AFTER = re.compile(r"[0-9]{1,4}")
 _MAX_RETRY_AFTER_SECONDS = 3600
+# This pins HTTPX 0.28.1's existing default in our own transport contract.
+# It is not tuned by the local mechanism micro-probe.
+UPSTREAM_KEEPALIVE_EXPIRY_SECONDS = 5.0
 
 
 def _safe_upstream_headers(headers: httpx.Headers, status_code: int) -> dict[str, str]:
@@ -86,6 +89,7 @@ class HttpxUpstream:
             limits=httpx.Limits(
                 max_connections=settings.concurrency_limit,
                 max_keepalive_connections=settings.concurrency_limit,
+                keepalive_expiry=UPSTREAM_KEEPALIVE_EXPIRY_SECONDS,
             ),
             follow_redirects=False,
             trust_env=False,
