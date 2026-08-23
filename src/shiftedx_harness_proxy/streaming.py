@@ -37,7 +37,9 @@ def prepare_replay_request(payload: JsonObject) -> tuple[JsonObject, ReplayOptio
     return buffered, ReplayOptions(include_usage=include_usage)
 
 
-def replay_completion(completion: JsonObject, options: ReplayOptions) -> bytes:
+def replay_completion(
+    completion: JsonObject, options: ReplayOptions, *, max_bytes: int | None = None
+) -> tuple[bytes, ...]:
     """Serialize one already-approved completion as standards-compatible SSE."""
     if not isinstance(completion.get("id"), str) or not completion["id"]:
         raise _malformed_completion()
@@ -46,7 +48,21 @@ def replay_completion(completion: JsonObject, options: ReplayOptions) -> bytes:
     choices = completion.get("choices")
     if not isinstance(choices, list) or not choices:
         raise _malformed_completion()
-    events: list[JsonObject] = []
+    chunks: list[bytes] = []
+    total_bytes = 0
+
+    def append(event: JsonObject) -> None:
+        nonlocal total_bytes
+        chunk = b"data: " + json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode() + b"\n\n"
+        total_bytes += len(chunk)
+        if max_bytes is not None and total_bytes > max_bytes:
+            raise ProxyError(
+                502,
+                "upstream_response_too_large",
+                "The upstream response exceeds the configured response size limit.",
+            )
+        chunks.append(chunk)
+
     for raw_choice in choices:
         if not isinstance(raw_choice, dict):
             raise _malformed_completion()
@@ -73,8 +89,8 @@ def replay_completion(completion: JsonObject, options: ReplayOptions) -> bytes:
             ]
         if message.get("refusal") is not None:
             delta["refusal"] = copy.deepcopy(message["refusal"])
-        events.append(_chunk(completion, index=index, delta=delta, finish_reason=None))
-        events.append(
+        append(_chunk(completion, index=index, delta=delta, finish_reason=None))
+        append(
             _chunk(
                 completion,
                 index=index,
@@ -86,12 +102,15 @@ def replay_completion(completion: JsonObject, options: ReplayOptions) -> bytes:
         usage_event = _chunk_base(completion)
         usage_event["choices"] = []
         usage_event["usage"] = copy.deepcopy(completion["usage"])
-        events.append(usage_event)
-    serialized = b"".join(
-        b"data: " + json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode() + b"\n\n"
-        for event in events
-    )
-    return serialized + b"data: [DONE]\n\n"
+        append(usage_event)
+    done = b"data: [DONE]\n\n"
+    if max_bytes is not None and total_bytes + len(done) > max_bytes:
+        raise ProxyError(
+            502,
+            "upstream_response_too_large",
+            "The upstream response exceeds the configured response size limit.",
+        )
+    return (*chunks, done)
 
 
 def _malformed_completion() -> ProxyError:

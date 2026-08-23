@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from typing import Any
@@ -453,6 +454,147 @@ async def test_stream_replay_preserves_reasoning_tool_calls_finish_reason_and_us
     assert chunks[2]["choices"] == []
     assert chunks[2]["usage"] == {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
     assert events[-1] == "[DONE]"
+
+
+@pytest.mark.asyncio
+async def test_stream_replay_paces_complete_sse_events_for_fragmented_downstream_reads() -> None:
+    """A blocked downstream write must not let replay queue later SSE events."""
+    app = create_app(Settings(upstream_base_url="http://upstream/v1"), EchoUpstream())
+    first_write = asyncio.Event()
+    release_write = asyncio.Event()
+    body_chunks: list[bytes] = []
+    received_request = False
+
+    async def receive() -> dict[str, Any]:
+        nonlocal received_request
+        if not received_request:
+            received_request = True
+            return {
+                "type": "http.request",
+                "body": json.dumps(
+                    {
+                        "model": "model",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": True,
+                    }
+                ).encode(),
+                "more_body": False,
+            }
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def send(message: dict[str, Any]) -> None:
+        if message["type"] != "http.response.body" or not message.get("body"):
+            return
+        body_chunks.append(message["body"])
+        if len(body_chunks) == 1:
+            first_write.set()
+            await release_write.wait()
+
+    scope: dict[str, Any] = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/chat/completions",
+        "raw_path": b"/v1/chat/completions",
+        "query_string": b"",
+        "headers": [],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+    }
+    task = asyncio.create_task(app(scope, receive, send))
+    await asyncio.wait_for(first_write.wait(), timeout=1)
+
+    assert len(body_chunks) == 1
+    assert body_chunks[0].count(b"data: ") == 1
+    assert body_chunks[0].endswith(b"\n\n")
+
+    release_write.set()
+    await asyncio.wait_for(task, timeout=1)
+    assert b"".join(body_chunks).endswith(b"data: [DONE]\n\n")
+
+
+@pytest.mark.asyncio
+async def test_stream_replay_disconnect_stops_after_the_current_sse_event() -> None:
+    app = create_app(Settings(upstream_base_url="http://upstream/v1"), EchoUpstream())
+    first_write = asyncio.Event()
+    body_chunks: list[bytes] = []
+    received_request = False
+
+    async def receive() -> dict[str, Any]:
+        nonlocal received_request
+        if not received_request:
+            received_request = True
+            return {
+                "type": "http.request",
+                "body": b'{"model":"model","messages":[{"role":"user","content":"hello"}],"stream":true}',
+                "more_body": False,
+            }
+        await first_write.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        if message["type"] == "http.response.body" and message.get("body"):
+            body_chunks.append(message["body"])
+            first_write.set()
+            await asyncio.Event().wait()
+
+    scope: dict[str, Any] = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/chat/completions",
+        "raw_path": b"/v1/chat/completions",
+        "query_string": b"",
+        "headers": [],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+    }
+
+    await asyncio.wait_for(app(scope, receive, send), timeout=1)
+    assert len(body_chunks) == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_replay_is_bounded_before_sse_headers_are_sent() -> None:
+    upstream = ScriptedCompletionUpstream(
+        [
+            {
+                "id": "chatcmpl-large",
+                "model": "model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "x" * 1024},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+        ]
+    )
+    app = create_app(
+        Settings(upstream_base_url="http://upstream/v1", max_upstream_response_bytes=1024), upstream
+    )
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+            )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "upstream_response_too_large"
+    assert "x-shiftedx-stream-mode" not in response.headers
 
 
 @pytest.mark.asyncio

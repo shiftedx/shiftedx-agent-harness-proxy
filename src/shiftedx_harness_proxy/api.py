@@ -16,7 +16,7 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from starlette.requests import ClientDisconnect
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -320,11 +320,20 @@ def create_app(
                     )
                     headers = _telemetry_headers(result, settings)
                     headers["X-Request-ID"] = correlation_id
+                    response: Response
                     if replay_options is not None:
-                        replay = replay_completion(result.body, replay_options)
+                        replay = replay_completion(
+                            result.body,
+                            replay_options,
+                            max_bytes=settings.max_upstream_response_bytes,
+                        )
                         headers["Cache-Control"] = "no-cache"
                         headers["X-Shiftedx-Stream-Mode"] = "validate-then-replay"
-                        response = Response(replay, headers=headers, media_type="text/event-stream")
+                        response = StreamingResponse(
+                            iter(replay),
+                            headers=headers,
+                            media_type="text/event-stream",
+                        )
                     else:
                         response = JSONResponse(result.body, headers=headers)
                     _ensure_before_deadline(deadline_at)
