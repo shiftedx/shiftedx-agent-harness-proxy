@@ -14,6 +14,7 @@ import os
 import re
 import stat
 from dataclasses import dataclass
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
@@ -120,6 +121,9 @@ class _CampaignSpec:
     campaign_id_sha256: str
     preflight: CampaignSlot
     slots: tuple[CampaignSlot, ...]
+    policy_benefit_families: tuple[str, ...]
+    policy_benefit_case_count: int
+    policy_benefit_case_ids_sha256: str
 
 
 def advance_qualification_campaign(
@@ -412,10 +416,12 @@ def _complete_campaign(
 ) -> CampaignAdvance:
     if len(used_instances) != 13:
         raise CampaignFailure("campaign_model_instance_invalid")
+    policy_benefit_gate = _policy_benefit_gate(spec, private_campaign_dir)
+    status = "passed" if policy_benefit_gate["status"] == "passed" else "failed"
     outcome = {
         "schema_version": "1.0",
         "record_type": "qualification_campaign_outcome",
-        "status": "passed",
+        "status": status,
         "campaign_manifest_sha256": spec.manifest_sha256,
         "head_event_sha256": events[-1][1],
         "event_count": 13,
@@ -427,6 +433,7 @@ def _complete_campaign(
             for event, _digest in events
             if event["stage"] == "score-proxy"
         ],
+        "policy_benefit_gate": policy_benefit_gate,
     }
     path = private_campaign_dir / "qualification-campaign-outcome.json"
     if path.exists() or path.is_symlink():
@@ -440,7 +447,115 @@ def _complete_campaign(
     else:
         serialized = _atomic_write_no_clobber(path, outcome)
     digest = hashlib.sha256(serialized).hexdigest()
-    return CampaignAdvance("campaign_passed", None, None, None, None, None, events[-1][1], digest)
+    return CampaignAdvance(
+        "campaign_passed" if status == "passed" else "campaign_failed",
+        None,
+        None,
+        None,
+        None,
+        None if status == "passed" else str(policy_benefit_gate["failure_category"]),
+        events[-1][1],
+        digest,
+    )
+
+
+def _policy_benefit_gate(spec: _CampaignSpec, private_campaign_dir: Path) -> dict[str, Any]:
+    """Fail closed on the frozen policy-benefit cohort in every scored slot."""
+
+    try:
+        direct_samples: list[Decimal] = []
+        proxy_samples: list[Decimal] = []
+        for slot in spec.slots:
+            slot_dir = private_campaign_dir / "slots" / _slot_directory_name(slot)
+            direct_rows = _policy_benefit_rows(slot_dir / "scored-direct.jsonl", spec)
+            proxy_rows = _policy_benefit_rows(slot_dir / "scored-proxy.jsonl", spec)
+            if direct_rows.keys() != proxy_rows.keys() or any(
+                direct_rows[case_id][0] != proxy_rows[case_id][0] for case_id in direct_rows
+            ):
+                raise ValueError("unmatched cohort")
+            direct_samples.extend(wall_s for _family, wall_s in direct_rows.values())
+            proxy_samples.extend(wall_s for _family, wall_s in proxy_rows.values())
+        expected_samples = len(spec.slots) * spec.policy_benefit_case_count
+        if len(direct_samples) != expected_samples or len(proxy_samples) != expected_samples:
+            raise ValueError("incomplete cohort")
+        direct_p95 = _frozen_p95(direct_samples)
+        proxy_p95 = _frozen_p95(proxy_samples)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, InvalidOperation):
+        return _policy_benefit_gate_failure(spec, "policy_benefit_evidence_invalid")
+
+    ratio_ppm = int((proxy_p95 * Decimal(1_000_000) / direct_p95).to_integral_value(rounding=ROUND_CEILING))
+    summary = {
+        "cohort_case_ids_sha256": spec.policy_benefit_case_ids_sha256,
+        "cohort_case_count": spec.policy_benefit_case_count,
+        "matched_slot_count": len(spec.slots),
+        "matched_sample_count": len(direct_samples),
+        "direct_p95_wall_us": _wall_microseconds(direct_p95),
+        "proxy_p95_wall_us": _wall_microseconds(proxy_p95),
+        "proxy_to_direct_p95_ratio_ppm": ratio_ppm,
+    }
+    if proxy_p95 > direct_p95 * Decimal("0.80"):
+        return {"status": "failed", "failure_category": "policy_benefit_gate_failed", **summary}
+    return {"status": "passed", "failure_category": None, **summary}
+
+
+def _policy_benefit_gate_failure(spec: _CampaignSpec, category: str) -> dict[str, Any]:
+    return {
+        "status": "failed",
+        "failure_category": category,
+        "cohort_case_ids_sha256": spec.policy_benefit_case_ids_sha256,
+        "cohort_case_count": spec.policy_benefit_case_count,
+        "matched_slot_count": 0,
+        "matched_sample_count": 0,
+        "direct_p95_wall_us": None,
+        "proxy_p95_wall_us": None,
+        "proxy_to_direct_p95_ratio_ppm": None,
+    }
+
+
+def _policy_benefit_rows(path: Path, spec: _CampaignSpec) -> dict[str, tuple[str, Decimal]]:
+    serialized = _read_regular_file(path, private=True)
+    rows: dict[str, tuple[str, Decimal]] = {}
+    for line in serialized.decode("utf-8").splitlines():
+        if not line:
+            raise ValueError("blank row")
+        row = json.loads(line, object_pairs_hook=_unique_object, parse_float=Decimal)
+        if not isinstance(row, dict):
+            raise ValueError("row is not object")
+        case_id = row.get("case_id")
+        metadata = row.get("metadata")
+        family = metadata.get("agentic_family") if isinstance(metadata, dict) else None
+        if not isinstance(case_id, str) or _SAFE_ID.fullmatch(case_id) is None:
+            raise ValueError("case id")
+        if family not in spec.policy_benefit_families:
+            continue
+        if case_id in rows or row.get("passed") is not True:
+            raise ValueError("invalid policy outcome")
+        telemetry = row.get("telemetry")
+        wall_s = telemetry.get("wall_s") if isinstance(telemetry, dict) else None
+        if isinstance(wall_s, bool) or not isinstance(wall_s, int | Decimal):
+            raise ValueError("wall time")
+        wall = Decimal(wall_s)
+        if not wall.is_finite() or wall <= 0:
+            raise ValueError("wall time")
+        rows[case_id] = (family, wall)
+    case_ids = sorted(rows)
+    if (
+        len(case_ids) != spec.policy_benefit_case_count
+        or hashlib.sha256(json.dumps(case_ids, separators=(",", ":")).encode()).hexdigest()
+        != spec.policy_benefit_case_ids_sha256
+    ):
+        raise ValueError("cohort mismatch")
+    return rows
+
+
+def _frozen_p95(samples: list[Decimal]) -> Decimal:
+    if not samples:
+        raise ValueError("zero samples")
+    return sorted(samples)[(len(samples) - 1) * 95 // 100]
+
+
+def _wall_microseconds(value: Decimal) -> int:
+    return int((value * Decimal(1_000_000)).to_integral_value(rounding=ROUND_CEILING))
 
 
 def _load_campaign_spec(path: Path) -> _CampaignSpec:
@@ -458,11 +573,17 @@ def _load_campaign_spec(path: Path) -> _CampaignSpec:
         "treatment_order",
         "model_instance_policy",
         "failure_policy",
+        "policy_benefit_families",
+        "policy_benefit_case_count",
+        "policy_benefit_case_ids_sha256",
     }
     if not isinstance(campaign, dict) or set(campaign) != expected_keys:
         raise CampaignFailure("campaign_manifest_invalid")
     campaign_id = campaign.get("campaign_id")
     raw_slots = campaign.get("slots")
+    raw_families = campaign.get("policy_benefit_families")
+    case_count = campaign.get("policy_benefit_case_count")
+    case_ids_sha256 = campaign.get("policy_benefit_case_ids_sha256")
     if (
         not isinstance(campaign_id, str)
         or _SAFE_ID.fullmatch(campaign_id) is None
@@ -472,6 +593,15 @@ def _load_campaign_spec(path: Path) -> _CampaignSpec:
         or campaign.get("failure_policy") != "terminal-no-rerun"
         or not isinstance(raw_slots, list)
         or len(raw_slots) != 6
+        or not isinstance(raw_families, list)
+        or not raw_families
+        or any(not isinstance(family, str) or _SAFE_ID.fullmatch(family) is None for family in raw_families)
+        or len(set(raw_families)) != len(raw_families)
+        or not isinstance(case_count, int)
+        or isinstance(case_count, bool)
+        or case_count <= 0
+        or not isinstance(case_ids_sha256, str)
+        or _SHA256.fullmatch(case_ids_sha256) is None
     ):
         raise CampaignFailure("campaign_manifest_invalid")
     expected_pairs: tuple[tuple[CacheLane, int], ...] = (
@@ -504,6 +634,9 @@ def _load_campaign_spec(path: Path) -> _CampaignSpec:
         campaign_id_sha256=hashlib.sha256(campaign_id.encode()).hexdigest(),
         preflight=CampaignSlot(0, "preflight", 0, f"{campaign_id}-preflight"),
         slots=tuple(slots),
+        policy_benefit_families=tuple(raw_families),
+        policy_benefit_case_count=case_count,
+        policy_benefit_case_ids_sha256=case_ids_sha256,
     )
 
 

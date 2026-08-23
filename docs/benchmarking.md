@@ -173,7 +173,7 @@ uses `"schema_version": "1.0"` and exactly these keys:
       "agentic_set": "expanded",
       "sampler_profile": "ornith-productization-v1",
       "scenario_order_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-      "scenario_count": 12
+      "scenario_count": 22
     },
     "campaign": {
       "campaign_id": "qualification-2026-08-20",
@@ -188,7 +188,16 @@ uses `"schema_version": "1.0"` and exactly these keys:
       "stage_order": ["preflight", "score-direct", "score-proxy"],
       "treatment_order": ["direct", "proxy"],
       "model_instance_policy": "fresh-per-scored-treatment",
-      "failure_policy": "terminal-no-rerun"
+      "failure_policy": "terminal-no-rerun",
+      "policy_benefit_families": [
+        "failed_search_recovery",
+        "repair_loop",
+        "stale_evidence",
+        "structured_status",
+        "wrong_path_recovery"
+      ],
+      "policy_benefit_case_count": 22,
+      "policy_benefit_case_ids_sha256": "73c007092312a9b187b66c67fd73e4d343641696ab59aafc56b36d2284ff1fc1"
     },
     "observer": {
       "host": "127.0.0.1",
@@ -304,6 +313,19 @@ the passed authenticated `scored-proxy-reconciliation.json`; it snapshots zero p
 the child, validates its request/observer/model evidence after the child, and fails closed on a
 counter or partition mismatch. The supervisor supplies each slot's frozen run ID to both
 treatments and derives variants as `<cache_lane>-pair<pair_index>-direct|proxy-<agentic_set>`.
+
+At terminal campaign completion, the orchestrator also enforces the frozen policy-benefit gate.
+Before trial 1, the manifest commits the eligible `metadata.agentic_family` values, the selected
+case count, and the SHA-256 of the canonical sorted selected case-ID list. It never infers the
+cohort from observed intervention results. Each direct/proxy scored ledger must supply that exact
+cohort in every one of the six slots (three cold and three warm-prefix), with matching IDs/families,
+`passed: true`, and a finite positive runner-measured `telemetry.wall_s`. The frozen p95 index
+`(n - 1) * 95 // 100` over all matched direct rows and all matched proxy rows is compared; proxy
+must be at most `80%` of direct. Missing, malformed, mismatched, zero-sample, or failed cohort
+evidence fails closed and is
+not excluded from the ratio. The private campaign outcome records only the cohort hash/count and
+aggregate p95/ratio fields—never case IDs or prompts—and its status cannot be `passed` until this
+gate passes.
 
 `cache_lane` is measured proof, not a `cache_proof_sha256` self-assertion. Preflight always sends
 `--cache-mode bypass`, including a later `warm-prefix` campaign: every successful preflight attempt

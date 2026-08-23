@@ -659,6 +659,9 @@ class _CampaignSpec:
     campaign_id: str
     campaign_id_sha256: str
     slots: tuple[_TrialSpec, ...]
+    policy_benefit_families: tuple[str, ...]
+    policy_benefit_case_count: int
+    policy_benefit_case_ids_sha256: str
 
 
 @dataclass(frozen=True)
@@ -1504,10 +1507,16 @@ def _parse_campaign(value: Any) -> _CampaignSpec:
             "treatment_order",
             "model_instance_policy",
             "failure_policy",
+            "policy_benefit_families",
+            "policy_benefit_case_count",
+            "policy_benefit_case_ids_sha256",
         },
     )
     campaign_id = _required_text(campaign.get("campaign_id"))
     raw_slots = campaign.get("slots")
+    raw_families = campaign.get("policy_benefit_families")
+    case_count = campaign.get("policy_benefit_case_count")
+    case_ids_sha256 = campaign.get("policy_benefit_case_ids_sha256")
     if (
         _RUN_ID.fullmatch(campaign_id) is None
         or campaign.get("stage_order") != ["preflight", "score-direct", "score-proxy"]
@@ -1516,6 +1525,15 @@ def _parse_campaign(value: Any) -> _CampaignSpec:
         or campaign.get("failure_policy") != "terminal-no-rerun"
         or not isinstance(raw_slots, list)
         or len(raw_slots) != 6
+        or not isinstance(raw_families, list)
+        or not raw_families
+        or any(not isinstance(family, str) or _RUN_ID.fullmatch(family) is None for family in raw_families)
+        or len(set(raw_families)) != len(raw_families)
+        or not isinstance(case_count, int)
+        or isinstance(case_count, bool)
+        or case_count <= 0
+        or not isinstance(case_ids_sha256, str)
+        or _SHA256.fullmatch(case_ids_sha256) is None
     ):
         raise QualificationRuntimeFailure("runtime_manifest_invalid")
     expected: tuple[tuple[Literal["cold", "warm-prefix"], int], ...] = (
@@ -1540,7 +1558,14 @@ def _parse_campaign(value: Any) -> _CampaignSpec:
             raise QualificationRuntimeFailure("runtime_manifest_invalid")
         run_ids.add(run_id)
         slots.append(_TrialSpec(run_id, lane, pair_index, ("direct", "proxy")))
-    return _CampaignSpec(campaign_id, hashlib.sha256(campaign_id.encode("utf-8")).hexdigest(), tuple(slots))
+    return _CampaignSpec(
+        campaign_id,
+        hashlib.sha256(campaign_id.encode("utf-8")).hexdigest(),
+        tuple(slots),
+        tuple(raw_families),
+        case_count,
+        case_ids_sha256,
+    )
 
 
 def _validate_benchmark_checkout(runner: RuntimeCommandRunner, benchmark: _BenchmarkSpec) -> None:

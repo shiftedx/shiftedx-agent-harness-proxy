@@ -38,6 +38,11 @@ def _campaign_manifest(path: Path) -> Path:
                 "treatment_order": ["direct", "proxy"],
                 "model_instance_policy": "fresh-per-scored-treatment",
                 "failure_policy": "terminal-no-rerun",
+                "policy_benefit_families": ["policy"],
+                "policy_benefit_case_count": 1,
+                "policy_benefit_case_ids_sha256": hashlib.sha256(
+                    json.dumps(["case-policy"], separators=(",", ":")).encode()
+                ).hexdigest(),
             }
         }
     }
@@ -71,6 +76,9 @@ class _FakeStageRunner:
         fixed_instance_sha256: str | None = None,
         null_evidence_sequences: set[int] | None = None,
         failure_categories: dict[int, str] | None = None,
+        policy_proxy_wall_s: float = 0.8,
+        policy_case_passed: bool = True,
+        policy_wall_s_by_sequence: dict[int, float] | None = None,
     ) -> None:
         self.requests: list[StageRequest] = []
         self.results: dict[Path, StageResult] = {}
@@ -80,6 +88,9 @@ class _FakeStageRunner:
         self.fixed_instance_sha256 = fixed_instance_sha256
         self.null_evidence_sequences = null_evidence_sequences or set()
         self.failure_categories = failure_categories or {}
+        self.policy_proxy_wall_s = policy_proxy_wall_s
+        self.policy_case_passed = policy_case_passed
+        self.policy_wall_s_by_sequence = policy_wall_s_by_sequence or {}
 
     def inspect(self, request: StageRequest) -> StageInspection:
         if request.sequence in self.partial_sequences:
@@ -111,6 +122,23 @@ class _FakeStageRunner:
         ).encode()
         request.outcome_path.write_bytes(payload)
         os.chmod(request.outcome_path, 0o600)
+        if request.stage in {"score-direct", "score-proxy"}:
+            row = {
+                "case_id": "case-policy",
+                "passed": self.policy_case_passed,
+                "telemetry": {
+                    "wall_s": self.policy_wall_s_by_sequence.get(
+                        request.sequence,
+                        1.0 if request.stage == "score-direct" else self.policy_proxy_wall_s,
+                    )
+                },
+                "metadata": {"agentic_family": "policy"},
+            }
+            ledger = request.outcome_path.with_name(
+                "scored-direct.jsonl" if request.stage == "score-direct" else "scored-proxy.jsonl"
+            )
+            ledger.write_text(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+            os.chmod(ledger, 0o600)
         result = StageResult(
             status=status,  # type: ignore[arg-type]
             failure_category=None if status == "passed" else self.failure_categories.get(
@@ -274,6 +302,92 @@ def test_campaign_runs_one_preflight_then_six_direct_proxy_pairs_and_finalizes(t
     assert document["event_count"] == 13
     assert document["scored_stage_count"] == document["scored_model_instance_count"] == 12
     assert document["slot_count"] == len(document["proxy_reconciliation_sha256s"]) == 6
+
+
+@pytest.mark.parametrize(
+    ("proxy_wall_s", "passes", "ratio_ppm"),
+    [(0.8, True, 800_000), (0.8000001, False, 800_001), (0.81, False, 810_000)],
+)
+def test_policy_benefit_gate_enforces_the_frozen_twenty_percent_boundary(
+    tmp_path: Path, proxy_wall_s: float, passes: bool, ratio_ppm: int
+) -> None:
+    manifest = _campaign_manifest(tmp_path / "manifest.json")
+    private = _private_campaign(tmp_path / "campaign")
+    runner = _FakeStageRunner(policy_proxy_wall_s=proxy_wall_s)
+
+    final = [
+        advance_qualification_campaign(manifest, private, stage_runner=runner, readiness_probe=_ReadyProbe())
+        for _ in range(13)
+    ][-1]
+
+    assert final.kind == ("campaign_passed" if passes else "campaign_failed")
+    outcome = json.loads((private / "qualification-campaign-outcome.json").read_text())
+    assert outcome["status"] == ("passed" if passes else "failed")
+    assert outcome["policy_benefit_gate"]["matched_slot_count"] == 6
+    assert outcome["policy_benefit_gate"]["proxy_to_direct_p95_ratio_ppm"] == ratio_ppm
+
+
+def test_policy_benefit_gate_uses_the_frozen_p95_index_not_nearest_rank(tmp_path: Path) -> None:
+    manifest = _campaign_manifest(tmp_path / "manifest.json")
+    private = _private_campaign(tmp_path / "campaign")
+    runner = _FakeStageRunner(
+        policy_wall_s_by_sequence={
+            3: 0.81,
+            5: 0.81,
+            7: 0.81,
+            9: 0.81,
+            11: 0.81,
+            12: 100.0,
+            13: 0.81,
+        }
+    )
+
+    final = [
+        advance_qualification_campaign(manifest, private, stage_runner=runner, readiness_probe=_ReadyProbe())
+        for _ in range(13)
+    ][-1]
+
+    outcome = json.loads((private / "qualification-campaign-outcome.json").read_text())
+    assert final.kind == "campaign_failed"
+    assert outcome["policy_benefit_gate"]["direct_p95_wall_us"] == 1_000_000
+    assert outcome["policy_benefit_gate"]["proxy_to_direct_p95_ratio_ppm"] == 810_000
+
+
+def test_policy_benefit_gate_fails_closed_on_a_failed_cohort_row(tmp_path: Path) -> None:
+    manifest = _campaign_manifest(tmp_path / "manifest.json")
+    private = _private_campaign(tmp_path / "campaign")
+    runner = _FakeStageRunner(policy_case_passed=False)
+
+    final = [
+        advance_qualification_campaign(manifest, private, stage_runner=runner, readiness_probe=_ReadyProbe())
+        for _ in range(13)
+    ][-1]
+
+    outcome = json.loads((private / "qualification-campaign-outcome.json").read_text())
+    assert final.kind == "campaign_failed"
+    assert outcome["policy_benefit_gate"]["failure_category"] == "policy_benefit_evidence_invalid"
+
+
+def test_policy_benefit_gate_fails_closed_on_tampered_cohort_membership(tmp_path: Path) -> None:
+    manifest = _campaign_manifest(tmp_path / "manifest.json")
+    private = _private_campaign(tmp_path / "campaign")
+    runner = _FakeStageRunner()
+
+    for _ in range(12):
+        advance_qualification_campaign(manifest, private, stage_runner=runner, readiness_probe=_ReadyProbe())
+    ledger = private / "slots" / "06-warm-prefix-pair3" / "scored-direct.jsonl"
+    row = json.loads(ledger.read_text())
+    row["case_id"] = "case-tampered"
+    ledger.write_text(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    os.chmod(ledger, 0o600)
+
+    final = advance_qualification_campaign(manifest, private, stage_runner=runner, readiness_probe=_ReadyProbe())
+
+    outcome_path = private / "qualification-campaign-outcome.json"
+    outcome = json.loads(outcome_path.read_text())
+    assert final.kind == "campaign_failed"
+    assert outcome["policy_benefit_gate"]["failure_category"] == "policy_benefit_evidence_invalid"
+    assert "case-tampered" not in outcome_path.read_text()
 
 
 def test_final_outcome_is_idempotent_but_cannot_be_replaced(tmp_path: Path) -> None:

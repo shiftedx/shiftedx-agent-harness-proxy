@@ -99,6 +99,19 @@ verification, terminal-schema, or repeated-failure recovery pressure. Ordinary t
 pass-through tasks remain separate cohorts and cannot be moved into or out of this cohort after
 results are observed. A faster invalid answer is not a valid outcome.
 
+The immutable private campaign manifest binds this cohort before trial 1 through its allowed
+scenario-family list (`failed_search_recovery`, `repair_loop`, `stale_evidence`,
+`structured_status`, and `wrong_path_recovery`), canonical selected-case-ID hash
+`73c007092312a9b187b66c67fd73e4d343641696ab59aafc56b36d2284ff1fc1`, and selected-case count
+`22` against frozen expanded revision `335e6694e4aec13e9370af8a993d8c8f14d7ffb5`. At terminal
+completion, every direct/proxy scored ledger in all three cold and all three warm-prefix pairs must
+contain the same bound cohort with `passed: true` and finite positive runner `telemetry.wall_s`.
+The campaign computes p95 with the frozen sorted index `(n - 1) * 95 // 100` from all twelve
+matched treatment rows per selected case and passes only when proxy p95 is `<=80%` of direct p95.
+A missing, malformed, failed, zero-sample, or
+mismatched row is a terminal failed gate, never a reason to remove it from the calculation. The
+published campaign outcome contains hash/count and aggregate timing only.
+
 ## Cache lanes
 
 Cold and warm-prefix results are separate datasets.

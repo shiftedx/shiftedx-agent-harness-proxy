@@ -266,6 +266,9 @@ def _manifest(tmp_path: Path) -> Path:
                 "treatment_order": ["direct", "proxy"],
                 "model_instance_policy": "fresh-per-scored-treatment",
                 "failure_policy": "terminal-no-rerun",
+                "policy_benefit_families": ["policy"],
+                "policy_benefit_case_count": 1,
+                "policy_benefit_case_ids_sha256": _canonical_sha256(["case-policy"]),
             },
             "observer": {
                 "host": "127.0.0.1",
@@ -3651,6 +3654,9 @@ def test_benchmarking_manifest_example_is_duplicate_rejecting_json_with_c1_model
         "treatment_order",
         "model_instance_policy",
         "failure_policy",
+        "policy_benefit_families",
+        "policy_benefit_case_count",
+        "policy_benefit_case_ids_sha256",
     }
     assert len(campaign["slots"]) == 6
     assert runtime["benchmark"]["sampler_profile"] == "ornith-productization-v1"
