@@ -324,6 +324,29 @@ def test_manifest_accepts_ornith_productization_sampler_profile(tmp_path) -> Non
     assert spec.benchmark.sampler_profile == "ornith-productization-v1"
 
 
+def test_timing_capture_initializer_locks_mode_before_transferring_ownership(tmp_path) -> None:
+    runner = _FakeRuntimeRunner()
+    spec = runtime_module._load_runtime_spec(_manifest(tmp_path), runner)
+
+    runtime_module._initialize_timing_capture(
+        runner,
+        spec,
+        "qualification-timing-volume",
+        "qualification-instance",
+        "score-proxy",
+    )
+
+    argv = runner.calls[-1][1]
+    script = argv[-1]
+    assert argv.count("--cap-add") == 2
+    assert "FOWNER" not in argv
+    assert script.index(": > /target/capture.jsonl") < script.index("chmod 0600 /target/capture.jsonl")
+    assert script.index("chmod 0600 /target/capture.jsonl") < script.index("chown 10001:10001 /target/capture.jsonl")
+    assert script.endswith(
+        "test \"$(stat -c '%u:%g:%a' /target/capture.jsonl)\" = 10001:10001:600"
+    )
+
+
 def test_ornith_sampler_profile_binds_enabled_ssd_cache_in_model_evidence_contract(tmp_path) -> None:
     manifest = _manifest(tmp_path)
     document = _manifest_document(manifest)

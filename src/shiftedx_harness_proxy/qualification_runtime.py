@@ -1933,8 +1933,8 @@ def _initialize_timing_capture(
             spec.image.reference,
             "-ceu",
             (
-                "umask 077; : > /target/capture.jsonl; chown 10001:10001 /target/capture.jsonl; "
-                "chmod 0600 /target/capture.jsonl; "
+                "umask 077; : > /target/capture.jsonl; chmod 0600 /target/capture.jsonl; "
+                "chown 10001:10001 /target/capture.jsonl; "
                 "test \"$(stat -c '%u:%g:%a' /target/capture.jsonl)\" = 10001:10001:600"
             ),
         )
