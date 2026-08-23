@@ -35,6 +35,7 @@ from shiftedx_harness_proxy.qualification_reconciliation import (
     ReconciliationFailure,
     read_request_accounting_ledger,
 )
+from shiftedx_harness_proxy.qualification_timing import finalize_timing_evidence
 
 _RUN_MANIFEST_SHA256 = "1" * 64
 
@@ -2015,7 +2016,49 @@ def test_provisional_direct_timing_uses_global_attempt_ranges_across_client_inst
         attempt_ledger,
         [record for client in clients for record in client.attempt_records],
     )
-    assert [record.sequence for record in read_model_boundary_observer_records(attempt_ledger)] == [1, 2]
+    globally_resequenced = [json.loads(line) for line in attempt_ledger.read_text(encoding="utf-8").splitlines()]
+    assert [record["sequence"] for record in globally_resequenced] == [1, 2]
+
+    private_parent = tmp_path / "private"
+    private_parent.mkdir(mode=0o700)
+    private_parent.chmod(0o700)
+    provisional = private_parent / "direct-provisional.jsonl"
+    timing = tmp_path / "direct-timing.jsonl"
+    runner.write_provisional_client_timing_ledger(provisional, ledger.records)
+    rows = finalize_timing_evidence(
+        arm="direct",
+        cache_lane="cold",
+        provisional_client_path=provisional,
+        timing_path=timing,
+        observer_records=globally_resequenced,
+    )
+
+    assert [row["sequence"] for row in rows] == [1, 2]
+    assert [
+        (record.observer_sequence_start, record.observer_sequence_end) for record in ledger.records
+    ] == [(1, 1), (2, 2)]
+    assert len(timing.read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_provisional_direct_timing_rejects_a_noncontiguous_local_attempt_slice(monkeypatch):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    payload = runner._preflight_payload(scenario, model="model", proxy_policy=False, no_tools=True)
+    response = {"content": '{"status":"passed"}', "tool_calls": []}
+    first = runner.model_boundary_record(payload, sequence=1, status_code=200, response=response)
+    third = replace(first, sequence=3)
+    ledger = runner.ProvisionalClientTimingLedger(cache_lane="cold")
+
+    with pytest.raises(runner.ProvisionalTimingLedgerFailure, match="provisional_direct_attempt_slice_invalid"):
+        ledger.append(
+            pair_ordinal=ledger.begin(),
+            arm="direct",
+            client_wall_ns=2,
+            outcome="succeeded",
+            observer_records=(first, third),
+            direct_attempt_wall_ns=(1, 1),
+            downstream_request_sha256=runner.downstream_request_sha256(payload),
+        )
 
 
 def test_provisional_timing_writer_requires_a_private_existing_parent_and_safe_bounded_rows(monkeypatch, tmp_path):
