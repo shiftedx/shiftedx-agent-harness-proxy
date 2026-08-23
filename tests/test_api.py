@@ -593,10 +593,12 @@ async def test_stream_replay_deadline_releases_admission_after_headers(tmp_path)
     assert app.state.admission.snapshot().active == 0
     assert read_timing_capture_ledger(ledger)[0]["outcome"] == "deadline"
     assert messages[0]["type"] == "http.response.start"
-    assert not any(
-        message["type"] == "http.response.body" and not message.get("more_body", False)
+    terminal_messages = [
+        message
         for message in messages
-    )
+        if message["type"] == "http.response.body" and not message.get("more_body", False)
+    ]
+    assert terminal_messages == [{"type": "http.response.body", "body": b"", "more_body": False}]
     assert not b"".join(
         message["body"] for message in messages if message["type"] == "http.response.body"
     ).endswith(b"data: [DONE]\n\n")

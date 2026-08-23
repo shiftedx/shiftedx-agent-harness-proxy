@@ -203,6 +203,7 @@ class _ReplayStreamingResponse(StreamingResponse):
                 await send({"type": "http.response.body", "body": b"", "more_body": False})
         except TimeoutError:
             self._record_outcome("deadline")
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
             return
         except asyncio.CancelledError:
             self._record_outcome("cancelled")

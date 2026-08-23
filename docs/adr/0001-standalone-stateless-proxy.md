@@ -38,8 +38,8 @@ credentials remain separate. Internal rejected turns exist only for the duration
 - Validate-then-replay removes client protocol incompatibility but cannot improve TTFT. Every
   upstream, policy, and serialization failure occurs before SSE response headers. The same total
   deadline remains active while replaying to the downstream client; if it expires after headers, the
-  proxy intentionally terminates the SSE response without a `[DONE]` event because HTTP cannot replace
-  an already-started response with a 504. Post-header upstream failures do not exist in this mode
+  proxy emits a clean truncated SSE EOF without a `[DONE]` event because HTTP cannot replace an
+  already-started response with a 504. Post-header upstream failures do not exist in this mode
   because upstream work is already complete.
 - Stateful sessions may be added only if testing demonstrates a need, with explicit TTL and tenant
   isolation; client IP and the OpenAI `user` field are not session identifiers.
