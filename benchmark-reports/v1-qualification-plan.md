@@ -70,6 +70,7 @@ Any violation is an automatic `DO NOT PROMOTE`, regardless of aggregate quality 
 | Quality | Aggregate proxy-assisted passed-case count is at least the direct baseline count, with no critical-case regression |
 | Proxy-only latency | Scripted-upstream processing p95 `< 15 ms` and p99 `< 30 ms` |
 | Pass-through latency | For responses requiring no policy retry or Local Projection, added p95 wall time and TTFT are each no more than the larger of `15 ms` or `5%` of the matched baseline |
+| Policy-benefit performance | Across the preregistered policy-benefit and recovery cohorts, proxy p95 wall time to a valid outcome is `<=80%` of the matched direct p95; failed outcomes remain in the denominator |
 | Full agentic latency | Aggregate p95 wall time to final valid outcome is no more than `125%` of matched baseline in each cache lane |
 | Decode throughput | Weighted decode throughput is at least `90%` of matched baseline in each cache lane |
 | Upstream amplification | Mean upstream calls per downstream request `<= 2.0`; every request remains `<= MAX_UPSTREAM_CALLS` |
@@ -84,6 +85,11 @@ Any violation is an automatic `DO NOT PROMOTE`, regardless of aggregate quality 
 The public report includes p50/p95/p99, sample counts, confidence/variance notes, throughput, TTFT,
 RSS, open connections, active/queued work, error/rejection counts, recovery time, and every failed
 gate. A hard container limit is not itself proof of a passing resource result.
+
+The policy-benefit performance cohort is fixed before scoring: tasks with duplicate, stall,
+verification, terminal-schema, or repeated-failure recovery pressure. Ordinary tool-use and
+pass-through tasks remain separate cohorts and cannot be moved into or out of this cohort after
+results are observed. A faster invalid answer is not a valid outcome.
 
 ## Cache lanes
 
