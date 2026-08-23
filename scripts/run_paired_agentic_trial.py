@@ -171,6 +171,7 @@ class ProvisionalClientTimingLedger:
             raise ValueError("provisional timing cache lane is invalid")
         self.cache_lane = cache_lane
         self._next_pair_ordinal = 1
+        self._next_direct_attempt_sequence = 1
         self._records: list[ProvisionalClientTimingRecord] = []
 
     @property
@@ -197,6 +198,22 @@ class ProvisionalClientTimingLedger:
             raise ValueError("provisional timing arm is invalid")
         if client_wall_ns < 0:
             raise ValueError("provisional client wall time is invalid")
+        if arm == "direct" and observer_records:
+            local_sequences = [record.sequence for record in observer_records]
+            local_start = local_sequences[0]
+            if (
+                type(local_start) is not int
+                or local_start < 1
+                or any(type(sequence) is not int for sequence in local_sequences)
+                or local_sequences != list(range(local_start, local_start + len(local_sequences)))
+            ):
+                raise ProvisionalTimingLedgerFailure("provisional_direct_attempt_slice_invalid")
+            observer_sequence_start = self._next_direct_attempt_sequence
+            observer_sequence_end = observer_sequence_start + len(observer_records) - 1
+            self._next_direct_attempt_sequence = observer_sequence_end + 1
+        else:
+            observer_sequence_start = observer_records[0].sequence if observer_records else None
+            observer_sequence_end = observer_records[-1].sequence if observer_records else None
         self._records.append(
             ProvisionalClientTimingRecord(
                 pair_ordinal=pair_ordinal,
@@ -204,8 +221,8 @@ class ProvisionalClientTimingLedger:
                 cache_lane=self.cache_lane,
                 client_wall_ns=client_wall_ns,
                 outcome=outcome,
-                observer_sequence_start=observer_records[0].sequence if observer_records else None,
-                observer_sequence_end=observer_records[-1].sequence if observer_records else None,
+                observer_sequence_start=observer_sequence_start,
+                observer_sequence_end=observer_sequence_end,
                 observer_record_count=len(observer_records),
                 direct_attempt_wall_ns=direct_attempt_wall_ns,
                 downstream_request_sha256=downstream_request_sha256,

@@ -1982,6 +1982,42 @@ def test_provisional_direct_timing_uses_the_attempt_slice_for_a_two_phase_logica
     assert ledger.records[0].direct_attempt_wall_ns == (10, 10)
 
 
+def test_provisional_direct_timing_uses_global_attempt_ranges_across_client_instances(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    payload = runner._preflight_payload(scenario, model="model", proxy_policy=False, no_tools=True)
+
+    class Direct:
+        def complete(self, _payload, *, stream=False):
+            assert stream is False
+            return {"content": '{"status":"passed"}', "tool_calls": []}
+
+    ledger = runner.ProvisionalClientTimingLedger(cache_lane="cold")
+    clients = [
+        runner.CompatibilityClient(
+            Direct(),
+            arm="direct",
+            scenario_order=[scenario.case_id],
+            proxy_policy=False,
+            provisional_timing=ledger,
+        )
+        for _ in range(2)
+    ]
+    for client in clients:
+        client.complete(payload)
+
+    assert [(record.observer_sequence_start, record.observer_sequence_end) for record in ledger.records] == [
+        (1, 1),
+        (2, 2),
+    ]
+    attempt_ledger = tmp_path / "direct-attempts.jsonl"
+    runner.write_model_boundary_attempt_ledger(
+        attempt_ledger,
+        [record for client in clients for record in client.attempt_records],
+    )
+    assert [record.sequence for record in read_model_boundary_observer_records(attempt_ledger)] == [1, 2]
+
+
 def test_provisional_timing_writer_requires_a_private_existing_parent_and_safe_bounded_rows(monkeypatch, tmp_path):
     runner = load_runner(monkeypatch)
     private_parent = tmp_path / "private"
