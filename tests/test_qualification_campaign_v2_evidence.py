@@ -6,6 +6,7 @@ import os
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -70,6 +71,17 @@ def _spec() -> V2EvidenceSpec:
         deadline_s=Decimal("600"),
         expected_direct_outcome_sha256="0" * 64,
     )
+
+
+def test_evidence_spec_requires_a_nonempty_critical_cohort() -> None:
+    spec = replace(
+        _spec(),
+        critical_cohort_ordinals=(),
+        critical_cohort_ordinals_sha256=_sha256(()),
+    )
+
+    with pytest.raises(QualificationV2EvidenceFailure):
+        adapt_v2_scored_evidence(spec, ())  # type: ignore[arg-type]
 
 
 def _rows(*, direct: bool, forbidden_case: int | None = None) -> list[dict[str, object]]:
@@ -145,7 +157,7 @@ def _proxy_reconciliation(path: Path, spec: V2EvidenceSpec, attestation: Path, e
 def _source(
     tmp_path: Path,
     spec: V2EvidenceSpec,
-    arm: str,
+    arm: Literal["direct", "proxy"],
     rows: list[dict[str, object]],
     predecessor_outcome_sha256: str | None = None,
 ) -> V2ScoredLedger:

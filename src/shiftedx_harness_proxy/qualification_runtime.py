@@ -559,6 +559,8 @@ class RuntimeLease:
     proxy_provisional_request_ledger: Path | None = None
     direct_provisional_request_ledger: Path | None = None
     proxy_request_accounting_provisional_ledger: Path | None = None
+    campaign_version: Literal["v1", "v2"] = "v1"
+    v2_private_scenario_deadline_seconds: int | None = None
 
 
 @dataclass(frozen=True)
@@ -654,7 +656,7 @@ class _TrialSpec:
 
 @dataclass(frozen=True)
 class _CampaignSpec:
-    """The immutable six-slot master-campaign identity, without exposing run IDs in evidence."""
+    """The immutable versioned campaign identity, without exposing run IDs in evidence."""
 
     campaign_id: str
     campaign_id_sha256: str
@@ -662,6 +664,8 @@ class _CampaignSpec:
     policy_benefit_families: tuple[str, ...]
     policy_benefit_case_count: int
     policy_benefit_case_ids_sha256: str
+    version: Literal["v1", "v2"]
+    v2_private_scenario_deadline_seconds: int | None
 
 
 @dataclass(frozen=True)
@@ -726,7 +730,7 @@ def _stage_binding(
             expected.run_id,
             private_run_dir,
         )
-    if request_slot.ordinal not in range(1, 7):
+    if request_slot.ordinal not in range(1, len(spec.campaign.slots) + 1):
         raise QualificationRuntimeFailure("runtime_campaign_request_invalid")
     expected_slot = spec.campaign.slots[request_slot.ordinal - 1]
     if (
@@ -1247,6 +1251,7 @@ def _inspect_durable_stage_outcome(
             slot_ordinal=binding.slot_ordinal,
             cache_lane=binding.cache_lane,
             pair_index=binding.pair_index,
+            campaign_version=spec.campaign.version,
         )
     except (
         QualificationRuntimeFailure,
@@ -1261,6 +1266,7 @@ def _inspect_durable_stage_outcome(
         loaded.file_sha256,
         model_evidence.runtime_instance_sha256,
         loaded.proxy_reconciliation_sha256,
+        model_identity_sha256,
     )
 
 
@@ -1361,6 +1367,8 @@ def _load_runtime_spec(manifest: Path, runner: RuntimeCommandRunner) -> _Runtime
     proxy = _parse_proxy(section.get("proxy"), observer)
     credentials = _parse_credentials(section.get("credentials"), model.upstream_authenticated)
     campaign = _parse_campaign(section.get("campaign"))
+    if campaign.version == "v2" and benchmark.scenario_count != 30:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
     _validate_settings(proxy.settings, observer.container_url, proxy.container_port, model.upstream_authenticated)
     return _RuntimeSpec(manifest_sha256, source_commit, image, model, benchmark, observer, proxy, credentials, campaign)
 
@@ -1498,20 +1506,72 @@ def _parse_campaign(value: Any) -> _CampaignSpec:
     a caller-selected trial object.
     """
 
-    campaign = _exact_object(
-        value,
-        {
-            "campaign_id",
-            "slots",
-            "stage_order",
-            "treatment_order",
-            "model_instance_policy",
-            "failure_policy",
-            "policy_benefit_families",
-            "policy_benefit_case_count",
-            "policy_benefit_case_ids_sha256",
-        },
-    )
+    if not isinstance(value, dict):
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    version = value.get("campaign_version", "v1")
+    if version == "v1":
+        campaign = _exact_object(
+            value,
+            {
+                "campaign_id",
+                "slots",
+                "stage_order",
+                "treatment_order",
+                "model_instance_policy",
+                "failure_policy",
+                "policy_benefit_families",
+                "policy_benefit_case_count",
+                "policy_benefit_case_ids_sha256",
+            },
+        )
+        v2_private_scenario_deadline_seconds: int | None = None
+    elif version == "v2":
+        campaign = _exact_object(
+            value,
+            {
+                "campaign_version",
+                "campaign_id",
+                "slots",
+                "stage_order",
+                "treatment_order",
+                "model_instance_policy",
+                "failure_policy",
+                "cohort_case_ids",
+                "cohort_case_ids_sha256",
+                "critical_cohort_ordinals",
+                "critical_cohort_ordinals_sha256",
+                "scenario_deadline_seconds",
+            },
+        )
+        raw_cohort_case_ids = campaign.get("cohort_case_ids")
+        raw_critical_ordinals = campaign.get("critical_cohort_ordinals")
+        if (
+            not isinstance(raw_cohort_case_ids, list)
+            or len(raw_cohort_case_ids) != 22
+            or any(
+                not isinstance(case_id, str) or _RUN_ID.fullmatch(case_id) is None
+                for case_id in raw_cohort_case_ids
+            )
+            or len(set(raw_cohort_case_ids)) != 22
+            or not isinstance(raw_critical_ordinals, list)
+            or not raw_critical_ordinals
+            or any(
+                not isinstance(ordinal, int) or isinstance(ordinal, bool) or not 1 <= ordinal <= 22
+                for ordinal in raw_critical_ordinals
+            )
+            or raw_critical_ordinals != sorted(set(raw_critical_ordinals))
+            or not isinstance(campaign.get("cohort_case_ids_sha256"), str)
+            or _SHA256.fullmatch(campaign["cohort_case_ids_sha256"]) is None
+            or campaign["cohort_case_ids_sha256"] != _canonical_sha256(raw_cohort_case_ids)
+            or not isinstance(campaign.get("critical_cohort_ordinals_sha256"), str)
+            or _SHA256.fullmatch(campaign["critical_cohort_ordinals_sha256"]) is None
+            or campaign["critical_cohort_ordinals_sha256"] != _canonical_sha256(raw_critical_ordinals)
+            or campaign.get("scenario_deadline_seconds") != 600
+        ):
+            raise QualificationRuntimeFailure("runtime_manifest_invalid")
+        v2_private_scenario_deadline_seconds = 600
+    else:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
     campaign_id = _required_text(campaign.get("campaign_id"))
     raw_slots = campaign.get("slots")
     raw_families = campaign.get("policy_benefit_families")
@@ -1524,25 +1584,34 @@ def _parse_campaign(value: Any) -> _CampaignSpec:
         or campaign.get("model_instance_policy") != "fresh-per-scored-treatment"
         or campaign.get("failure_policy") != "terminal-no-rerun"
         or not isinstance(raw_slots, list)
-        or len(raw_slots) != 6
-        or not isinstance(raw_families, list)
-        or not raw_families
-        or any(not isinstance(family, str) or _RUN_ID.fullmatch(family) is None for family in raw_families)
-        or len(set(raw_families)) != len(raw_families)
-        or not isinstance(case_count, int)
-        or isinstance(case_count, bool)
-        or case_count <= 0
-        or not isinstance(case_ids_sha256, str)
-        or _SHA256.fullmatch(case_ids_sha256) is None
+        or len(raw_slots) != (6 if version == "v1" else 8)
+        or version == "v1"
+        and (
+            not isinstance(raw_families, list)
+            or not raw_families
+            or any(not isinstance(family, str) or _RUN_ID.fullmatch(family) is None for family in raw_families)
+            or len(set(raw_families)) != len(raw_families)
+            or not isinstance(case_count, int)
+            or isinstance(case_count, bool)
+            or case_count <= 0
+            or not isinstance(case_ids_sha256, str)
+            or _SHA256.fullmatch(case_ids_sha256) is None
+        )
     ):
         raise QualificationRuntimeFailure("runtime_manifest_invalid")
     expected: tuple[tuple[Literal["cold", "warm-prefix"], int], ...] = (
-        ("cold", 1),
-        ("cold", 2),
-        ("cold", 3),
-        ("warm-prefix", 1),
-        ("warm-prefix", 2),
-        ("warm-prefix", 3),
+        (("cold", 1), ("cold", 2), ("cold", 3), ("warm-prefix", 1), ("warm-prefix", 2), ("warm-prefix", 3))
+        if version == "v1"
+        else (
+            ("cold", 1),
+            ("cold", 2),
+            ("cold", 3),
+            ("cold", 4),
+            ("warm-prefix", 1),
+            ("warm-prefix", 2),
+            ("warm-prefix", 3),
+            ("warm-prefix", 4),
+        )
     )
     slots: list[_TrialSpec] = []
     run_ids: set[str] = set()
@@ -1562,9 +1631,11 @@ def _parse_campaign(value: Any) -> _CampaignSpec:
         campaign_id,
         hashlib.sha256(campaign_id.encode("utf-8")).hexdigest(),
         tuple(slots),
-        tuple(raw_families),
-        case_count,
-        case_ids_sha256,
+        tuple(raw_families) if isinstance(raw_families, list) else (),
+        case_count if isinstance(case_count, int) and not isinstance(case_count, bool) else 0,
+        case_ids_sha256 if isinstance(case_ids_sha256, str) else "",
+        cast(Literal["v1", "v2"], version),
+        v2_private_scenario_deadline_seconds,
     )
 
 
@@ -2522,6 +2593,10 @@ def _proxy_lease(
         proxy_request_accounting_provisional_ledger=(
             _proxy_request_accounting_provisional_ledger_path(private_run_dir) if stage == "score-proxy" else None
         ),
+        campaign_version=spec.campaign.version,
+        v2_private_scenario_deadline_seconds=(
+            spec.campaign.v2_private_scenario_deadline_seconds if stage != "preflight" else None
+        ),
     )
 
 
@@ -2568,6 +2643,10 @@ def _direct_lease(
         direct_timing_ledger=_direct_timing_ledger_path(private_run_dir) if stage == "score-direct" else None,
         direct_provisional_request_ledger=(
             _direct_provisional_request_ledger_path(private_run_dir) if stage == "score-direct" else None
+        ),
+        campaign_version=spec.campaign.version,
+        v2_private_scenario_deadline_seconds=(
+            spec.campaign.v2_private_scenario_deadline_seconds if stage != "preflight" else None
         ),
     )
 
@@ -2779,6 +2858,7 @@ def _begin_proxy_reconciliation(
         return ProxyReconciliationSession.begin(
             identity,
             _ContainerMetricsReader(runner, container_id, spec.proxy.container_port),
+            campaign_version=spec.campaign.version,
         )
     except (ReconciliationFailure, QualificationRuntimeFailure) as error:
         raise QualificationRuntimeFailure(error.category) from None
@@ -3257,6 +3337,7 @@ def _validate_prior_outcome(
             slot_ordinal=prior_binding.slot_ordinal,
             cache_lane=prior_binding.cache_lane,
             pair_index=prior_binding.pair_index,
+            campaign_version=spec.campaign.version,
         )
         # Keep the static stage mapping visible to type checking and future
         # schema changes: C1's output stage is part of the prior-evidence gate.

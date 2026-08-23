@@ -311,6 +311,29 @@ def _manifest(tmp_path: Path) -> Path:
     return path
 
 
+def _v2_campaign() -> dict[str, object]:
+    cohort_case_ids = [f"case-{ordinal:02d}" for ordinal in range(1, 23)]
+    critical_cohort_ordinals = [1, 2]
+    return {
+        "campaign_version": "v2",
+        "campaign_id": "qualification-campaign-v2",
+        "slots": [
+            {"cache_lane": lane, "pair_index": pair, "run_id": f"qualification-v2-{lane}-{pair}"}
+            for lane in ("cold", "warm-prefix")
+            for pair in range(1, 5)
+        ],
+        "stage_order": ["preflight", "score-direct", "score-proxy"],
+        "treatment_order": ["direct", "proxy"],
+        "model_instance_policy": "fresh-per-scored-treatment",
+        "failure_policy": "terminal-no-rerun",
+        "cohort_case_ids": cohort_case_ids,
+        "cohort_case_ids_sha256": _canonical_sha256(cohort_case_ids),
+        "critical_cohort_ordinals": critical_cohort_ordinals,
+        "critical_cohort_ordinals_sha256": _canonical_sha256(critical_cohort_ordinals),
+        "scenario_deadline_seconds": 600,
+    }
+
+
 def test_manifest_accepts_ornith_productization_sampler_profile(tmp_path) -> None:
     manifest = _manifest(tmp_path)
     document = _manifest_document(manifest)
@@ -2551,6 +2574,192 @@ def test_campaign_identity_is_strict_and_blocks_runtime_resources(field, value, 
     assert _docker_commands(runner) == []
 
 
+def test_v2_campaign_parser_commits_exact_eight_slot_topology_and_deadline() -> None:
+    spec = runtime_module._parse_campaign(_v2_campaign())
+
+    assert spec.version == "v2"
+    assert spec.v2_private_scenario_deadline_seconds == 600
+    assert len(spec.slots) == 8
+    assert [(slot.cache_lane, slot.pair_index) for slot in spec.slots] == [
+        ("cold", 1),
+        ("cold", 2),
+        ("cold", 3),
+        ("cold", 4),
+        ("warm-prefix", 1),
+        ("warm-prefix", 2),
+        ("warm-prefix", 3),
+        ("warm-prefix", 4),
+    ]
+
+
+def test_v2_runtime_manifest_requires_the_fixed_thirty_scenario_denominator(tmp_path) -> None:
+    manifest = _manifest(tmp_path)
+    document = _manifest_document(manifest)
+    runtime = document["qualification_runtime"]
+    assert isinstance(runtime, dict)
+    runtime["campaign"] = _v2_campaign()
+    _store_manifest(manifest, document)
+
+    with pytest.raises(runtime_module.QualificationRuntimeFailure, match="^runtime_manifest_invalid$"):
+        runtime_module._load_runtime_spec(manifest, _FakeRuntimeRunner())
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda campaign: campaign["slots"].__setitem__(
+            3,
+            {"cache_lane": "warm-prefix", "pair_index": 4, "run_id": "wrong"},
+        ),
+        lambda campaign: campaign.__setitem__("scenario_deadline_seconds", 599),
+        lambda campaign: campaign.__setitem__("cohort_case_ids_sha256", "0" * 64),
+        lambda campaign: campaign.__setitem__("critical_cohort_ordinals", []),
+        lambda campaign: campaign.__setitem__("campaign_version", "v3"),
+    ],
+)
+def test_v2_campaign_parser_rejects_invalid_topology_or_commitments(mutate) -> None:
+    campaign = _v2_campaign()
+    mutate(campaign)
+
+    with pytest.raises(runtime_module.QualificationRuntimeFailure, match="^runtime_manifest_invalid$"):
+        runtime_module._parse_campaign(campaign)
+
+
+def test_v2_stage_binding_accepts_slot_eight_proxy_at_sequence_seventeen_only(tmp_path) -> None:
+    campaign = runtime_module._parse_campaign(_v2_campaign())
+    slots_dir = tmp_path / "slots"
+    slot_dir = slots_dir / "08-warm-prefix-pair4"
+    slots_dir.mkdir()
+    expected_slot = campaign.slots[7]
+    runtime_spec = SimpleNamespace(campaign=campaign, manifest_sha256="a" * 64)
+    request = StageRequest(
+        manifest=tmp_path / "manifest.json",
+        manifest_sha256="a" * 64,
+        sequence=17,
+        slot=CampaignSlot(8, "warm-prefix", 4, expected_slot.run_id),
+        stage="score-proxy",
+        private_run_dir=slot_dir,
+        outcome_path=slot_dir / "scored-proxy-runtime-outcome.json",
+    )
+
+    binding = runtime_module._stage_binding(runtime_spec, "score-proxy", slot_dir, request)
+
+    assert (binding.slot_ordinal, binding.cache_lane, binding.pair_index) == (8, "warm-prefix", 4)
+    with pytest.raises(runtime_module.QualificationRuntimeFailure, match="^runtime_campaign_request_invalid$"):
+        runtime_module._stage_binding(runtime_spec, "score-proxy", slot_dir, replace(request, sequence=16))
+
+
+def test_v2_scored_leases_carry_the_manifest_deadline_but_preflight_does_not(tmp_path) -> None:
+    campaign = runtime_module._parse_campaign(_v2_campaign())
+    spec = SimpleNamespace(
+        manifest_sha256="a" * 64,
+        source_commit="b" * 40,
+        image=SimpleNamespace(digest="sha256:" + "c" * 64),
+        model=SimpleNamespace(public_id="model", upstream_url="http://127.0.0.1:19999/v1"),
+        benchmark=SimpleNamespace(
+            revision="revision",
+            agentic_set="expanded",
+            sampler_profile="corrected-parity-v1",
+            scenario_order_sha256="d" * 64,
+            scenario_count=30,
+            checkout_path=tmp_path,
+        ),
+        credentials=SimpleNamespace(upstream_model_api_key_file=None),
+        campaign=campaign,
+    )
+    model_session = SimpleNamespace(model_identity_sha256="e" * 64, model_contract_sha256="f" * 64)
+    binding = runtime_module._StageBinding(
+        campaign.campaign_id_sha256,
+        8,
+        "warm-prefix",
+        4,
+        campaign.slots[7].run_id,
+        tmp_path,
+    )
+
+    scored = runtime_module._direct_lease(
+        spec, "score-direct", tmp_path, tmp_path / "attestation.json", model_session, binding
+    )
+    preflight = runtime_module._direct_lease(
+        spec, "preflight", tmp_path, tmp_path / "attestation.json", model_session, binding
+    )
+
+    assert (scored.campaign_version, scored.v2_private_scenario_deadline_seconds) == ("v2", 600)
+    assert (preflight.campaign_version, preflight.v2_private_scenario_deadline_seconds) == ("v2", None)
+
+
+def test_v2_durable_outcome_inspection_uses_the_v2_loader_contract(monkeypatch, tmp_path) -> None:
+    campaign = runtime_module._parse_campaign(_v2_campaign())
+    slot_dir = tmp_path / "08-warm-prefix-pair4"
+    request = StageRequest(
+        manifest=tmp_path / "manifest.json",
+        manifest_sha256="a" * 64,
+        sequence=16,
+        slot=CampaignSlot(8, "warm-prefix", 4, campaign.slots[7].run_id),
+        stage="score-direct",
+        private_run_dir=slot_dir,
+        outcome_path=slot_dir / "scored-direct-runtime-outcome.json",
+    )
+    spec = SimpleNamespace(manifest_sha256="a" * 64, benchmark=SimpleNamespace(scenario_count=30), campaign=campaign)
+    binding = runtime_module._StageBinding(
+        campaign.campaign_id_sha256,
+        8,
+        "warm-prefix",
+        4,
+        campaign.slots[7].run_id,
+        tmp_path,
+    )
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(runtime_module, "_read_private_file", lambda *_args: b'{"status":"passed"}')
+    monkeypatch.setattr(runtime_module, "_valid_stage_outcome_document", lambda *_args: True)
+    monkeypatch.setattr(runtime_module, "_attestation_model_identity", lambda _path: "e" * 64)
+    monkeypatch.setattr(
+        runtime_module,
+        "load_model_evidence",
+        lambda *_args, **_kwargs: SimpleNamespace(runtime_instance_sha256="f" * 64),
+    )
+
+    def load_outcome(*_args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(file_sha256="1" * 64, proxy_reconciliation_sha256=None)
+
+    monkeypatch.setattr(runtime_module, "load_runtime_outcome", load_outcome)
+
+    result = runtime_module._inspect_durable_stage_outcome(request, spec, binding)
+
+    assert result is not None
+    assert result.model_identity_sha256 == "e" * 64
+    assert captured["campaign_version"] == "v2"
+
+
+def test_v2_proxy_reconciliation_begins_with_the_v2_identity_contract(monkeypatch, tmp_path) -> None:
+    attestation = tmp_path / "attestation.json"
+    attestation.write_text("{}", encoding="utf-8")
+    attestation.chmod(0o600)
+    captured: dict[str, object] = {}
+    sentinel = object()
+
+    def begin(identity, _reader, *, campaign_version):
+        captured["identity"] = identity
+        captured["campaign_version"] = campaign_version
+        return sentinel
+
+    monkeypatch.setattr(runtime_module.ProxyReconciliationSession, "begin", staticmethod(begin))
+    spec = SimpleNamespace(
+        manifest_sha256="a" * 64,
+        proxy=SimpleNamespace(container_port=8090),
+        campaign=SimpleNamespace(version="v2"),
+    )
+    binding = runtime_module._StageBinding("b" * 64, 8, "warm-prefix", 4, "slot-eight", tmp_path)
+
+    assert runtime_module._begin_proxy_reconciliation(object(), "container", spec, binding, attestation) is sentinel
+    assert captured["campaign_version"] == "v2"
+    identity = captured["identity"]
+    assert isinstance(identity, runtime_module.ReconciliationIdentity)
+    assert (identity.slot_ordinal, identity.cache_lane, identity.pair_index) == (8, "warm-prefix", 4)
+
+
 def test_campaign_stage_runner_inspects_absent_partial_failed_and_passed_outcomes(tmp_path) -> None:
     """Campaign recovery uses durable outcome validation, never filename inference."""
 
@@ -3473,6 +3682,8 @@ def test_thin_cli_derives_fixed_child_argv_without_secret_values(stage) -> None:
     assert "--candidate-source-commit" in argv
     assert "--candidate-image-digest" in argv
     assert "--run-manifest-sha256" in argv
+    assert "--campaign-version" not in argv
+    assert "--v2-private-scenario-deadline-seconds" not in argv
     assert argv[argv.index("--sampler-profile") + 1] == "historical-aeon-v1"
     assert argv[argv.index("--run-id") + 1] == "qualified-run"
     assert argv[argv.index("--cache-mode") + 1] == ("bypass" if stage == "preflight" else "warm-prefix")
@@ -3507,6 +3718,46 @@ def test_thin_cli_derives_fixed_child_argv_without_secret_values(stage) -> None:
         assert argv[argv.index("--variant") + 1] == "warm-prefix-pair2-proxy-expanded"
         assert argv[argv.index("--preflight-runtime-outcome") + 1] == "/private/preflight-runtime-outcome.json"
         assert argv[argv.index("--direct-runtime-outcome") + 1] == "/private/scored-direct-runtime-outcome.json"
+
+
+@pytest.mark.parametrize("stage", ["score-direct", "score-proxy"])
+def test_thin_cli_adds_v2_contract_only_to_scored_child(stage: str) -> None:
+    cli = _load_runtime_cli()
+    lease = replace(
+        _lease(stage),
+        campaign_version="v2",
+        v2_private_scenario_deadline_seconds=600,
+    )
+
+    argv = cli.paired_runner_argv(lease)
+
+    assert argv[argv.index("--campaign-version") + 1] == "v2"
+    assert argv[argv.index("--v2-private-scenario-deadline-seconds") + 1] == "600"
+
+
+def test_thin_cli_never_adds_v2_contract_to_preflight_or_priming() -> None:
+    cli = _load_runtime_cli()
+    preflight = replace(_lease("preflight"), campaign_version="v2")
+    scored = replace(
+        _lease("score-direct"),
+        campaign_version="v2",
+        v2_private_scenario_deadline_seconds=600,
+    )
+
+    preflight_argv = cli.paired_runner_argv(preflight)
+    prime_argv = cli._prime_runner_argv(scored)
+
+    assert "--campaign-version" not in preflight_argv
+    assert "--v2-private-scenario-deadline-seconds" not in preflight_argv
+    assert "--campaign-version" not in prime_argv
+    assert "--v2-private-scenario-deadline-seconds" not in prime_argv
+
+
+def test_thin_cli_rejects_v2_scored_lease_without_deadline() -> None:
+    cli = _load_runtime_cli()
+
+    with pytest.raises(ValueError, match="v2 scored qualification lease requires a scenario deadline"):
+        cli.paired_runner_argv(replace(_lease("score-direct"), campaign_version="v2"))
 
 
 def test_thin_cli_forces_preflight_bypass_even_for_a_warm_campaign() -> None:
@@ -3600,6 +3851,27 @@ def test_campaign_cli_advances_only_the_manifest_derived_next_stage(tmp_path) ->
             ],
             campaign_advancer=campaign_advancer,
         )
+
+
+@pytest.mark.parametrize(
+    ("advance_kind", "expected_exit"),
+    (("campaign_passed", 0), ("campaign_scored_complete", 3)),
+)
+def test_campaign_cli_distinguishes_v1_promotion_from_v2_scored_completion(
+    tmp_path, advance_kind: str, expected_exit: int
+) -> None:
+    cli = _load_runtime_cli()
+
+    def campaign_advancer(*_args, **_kwargs):
+        return SimpleNamespace(kind=advance_kind)
+
+    assert (
+        cli.main(
+            ["--manifest", str(tmp_path / "manifest.json"), "--private-campaign-dir", str(tmp_path)],
+            campaign_advancer=campaign_advancer,
+        )
+        == expected_exit
+    )
 
 
 def test_campaign_cli_rejects_relative_campaign_dir_before_creating_campaign_state(tmp_path) -> None:

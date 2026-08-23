@@ -1215,6 +1215,12 @@ def main() -> None:
     parser.add_argument("--case-id", default=None)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
+        "--campaign-version",
+        choices=("v1", "v2"),
+        default="v1",
+        help="Private qualification campaign contract version; v2 is valid only for scored runs.",
+    )
+    parser.add_argument(
         "--v2-private-scenario-deadline-seconds",
         type=_v2_private_scenario_deadline_seconds,
         default=None,
@@ -1305,6 +1311,13 @@ def main() -> None:
     parser.add_argument("--cache-prime-arm", choices=("direct", "proxy"))
     args = parser.parse_args()
 
+    if args.campaign_version == "v1" and args.v2_private_scenario_deadline_seconds is not None:
+        parser.error("--v2-private-scenario-deadline-seconds requires --campaign-version v2")
+    if args.campaign_version == "v2" and (args.paired_preflight or args.cache_prime_only):
+        parser.error("--campaign-version v2 is valid only for scored runs")
+    if args.campaign_version == "v2" and args.v2_private_scenario_deadline_seconds is None:
+        parser.error("scored v2 requires --v2-private-scenario-deadline-seconds")
+
     selected = scenario_set(args.agentic_set)
     if args.case_id is not None:
         selected = [scenario for scenario in selected if scenario.case_id == args.case_id]
@@ -1390,6 +1403,7 @@ def main() -> None:
         runtime_attestation=args.runtime_attestation,
         preflight_runtime_outcome=args.preflight_runtime_outcome,
         direct_runtime_outcome=args.direct_runtime_outcome,
+        campaign_version=args.campaign_version,
     )
     api_key = _read_key(args.api_key_file)
     client = ProjectionAwareOpenAIClient(args.base_url, api_key=api_key, timeout_s=600.0)

@@ -7,7 +7,9 @@ import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -21,6 +23,7 @@ from shiftedx_harness_proxy.qualification_campaign import (
     StageResult,
     advance_qualification_campaign,
 )
+from shiftedx_harness_proxy.qualification_campaign_v2 import V2OutcomeRecord
 
 
 def _campaign_manifest(path: Path) -> Path:
@@ -60,6 +63,47 @@ def _private_campaign(path: Path) -> Path:
     path.mkdir(mode=0o700)
     os.chmod(path, 0o700)
     return path
+
+
+def _v2_campaign_manifest(path: Path) -> tuple[Path, tuple[str, ...]]:
+    scenario_case_ids = tuple(f"v2-case-{ordinal:02d}" for ordinal in range(1, 31))
+    cohort_case_ids = scenario_case_ids[:22]
+    critical_ordinals = [1, 2]
+    slots = [
+        {"cache_lane": lane, "pair_index": pair, "run_id": f"qualification-v2-{lane}-{pair}"}
+        for lane in ("cold", "warm-prefix")
+        for pair in range(1, 5)
+    ]
+    document = {
+        "qualification_runtime": {
+            "benchmark": {
+                "scenario_count": 30,
+                "scenario_order_sha256": hashlib.sha256(
+                    json.dumps(scenario_case_ids, separators=(",", ":")).encode()
+                ).hexdigest(),
+            },
+            "campaign": {
+                "campaign_version": "v2",
+                "campaign_id": "qualification-2026-08-23-v2",
+                "slots": slots,
+                "stage_order": ["preflight", "score-direct", "score-proxy"],
+                "treatment_order": ["direct", "proxy"],
+                "model_instance_policy": "fresh-per-scored-treatment",
+                "failure_policy": "terminal-no-rerun",
+                "cohort_case_ids": list(cohort_case_ids),
+                "cohort_case_ids_sha256": hashlib.sha256(
+                    json.dumps(cohort_case_ids, separators=(",", ":")).encode()
+                ).hexdigest(),
+                "critical_cohort_ordinals": critical_ordinals,
+                "critical_cohort_ordinals_sha256": hashlib.sha256(
+                    json.dumps(critical_ordinals, separators=(",", ":")).encode()
+                ).hexdigest(),
+                "scenario_deadline_seconds": 600,
+            },
+        }
+    }
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return path, scenario_case_ids
 
 
 class _ReadyProbe:
@@ -209,6 +253,40 @@ class _FakeStageRunner:
         return result
 
 
+class _V2FakeStageRunner(_FakeStageRunner):
+    def run(self, request: StageRequest) -> StageResult:
+        result = super().run(request)
+        if request.stage in {"score-direct", "score-proxy"}:
+            result = replace(
+                result,
+                model_identity_sha256=hashlib.sha256(
+                    f"model-identity-{request.sequence}".encode()
+                ).hexdigest(),
+            )
+            self.results[request.outcome_path] = result
+        return result
+
+
+def _v2_adapted_records(spec: Any, ledgers: Any) -> list[V2OutcomeRecord]:
+    del ledgers
+    records: list[V2OutcomeRecord] = []
+    for arm in ("direct", "proxy"):
+        for ordinal in range(1, 23):
+            records.append(
+                V2OutcomeRecord(
+                    case_ordinal=ordinal,
+                    cache_lane=spec.cache_lane,
+                    replicate=spec.replicate,
+                    arm=arm,
+                    passed=not (arm == "direct" and ordinal <= 3),
+                    wall_s=Decimal(10 if arm == "direct" else 5),
+                    deadline_s=Decimal(600),
+                    critical_integrity_violation=False,
+                )
+            )
+    return records
+
+
 def test_first_advance_derives_one_campaign_preflight_and_writes_private_event(tmp_path: Path) -> None:
     manifest = _campaign_manifest(tmp_path / "manifest.json")
     private = _private_campaign(tmp_path / "campaign")
@@ -281,7 +359,7 @@ def test_scored_advance_waits_for_restart_then_runs_the_only_next_treatment(tmp_
         lambda campaign: campaign.update(extra=True),
     ],
 )
-def test_manifest_freezes_exact_six_slot_order_and_policies(tmp_path: Path, mutation) -> None:
+def test_manifest_freezes_exact_six_slot_order_and_policies(tmp_path: Path, mutation: Any) -> None:
     manifest = _campaign_manifest(tmp_path / "manifest.json")
     document = json.loads(manifest.read_text(encoding="utf-8"))
     mutation(document["qualification_runtime"]["campaign"])
@@ -691,3 +769,209 @@ def test_concurrent_advances_cannot_run_the_same_stage_twice(tmp_path: Path) -> 
 
     assert sorted(item.sequence for item in results if item.sequence is not None) == [1, 2]
     assert [request.sequence for request in runner.requests] == [1, 2]
+
+
+def test_v2_campaign_runs_exact_direct_then_proxy_topology_and_writes_public_aggregate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, scenario_case_ids = _v2_campaign_manifest(tmp_path / "manifest.json")
+    private = _private_campaign(tmp_path / "campaign")
+    runner = _V2FakeStageRunner()
+    import shiftedx_harness_proxy.qualification_campaign_v2_evidence as evidence
+
+    adapted_pairs: list[tuple[Any, Any]] = []
+
+    def adapt(spec: Any, ledgers: Any) -> list[V2OutcomeRecord]:
+        adapted_pairs.append((spec, ledgers))
+        return _v2_adapted_records(spec, ledgers)
+
+    monkeypatch.setattr(evidence, "adapt_v2_scored_evidence", adapt)
+
+    results = [
+        advance_qualification_campaign(manifest, private, stage_runner=runner, readiness_probe=_ReadyProbe())
+        for _ in range(17)
+    ]
+
+    assert [
+        (request.sequence, request.stage, request.slot.cache_lane, request.slot.pair_index)
+        for request in runner.requests
+    ] == [
+        (1, "preflight", "preflight", 0),
+        *[
+            (sequence, stage, lane, replicate)
+            for sequence, (lane, replicate, stage) in enumerate(
+                (
+                    item
+                    for lane in ("cold", "warm-prefix")
+                    for replicate in range(1, 5)
+                    for item in ((lane, replicate, "score-direct"), (lane, replicate, "score-proxy"))
+                ),
+                start=2,
+            )
+        ],
+    ]
+    assert results[-1].kind == "campaign_scored_complete"
+    assert results[-1].campaign_outcome_sha256 is not None
+    assert len(adapted_pairs) == 8
+    assert all(len(ledgers) == 2 for _spec, ledgers in adapted_pairs)
+
+    direct = json.loads((private / "campaign-events" / "0002.json").read_text(encoding="utf-8"))
+    proxy = json.loads((private / "campaign-events" / "0003.json").read_text(encoding="utf-8"))
+    assert proxy["direct_predecessor_runtime_outcome_sha256"] == direct["runtime_outcome_sha256"]
+    assert proxy["model_identity_sha256"] == hashlib.sha256(b"model-identity-3").hexdigest()
+
+    outcome = json.loads((private / "qualification-campaign-outcome.json").read_text(encoding="utf-8"))
+    assert set(outcome) == {
+        "schema_version",
+        "record_type",
+        "status",
+        "scored_decision",
+        "failure_category",
+        "campaign_manifest_sha256",
+        "head_event_sha256",
+        "event_count",
+        "slot_count",
+        "scored_stage_count",
+        "scored_model_instance_count",
+        "proxy_reconciliation_sha256s",
+        "evaluator",
+    }
+    assert outcome["schema_version"] == "2.0"
+    assert outcome["status"] == "scored_complete"
+    assert outcome["scored_decision"] == "scored_passed"
+    assert outcome["event_count"] == 17
+    assert outcome["slot_count"] == 8
+    assert outcome["scored_stage_count"] == 16
+    assert outcome["scored_model_instance_count"] == 16
+    serialized_outcome = json.dumps(outcome, sort_keys=True)
+    assert "case_id" not in serialized_outcome
+    assert str(private) not in serialized_outcome
+    assert all(case_id not in serialized_outcome for case_id in scenario_case_ids)
+
+    again = advance_qualification_campaign(manifest, private, stage_runner=runner, readiness_probe=_ReadyProbe())
+    assert again == results[-1]
+    assert len(runner.requests) == 17
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda campaign: campaign.update(scenario_deadline_seconds=599),
+        lambda campaign: campaign["slots"].reverse(),
+        lambda campaign: campaign.update(policy_benefit_case_count=22),
+        lambda campaign: campaign.update(critical_cohort_ordinals=[]),
+    ],
+)
+def test_v2_manifest_freezes_the_campaign_topology_and_deadline(tmp_path: Path, mutation: Any) -> None:
+    manifest, _scenario_case_ids = _v2_campaign_manifest(tmp_path / "manifest.json")
+    document = json.loads(manifest.read_text(encoding="utf-8"))
+    mutation(document["qualification_runtime"]["campaign"])
+    manifest.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(CampaignFailure, match="campaign_manifest_invalid"):
+        advance_qualification_campaign(
+            manifest,
+            _private_campaign(tmp_path / "campaign"),
+            stage_runner=_V2FakeStageRunner(),
+            readiness_probe=_ReadyProbe(),
+        )
+
+
+@pytest.mark.parametrize("scenario_count", (29, 31))
+def test_v2_manifest_requires_exact_thirty_scenarios(tmp_path: Path, scenario_count: int) -> None:
+    manifest, _scenario_case_ids = _v2_campaign_manifest(tmp_path / "manifest.json")
+    document = json.loads(manifest.read_text(encoding="utf-8"))
+    document["qualification_runtime"]["benchmark"]["scenario_count"] = scenario_count
+    manifest.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(CampaignFailure, match="campaign_manifest_invalid"):
+        advance_qualification_campaign(
+            manifest,
+            _private_campaign(tmp_path / "campaign"),
+            stage_runner=_V2FakeStageRunner(),
+            readiness_probe=_ReadyProbe(),
+        )
+
+
+def test_v2_evaluator_bug_propagates_without_writing_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, _scenario_case_ids = _v2_campaign_manifest(tmp_path / "manifest.json")
+    private = _private_campaign(tmp_path / "campaign")
+    runner = _V2FakeStageRunner()
+    import shiftedx_harness_proxy.qualification_campaign_v2 as evaluator
+    import shiftedx_harness_proxy.qualification_campaign_v2_evidence as evidence
+
+    monkeypatch.setattr(evidence, "adapt_v2_scored_evidence", _v2_adapted_records)
+
+    def unexpected_bug(_records: Any) -> dict[str, Any]:
+        raise RuntimeError("unexpected evaluator bug")
+
+    monkeypatch.setattr(evaluator, "evaluate_qualification_v2", unexpected_bug)
+
+    with pytest.raises(RuntimeError, match="unexpected evaluator bug"):
+        for _ in range(17):
+            advance_qualification_campaign(manifest, private, stage_runner=runner, readiness_probe=_ReadyProbe())
+    assert not (private / "qualification-campaign-outcome.json").exists()
+
+
+def test_v2_authenticated_gate_failure_is_scored_complete(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest, _scenario_case_ids = _v2_campaign_manifest(tmp_path / "manifest.json")
+    private = _private_campaign(tmp_path / "campaign")
+    runner = _V2FakeStageRunner()
+    import shiftedx_harness_proxy.qualification_campaign_v2_evidence as evidence
+
+    def no_benefit(spec: Any, ledgers: Any) -> list[V2OutcomeRecord]:
+        return [replace(record, passed=True) for record in _v2_adapted_records(spec, ledgers)]
+
+    monkeypatch.setattr(evidence, "adapt_v2_scored_evidence", no_benefit)
+    final = [
+        advance_qualification_campaign(manifest, private, stage_runner=runner, readiness_probe=_ReadyProbe())
+        for _ in range(17)
+    ][-1]
+
+    outcome = json.loads((private / "qualification-campaign-outcome.json").read_text(encoding="utf-8"))
+    assert final.kind == "campaign_scored_complete"
+    assert final.failure_category == "v2_scored_gate_failed"
+    assert outcome["status"] == "scored_complete"
+    assert outcome["scored_decision"] == "scored_failed"
+
+
+def test_v2_known_evidence_failure_is_terminal_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest, _scenario_case_ids = _v2_campaign_manifest(tmp_path / "manifest.json")
+    private = _private_campaign(tmp_path / "campaign")
+    runner = _V2FakeStageRunner()
+    import shiftedx_harness_proxy.qualification_campaign_v2_evidence as evidence
+
+    def invalid_evidence(_spec: Any, _ledgers: Any) -> list[V2OutcomeRecord]:
+        raise evidence.QualificationV2EvidenceFailure("qualification_v2_evidence_invalid")
+
+    monkeypatch.setattr(evidence, "adapt_v2_scored_evidence", invalid_evidence)
+    final = [
+        advance_qualification_campaign(manifest, private, stage_runner=runner, readiness_probe=_ReadyProbe())
+        for _ in range(17)
+    ][-1]
+
+    outcome = json.loads((private / "qualification-campaign-outcome.json").read_text(encoding="utf-8"))
+    assert final.kind == "campaign_failed"
+    assert final.failure_category == "v2_evidence_invalid"
+    assert outcome["status"] == "failed"
+    assert outcome["evaluator"] is None
+
+
+def test_v2_failure_is_terminal_and_never_reruns(tmp_path: Path) -> None:
+    manifest, _scenario_case_ids = _v2_campaign_manifest(tmp_path / "manifest.json")
+    private = _private_campaign(tmp_path / "campaign")
+    runner = _V2FakeStageRunner(statuses={3: "failed"})
+
+    first = [
+        advance_qualification_campaign(manifest, private, stage_runner=runner, readiness_probe=_ReadyProbe())
+        for _ in range(3)
+    ][-1]
+    second = advance_qualification_campaign(manifest, private, stage_runner=runner, readiness_probe=_ReadyProbe())
+
+    assert first.kind == "campaign_failed"
+    assert first.failure_category == "stage_failed"
+    assert second.kind == "campaign_failed"
+    assert second.event_sha256 == first.event_sha256
+    assert len(runner.requests) == 3

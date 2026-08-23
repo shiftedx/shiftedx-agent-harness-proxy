@@ -2193,6 +2193,7 @@ def _scored_direct_argv(
     preflight_outcome,
     attempts,
     provisional,
+    campaign_version: str | None = None,
     v2_private_scenario_deadline_seconds: str | None = None,
 ):
     argv = [
@@ -2222,6 +2223,8 @@ def _scored_direct_argv(
         "--direct-provisional-request-ledger",
         str(provisional),
     ]
+    if campaign_version is not None:
+        argv.extend(["--campaign-version", campaign_version])
     if v2_private_scenario_deadline_seconds is not None:
         argv.extend(
             [
@@ -2230,6 +2233,46 @@ def _scored_direct_argv(
             ]
         )
     return argv
+
+
+@pytest.mark.parametrize(
+    ("campaign_version", "deadline", "mode", "message"),
+    [
+        ("v1", "600", (), "requires --campaign-version v2"),
+        ("v2", None, (), "scored v2 requires"),
+        ("v2", "600", ("--paired-preflight",), "valid only for scored"),
+        ("v2", "600", ("--cache-prime-only",), "valid only for scored"),
+    ],
+)
+def test_campaign_version_deadline_contract_rejects_invalid_modes_before_action(
+    monkeypatch, capsys, tmp_path, campaign_version, deadline, mode, message
+):
+    runner = load_runner(monkeypatch)
+    argv = [
+        "run_paired_agentic_trial.py",
+        "--model",
+        "model",
+        "--output",
+        str(tmp_path / "unused.jsonl"),
+        "--variant",
+        "direct",
+        "--campaign-version",
+        campaign_version,
+        *mode,
+    ]
+    if deadline is not None:
+        argv.extend(["--v2-private-scenario-deadline-seconds", deadline])
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(
+        runner,
+        "scenario_set",
+        lambda _agentic_set: (_ for _ in ()).throw(AssertionError("runner action must not start")),
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        runner.main()
+
+    assert message in capsys.readouterr().err
 
 
 def _scored_direct_prerequisites(runner, tmp_path):
@@ -2293,6 +2336,7 @@ def test_v2_private_scenario_deadline_retains_expiry_and_continues_later_case(mo
             preflight_outcome=preflight_outcome,
             attempts=attempts,
             provisional=provisional,
+            campaign_version="v2",
             v2_private_scenario_deadline_seconds="0.01",
         ),
     )

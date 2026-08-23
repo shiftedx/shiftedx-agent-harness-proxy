@@ -1510,6 +1510,7 @@ def require_scoring_gate(
     runtime_attestation: Path | None = None,
     preflight_runtime_outcome: Path | None = None,
     direct_runtime_outcome: Path | None = None,
+    campaign_version: Literal["v1", "v2"] = "v1",
 ) -> None:
     """Prohibit scored writes unless a matching paired preflight and immutable provenance exist."""
     if output.exists():
@@ -1621,6 +1622,7 @@ def require_scoring_gate(
                 model_identity_sha256=preflight_attestation.model_identity_sha256,
                 output_ledger=direct_runtime_outcome.with_name("scored-direct.jsonl"),
                 expected_output_record_count=len(scenario_order),
+                campaign_version=campaign_version,
             )
         except RuntimeOutcomeFailure as error:
             raise SystemExit("scored proxy requires a passed matching direct runtime outcome") from error

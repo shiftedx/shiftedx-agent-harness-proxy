@@ -14,7 +14,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, Decimal
 from math import comb
-from typing import Literal
+from typing import Any, Literal
 
 Arm = Literal["direct", "proxy"]
 _LANES = ("cold", "warm-prefix")
@@ -50,7 +50,7 @@ class V2OutcomeRecord:
     critical_integrity_violation: bool
 
 
-def evaluate_qualification_v2(records: Sequence[V2OutcomeRecord]) -> dict[str, object]:
+def evaluate_qualification_v2(records: Sequence[V2OutcomeRecord]) -> dict[str, Any]:
     """Evaluate fixed, complete matched evidence without exposing case IDs.
 
     The primary time measure is a capped loss: a valid outcome contributes its
