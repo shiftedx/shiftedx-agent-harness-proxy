@@ -278,6 +278,12 @@ def create_app(
                 else "failed"
             )
             timing.begin_response_finalize()
+        corrections, blocked_duplicates, blocked_stalls = getattr(
+            request.state, "intervention_counts", (0, 0, 0)
+        )
+        counters.correction_turns += corrections
+        counters.blocked_duplicates += blocked_duplicates
+        counters.blocked_stalls += blocked_stalls
         counters.errors += 1
         if exc.code in {
             "receipt_override_denied",
@@ -345,6 +351,7 @@ def create_app(
 
     @app.post("/v1/chat/completions")
     async def chat(request: Request) -> Response:
+        request.state.intervention_counts = [0, 0, 0]
         correlation_id = _set_correlation_id(request)
         principal = _authenticate(request, settings)
         deadline_at = _deadline_at(settings)
@@ -377,6 +384,7 @@ def create_app(
                             policy_extensions_allowed=principal.policy_extensions_allowed,
                             trusted_policy_extension_used=opt_out,
                             server_cache_namespace=principal.server_cache_namespace,
+                            intervention_counts=request.state.intervention_counts,
                         ),
                     )
                     headers = _telemetry_headers(result, settings)
@@ -413,6 +421,7 @@ def create_app(
                     if timing is not None:
                         timing.begin_response_finalize()
                     counters.observe(result)
+                    request.state.intervention_counts[:] = [0, 0, 0]
                 if replay_options is not None:
                     response = _ReplayStreamingResponse(
                         _replay_stream(replay),
@@ -429,6 +438,10 @@ def create_app(
             raise ProxyError(504, "request_deadline_exceeded", "The request exceeded its total time limit.") from exc
         except asyncio.CancelledError:
             counters.cancellations += 1
+            corrections, blocked_duplicates, blocked_stalls = request.state.intervention_counts
+            counters.correction_turns += corrections
+            counters.blocked_duplicates += blocked_duplicates
+            counters.blocked_stalls += blocked_stalls
             timing = current_request_timing()
             if timing is not None:
                 timing.classify("cancelled")

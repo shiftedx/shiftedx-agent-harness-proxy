@@ -16,6 +16,11 @@ from starlette.requests import Request
 from shiftedx_harness_proxy.api import create_app
 from shiftedx_harness_proxy.config import Settings
 from shiftedx_harness_proxy.errors import ProxyError
+from shiftedx_harness_proxy.qualification_timing import (
+    PrivateTimingSink,
+    read_timing_capture_ledger,
+    reserve_timing_capture_ledger,
+)
 from shiftedx_harness_proxy.transport import HttpxUpstream
 
 JsonObject = dict[str, Any]
@@ -71,13 +76,17 @@ class ScriptedUpstream:
 
 
 class WaitingUpstream(ScriptedUpstream):
-    def __init__(self) -> None:
-        super().__init__([])
+    def __init__(self, outcomes: list[JsonObject | BaseException] | None = None) -> None:
+        super().__init__(outcomes or [])
+        self.waiting = asyncio.Event()
 
     async def chat(self, payload: JsonObject, request_headers: dict[str, str]) -> JsonObject:
+        if self.outcomes:
+            return await super().chat(payload, request_headers)
         del request_headers
         self.calls.append(payload)
         self.started.set()
+        self.waiting.set()
         try:
             await asyncio.sleep(10)
         except asyncio.CancelledError:
@@ -151,6 +160,30 @@ def strict_schema() -> JsonObject:
             },
         },
     }
+
+
+def blocked_duplicate_case() -> tuple[JsonObject, JsonObject]:
+    duplicate = {
+        "id": "again",
+        "type": "function",
+        "function": {"name": "read_file", "arguments": '{"path":"a.py"}'},
+    }
+    return (
+        {
+            "model": "model",
+            "messages": [
+                {"role": "user", "content": "synthetic"},
+                {"role": "assistant", "tool_calls": [{**duplicate, "id": "old"}]},
+                {"role": "tool", "tool_call_id": "old", "content": "source"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+            "response_format": strict_schema(),
+        },
+        {
+            "id": "chatcmpl",
+            "choices": [{"message": {"role": "assistant", "content": "", "tool_calls": [duplicate]}}],
+        },
+    )
 
 
 def assert_ledger(values: dict[str, int], *, requests: int, attempts: int, calls: int) -> None:
@@ -295,7 +328,7 @@ async def test_phase_attempt_counters_only_follow_started_acquisition_and_finali
 
 
 @pytest.mark.asyncio
-async def test_retry_exhaustion_counts_every_started_attempt() -> None:
+async def test_retry_exhaustion_counts_every_started_attempt_and_its_corrections() -> None:
     upstream = ScriptedUpstream([completion("not-json"), completion("not-json"), completion("not-json")])
     payload = {**chat_payload(), "response_format": strict_schema()}
     response, values = await post(create_app(settings(), upstream), payload)
@@ -305,10 +338,108 @@ async def test_retry_exhaustion_counts_every_started_attempt() -> None:
     assert_ledger(values, requests=1, attempts=3, calls=len(upstream.calls))
     assert correction_turns_sent(upstream) == 2
     assert values["shiftedx_proxy_upstream_calls_total"] == 1 + correction_turns_sent(upstream)
-    # Successful-policy telemetry deliberately does not report corrections from an exhausted request.
-    assert values["shiftedx_proxy_correction_turns_total"] == 0
+    assert values["shiftedx_proxy_correction_turns_total"] == 2
     assert values["shiftedx_proxy_errors_total"] == 1
     assert values["shiftedx_proxy_downstream_cancellations_total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_duplicate_block_is_counted_once_with_a_timing_capture(tmp_path) -> None:
+    payload, duplicate_response = blocked_duplicate_case()
+    upstream = ScriptedUpstream(
+        [
+            duplicate_response,
+            completion("not-json"),
+            completion("not-json"),
+        ]
+    )
+    ledger = tmp_path / "timing-captures.jsonl"
+    reserve_timing_capture_ledger(ledger)
+
+    response, values = await post(create_app(settings(), upstream, timing_sink=PrivateTimingSink(ledger)), payload)
+
+    assert response.status_code == 502
+    capture = read_timing_capture_ledger(ledger)[0]
+    assert capture["blocked_duplicate_count"] == values["shiftedx_proxy_blocked_duplicates_total"] == 1
+    assert capture["correction_count"] == values["shiftedx_proxy_correction_turns_total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_malformed_tool_calls_retain_a_prior_correction_without_timing_capture() -> None:
+    upstream = ScriptedUpstream(
+        [
+            completion("not-json"),
+            {"id": "chatcmpl", "choices": [{"message": {"role": "assistant", "tool_calls": "invalid"}}]},
+        ]
+    )
+
+    response, values = await post(
+        create_app(settings(), upstream), {**chat_payload(), "response_format": strict_schema()}
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "upstream_malformed_tool_calls"
+    assert values["shiftedx_proxy_correction_turns_total"] == 1
+    assert values["shiftedx_proxy_blocked_duplicates_total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_blocked_duplicate_is_counted_when_deadline_cancels_the_retry() -> None:
+    payload, duplicate_response = blocked_duplicate_case()
+    upstream = WaitingUpstream([duplicate_response])
+    app = create_app(settings(total_request_deadline_seconds=0.02), upstream)
+
+    response, values = await post(app, payload)
+
+    assert response.status_code == 504
+    assert upstream.cancelled.is_set()
+    assert values["shiftedx_proxy_blocked_duplicates_total"] == 1
+    assert values["shiftedx_proxy_correction_turns_total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_blocked_duplicate_is_counted_when_external_cancellation_stops_the_retry() -> None:
+    payload, duplicate_response = blocked_duplicate_case()
+    upstream = WaitingUpstream([duplicate_response])
+    app = create_app(settings(), upstream)
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
+            task = asyncio.create_task(client.post("/v1/chat/completions", json=payload))
+            await upstream.waiting.wait()
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    assert upstream.cancelled.is_set()
+    assert app.state.counters.blocked_duplicates == 1
+    assert app.state.counters.correction_turns == 0
+    assert app.state.counters.cancellations == 1
+
+
+@pytest.mark.asyncio
+async def test_successful_interventions_are_not_recounted_if_admission_cleanup_is_cancelled(monkeypatch) -> None:
+    payload, duplicate_response = blocked_duplicate_case()
+    upstream = ScriptedUpstream([duplicate_response, completion('{"status":"done"}')])
+    app = create_app(settings(), upstream)
+    cleanup_started = asyncio.Event()
+
+    async def pause_cleanup() -> None:
+        cleanup_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(app.state.admission, "_prune_principals", pause_cleanup)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
+            task = asyncio.create_task(client.post("/v1/chat/completions", json=payload))
+            await cleanup_started.wait()
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    assert app.state.counters.blocked_duplicates == 1
+    assert app.state.counters.correction_turns == 0
+    assert app.state.counters.cancellations == 1
 
 
 @pytest.mark.asyncio

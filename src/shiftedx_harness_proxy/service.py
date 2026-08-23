@@ -80,6 +80,7 @@ class ChatService:
         policy_extensions_allowed: bool = False,
         trusted_policy_extension_used: bool = False,
         server_cache_namespace: ServerCacheNamespace | None = None,
+        intervention_counts: list[int] | None = None,
     ) -> ChatResult:
         started = time.perf_counter()
         _validate_chat_payload(payload, harness_enabled=harness_enabled)
@@ -193,7 +194,7 @@ class ChatService:
         except ValueError as exc:
             raise ProxyError(400, "invalid_messages", str(exc)) from exc
         harness = rebuilt.harness
-        _snapshot_timing(harness, retry_attempt_count=0)
+        _snapshot_timing(harness, retry_attempt_count=0, intervention_counts=intervention_counts)
 
         projection = _project_latest_if_current(forwarded["messages"], rebuilt)
         if projection is not None:
@@ -202,6 +203,7 @@ class ChatService:
                 retry_attempt_count=0,
                 local_projection=True,
                 avoided_immediate_upstream_calls=1,
+                intervention_counts=intervention_counts,
             )
             body = _projected_response(str(forwarded.get("model", "")), projection)
             return ChatResult(
@@ -260,10 +262,14 @@ class ChatService:
                             ),
                         }
                     )
-                    _snapshot_timing(harness, retry_attempt_count=internal_retries)
+                    _snapshot_timing(
+                        harness, retry_attempt_count=internal_retries, intervention_counts=intervention_counts
+                    )
                     continue
                 rejected = _rejected_results(calls, harness)
-                _snapshot_timing(harness, retry_attempt_count=internal_retries)
+                _snapshot_timing(
+                    harness, retry_attempt_count=internal_retries, intervention_counts=intervention_counts
+                )
                 if not rejected:
                     return ChatResult(
                         _without_reserved_projection_marker(response),
@@ -291,7 +297,9 @@ class ChatService:
                         separators=(",", ":"),
                     )
                     working_messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
-                _snapshot_timing(harness, retry_attempt_count=internal_retries)
+                _snapshot_timing(
+                    harness, retry_attempt_count=internal_retries, intervention_counts=intervention_counts
+                )
                 continue
 
             content = message.get("content")
@@ -329,7 +337,7 @@ class ChatService:
             internal_retries += 1
             working_messages.append({"role": "assistant", "content": content})
             working_messages.append({"role": "user", "content": harness.correction(issue)})
-            _snapshot_timing(harness, retry_attempt_count=internal_retries)
+            _snapshot_timing(harness, retry_attempt_count=internal_retries, intervention_counts=intervention_counts)
 
         raise ProxyError(
             502,
@@ -397,9 +405,16 @@ def _snapshot_timing(
     retry_attempt_count: int,
     local_projection: bool = False,
     avoided_immediate_upstream_calls: int = 0,
+    intervention_counts: list[int] | None = None,
 ) -> None:
     """Preserve policy mutations even when a later upstream turn fails."""
 
+    if intervention_counts is not None:
+        intervention_counts[:] = [
+            harness.terminal_corrections,
+            harness.blocked_duplicates,
+            harness.blocked_stalls,
+        ]
     timing = current_request_timing()
     if timing is not None:
         timing.record_interventions(
