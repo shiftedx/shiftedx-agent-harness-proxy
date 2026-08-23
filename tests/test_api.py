@@ -456,6 +456,76 @@ async def test_stream_replay_preserves_reasoning_tool_calls_finish_reason_and_us
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "completion",
+    [
+        {
+            "model": "model",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+        },
+        {
+            "id": "chatcmpl",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+        },
+        {
+            "id": "chatcmpl",
+            "model": "model",
+            "choices": [
+                {
+                    "index": "zero",
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+        },
+        {
+            "id": "chatcmpl",
+            "model": "model",
+            "choices": [
+                {"index": 0, "message": {"role": "assistant", "content": "ok"}}
+            ],
+        },
+    ],
+)
+async def test_malformed_optional_stream_fields_fail_before_sse_headers(
+    completion: dict[str, Any],
+) -> None:
+    upstream = ScriptedCompletionUpstream([completion])
+    app = create_app(Settings(upstream_base_url="http://upstream/v1"), upstream)
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+            )
+
+    assert response.status_code == 502
+    assert response.headers["content-type"].startswith("application/json")
+    assert "x-shiftedx-stream-mode" not in response.headers
+    assert response.json()["error"]["code"] == "upstream_malformed_completion"
+    assert "data:" not in response.text
+
+
+@pytest.mark.asyncio
 async def test_stream_replay_never_releases_a_withheld_tool_batch() -> None:
     def tool_call(call_id: str, path: str) -> dict[str, Any]:
         return {

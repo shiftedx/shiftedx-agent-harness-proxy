@@ -39,17 +39,26 @@ def prepare_replay_request(payload: JsonObject) -> tuple[JsonObject, ReplayOptio
 
 def replay_completion(completion: JsonObject, options: ReplayOptions) -> bytes:
     """Serialize one already-approved completion as standards-compatible SSE."""
+    if not isinstance(completion.get("id"), str) or not completion["id"]:
+        raise _malformed_completion()
+    if not isinstance(completion.get("model"), str) or not completion["model"]:
+        raise _malformed_completion()
     choices = completion.get("choices")
-    if not isinstance(choices, list):
-        raise ProxyError(502, "upstream_malformed_completion", "The upstream completion is malformed.")
+    if not isinstance(choices, list) or not choices:
+        raise _malformed_completion()
     events: list[JsonObject] = []
     for raw_choice in choices:
         if not isinstance(raw_choice, dict):
-            raise ProxyError(502, "upstream_malformed_completion", "The upstream completion is malformed.")
+            raise _malformed_completion()
         message = raw_choice.get("message")
         if not isinstance(message, dict):
-            raise ProxyError(502, "upstream_malformed_completion", "The upstream completion is malformed.")
-        index = raw_choice.get("index", 0)
+            raise _malformed_completion()
+        index = raw_choice.get("index")
+        finish_reason = raw_choice.get("finish_reason")
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise _malformed_completion()
+        if not isinstance(finish_reason, str) or not finish_reason:
+            raise _malformed_completion()
         delta = {
             key: copy.deepcopy(value)
             for key, value in message.items()
@@ -58,7 +67,7 @@ def replay_completion(completion: JsonObject, options: ReplayOptions) -> bytes:
         tool_calls = message.get("tool_calls")
         if tool_calls is not None:
             if not isinstance(tool_calls, list) or not all(isinstance(call, dict) for call in tool_calls):
-                raise ProxyError(502, "upstream_malformed_completion", "The upstream completion is malformed.")
+                raise _malformed_completion()
             delta["tool_calls"] = [
                 {"index": index, **copy.deepcopy(call)} for index, call in enumerate(tool_calls)
             ]
@@ -70,7 +79,7 @@ def replay_completion(completion: JsonObject, options: ReplayOptions) -> bytes:
                 completion,
                 index=index,
                 delta={},
-                finish_reason=raw_choice.get("finish_reason"),
+                finish_reason=finish_reason,
             )
         )
     if options.include_usage and isinstance(completion.get("usage"), dict):
@@ -83,6 +92,10 @@ def replay_completion(completion: JsonObject, options: ReplayOptions) -> bytes:
         for event in events
     )
     return serialized + b"data: [DONE]\n\n"
+
+
+def _malformed_completion() -> ProxyError:
+    return ProxyError(502, "upstream_malformed_completion", "The upstream completion is malformed.")
 
 
 def _chunk(completion: JsonObject, *, index: object, delta: JsonObject, finish_reason: object) -> JsonObject:

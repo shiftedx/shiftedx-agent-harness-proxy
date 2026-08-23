@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import socket
 import subprocess
 import tempfile
@@ -68,7 +69,7 @@ class ProtocolLedger:
         }
 
 
-def upstream_app(ledger: ProtocolLedger) -> FastAPI:
+def upstream_app(ledger: ProtocolLedger, terminal_marker: str) -> FastAPI:
     app = FastAPI()
 
     @app.get("/v1/models")
@@ -116,7 +117,7 @@ def upstream_app(ledger: ProtocolLedger) -> FastAPI:
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": "42"},
+                    "message": {"role": "assistant", "content": terminal_marker},
                     "finish_reason": "stop",
                 }
             ],
@@ -196,7 +197,8 @@ def main() -> int:
         [args.hermes, "--version"], capture_output=True, check=True, text=True, timeout=10
     ).stdout.splitlines()[0]
     ledger = ProtocolLedger()
-    with running_server(upstream_app(ledger)) as upstream_base_url:
+    terminal_marker = secrets.token_urlsafe(24)
+    with running_server(upstream_app(ledger, terminal_marker)) as upstream_base_url:
         proxy = create_app(Settings(upstream_base_url=f"{upstream_base_url}/v1"))
         capture_downstream_requests(proxy, ledger)
         with running_server(proxy) as proxy_base_url:
@@ -210,7 +212,7 @@ def main() -> int:
                         args.hermes,
                         "chat",
                         "--query",
-                        "Read the first line of README.md with the available file tool, then answer exactly 42.",
+                        "Read the first line of README.md with the available file tool, then report completion.",
                         "--toolsets",
                         "file",
                         "--provider",
@@ -235,7 +237,7 @@ def main() -> int:
                 "schema_version": "1.0",
                 "hermes_version": version,
                 "hermes_exit_code": run.returncode,
-                "terminal_answer_observed": "42" in run.stdout,
+                "terminal_answer_observed": terminal_marker in run.stdout,
                 "stream_replay_count": proxy.state.counters.stream_replays,
                 **ledger.evidence(),
             }

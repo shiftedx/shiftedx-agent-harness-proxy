@@ -322,13 +322,14 @@ def create_app(
                     headers["X-Request-ID"] = correlation_id
                     if replay_options is not None:
                         replay = replay_completion(result.body, replay_options)
-                        counters.stream_replays += 1
                         headers["Cache-Control"] = "no-cache"
                         headers["X-Shiftedx-Stream-Mode"] = "validate-then-replay"
                         response = Response(replay, headers=headers, media_type="text/event-stream")
                     else:
                         response = JSONResponse(result.body, headers=headers)
                     _ensure_before_deadline(deadline_at)
+                    if replay_options is not None:
+                        counters.stream_replays += 1
                     timing = current_request_timing()
                     if timing is not None:
                         timing.classify("succeeded")
