@@ -64,6 +64,7 @@ def test_operator_runbook_has_the_stock_hermes_and_pre_ingress_gates() -> None:
     assert "## Hermes provider" in runbook
     assert "provider: shiftedx-proxy" in runbook
     assert "api: https://proxy.internal/v1" in runbook
+    assert "key_env: SHIFTEDX_PROXY_API_KEY" in runbook
     assert "transport: chat_completions" in runbook
     assert "validate-then-replay" in runbook
     assert "deterministic\nexact-image smoke" in runbook

@@ -145,6 +145,7 @@ model:
 providers:
   shiftedx-proxy:
     api: https://proxy.internal/v1
+    key_env: SHIFTEDX_PROXY_API_KEY
     transport: chat_completions
     default_model: served-model-id
     discover_models: false
@@ -154,8 +155,8 @@ display:
   streaming: true
 ```
 
-Deliver the proxy Authorization bearer through a verified stock Hermes/provider secret mechanism
-for the deployed Hermes version; do not put a credential in this file. Then run
+Set `SHIFTEDX_PROXY_API_KEY` through the operator's secret mechanism; stock Hermes reads the named
+environment variable and sends it as the provider bearer. Do not put the credential in this file. Then run
 `hermes chat --provider shiftedx-proxy --model served-model-id`. Hermes uses the stock Chat
 Completions API; when it requests streaming, the proxy performs validate-then-replay: it buffers
 and validates the complete upstream completion before emitting OpenAI-compatible SSE events. This
