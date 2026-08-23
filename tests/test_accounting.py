@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 import pytest
+from pydantic import SecretStr
 from starlette.requests import Request
 
 from shiftedx_harness_proxy.api import create_app
@@ -296,8 +297,10 @@ async def test_admission_and_principal_rate_rejections_are_outside_the_admitted_
 
 
 @pytest.mark.asyncio
-async def test_phase_attempt_counters_only_follow_started_acquisition_and_finalization_calls() -> None:
+async def test_phase_attempt_counters_only_follow_started_acquisition_and_finalization_calls(tmp_path) -> None:
     upstream = PhaseSplitUpstream([])
+    ledger = tmp_path / "timing-captures.jsonl"
+    reserve_timing_capture_ledger(ledger)
     payload = {
         "model": "model",
         "messages": [
@@ -318,13 +321,105 @@ async def test_phase_attempt_counters_only_follow_started_acquisition_and_finali
         "response_format": strict_schema(),
     }
     response, values = await post(
-        create_app(settings(upstream_tool_response_capability_mode="phase_split"), upstream), payload
+        create_app(
+            settings(upstream_tool_response_capability_mode="phase_split"),
+            upstream,
+            timing_sink=PrivateTimingSink(ledger),
+        ),
+        payload,
     )
 
     assert response.status_code == 200
     assert_ledger(values, requests=1, attempts=2, calls=len(upstream.calls))
     assert values["shiftedx_proxy_phase_acquisition_total"] == 1
     assert values["shiftedx_proxy_phase_finalization_total"] == 1
+    assert read_timing_capture_ledger(ledger)[0]["retry_attempt_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_repeated_finalization_is_one_timing_retry_after_forced_transition(tmp_path) -> None:
+    payload, duplicate_response = blocked_duplicate_case()
+    finalization_tool_call = {
+        "id": "unexpected",
+        "type": "function",
+        "function": {"name": "read_file", "arguments": '{"path":"b.py"}'},
+    }
+    upstream = ScriptedUpstream(
+        [
+            duplicate_response,
+            {
+                "id": "chatcmpl",
+                "choices": [
+                    {"message": {"role": "assistant", "content": "", "tool_calls": [finalization_tool_call]}}
+                ],
+            },
+            completion('{"status":"done"}'),
+        ]
+    )
+    ledger = tmp_path / "timing-captures.jsonl"
+    reserve_timing_capture_ledger(ledger)
+
+    response, _values = await post(
+        create_app(
+            settings(upstream_tool_response_capability_mode="phase_split"),
+            upstream,
+            timing_sink=PrivateTimingSink(ledger),
+        ),
+        payload,
+    )
+
+    assert response.status_code == 200
+    capture = read_timing_capture_ledger(ledger)[0]
+    assert capture["phase_counts"] == {"acquisition": 1, "finalization": 2, "terminal": 0}
+    assert capture["retry_attempt_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_harness_opt_out_phase_split_counts_repeated_finalization_as_one_timing_retry(tmp_path) -> None:
+    finalization_tool_call = {
+        "id": "unexpected",
+        "type": "function",
+        "function": {"name": "read_file", "arguments": '{"path":"b.py"}'},
+    }
+    upstream = ScriptedUpstream(
+        [
+            completion("acquired"),
+            {
+                "id": "chatcmpl",
+                "choices": [
+                    {"message": {"role": "assistant", "content": "", "tool_calls": [finalization_tool_call]}}
+                ],
+            },
+            completion('{"status":"done"}'),
+        ]
+    )
+    ledger = tmp_path / "timing-captures.jsonl"
+    reserve_timing_capture_ledger(ledger)
+    payload = {
+        **chat_payload(),
+        "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+        "response_format": strict_schema(),
+    }
+
+    response, _values = await post(
+        create_app(
+            settings(
+                upstream_tool_response_capability_mode="phase_split",
+                allow_harness_opt_out=True,
+                trusted_policy_extension_api_keys=SecretStr("trusted-extension"),
+            ),
+            upstream,
+            timing_sink=PrivateTimingSink(ledger),
+        ),
+        payload,
+        headers={"Authorization": "Bearer trusted-extension", "X-Shiftedx-Harness": "off"},
+    )
+
+    assert response.status_code == 200
+    assert len(upstream.calls) == 3
+    capture = read_timing_capture_ledger(ledger)[0]
+    assert capture["phase_counts"] == {"acquisition": 1, "finalization": 2, "terminal": 0}
+    assert capture["retry_attempt_count"] == 1
 
 
 @pytest.mark.asyncio

@@ -650,6 +650,43 @@ def test_warm_prime_retry_and_local_projection_reconcile_without_counting_prime_
     }
 
 
+@pytest.mark.parametrize(("finalizations", "retries"), [(1, 0), (2, 1)])
+def test_acquisition_to_finalization_counts_only_repeated_finalization_as_a_retry(
+    tmp_path: Path, finalizations: int, retries: int
+) -> None:
+    attempt_count = 1 + finalizations
+    after = replace(
+        _ZERO_METRICS,
+        downstream_requests=1,
+        upstream_calls=attempt_count,
+        phase_acquisition=1,
+        phase_finalization=finalizations,
+    )
+    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, after))
+    observers = [_observer(1)] + [_observer(index, "finalization") for index in range(2, attempt_count + 1)]
+
+    result = session.complete(
+        _context(),
+        observers,
+        [
+            _request(
+                1,
+                start=1,
+                end=attempt_count,
+                attempts=attempt_count,
+                successful=attempt_count,
+                acquisition=1,
+                finalization=finalizations,
+                retries=retries,
+            )
+        ],
+        ModelOperationSummary(requests_completed_delta=attempt_count, prime_count=0),
+        tmp_path / "reconciliation.json",
+    )
+
+    assert result.status == "passed"
+
+
 @pytest.mark.parametrize(
     ("metric", "value", "check", "category"),
     [

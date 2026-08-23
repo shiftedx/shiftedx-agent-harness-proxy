@@ -334,7 +334,6 @@ class RequestTiming:
     correction_count: int = 0
     blocked_duplicate_count: int = 0
     blocked_stall_count: int = 0
-    retry_attempt_count: int = 0
     phase_counts: dict[str, int] = field(default_factory=lambda: {name: 0 for name in _PHASES})
     local_projection: bool = False
     avoided_immediate_upstream_calls: int = 0
@@ -372,7 +371,6 @@ class RequestTiming:
         correction_count: int,
         blocked_duplicate_count: int,
         blocked_stall_count: int,
-        retry_attempt_count: int,
         local_projection: bool,
         avoided_immediate_upstream_calls: int,
     ) -> None:
@@ -382,7 +380,6 @@ class RequestTiming:
                 correction_count,
                 blocked_duplicate_count,
                 blocked_stall_count,
-                retry_attempt_count,
                 avoided_immediate_upstream_calls,
             )
         ) or not isinstance(local_projection, bool):
@@ -390,7 +387,6 @@ class RequestTiming:
         self.correction_count = correction_count
         self.blocked_duplicate_count = blocked_duplicate_count
         self.blocked_stall_count = blocked_stall_count
-        self.retry_attempt_count = retry_attempt_count
         self.local_projection = local_projection
         self.avoided_immediate_upstream_calls = avoided_immediate_upstream_calls
 
@@ -438,7 +434,7 @@ class RequestTiming:
             "correction_count": self.correction_count,
             "blocked_duplicate_count": self.blocked_duplicate_count,
             "blocked_stall_count": self.blocked_stall_count,
-            "retry_attempt_count": self.retry_attempt_count,
+            "retry_attempt_count": len(attempts) - sum(count > 0 for count in self.phase_counts.values()),
             "phase_counts": dict(sorted(self.phase_counts.items())),
         }
 
