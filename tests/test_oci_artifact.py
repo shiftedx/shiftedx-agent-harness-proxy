@@ -54,6 +54,24 @@ def test_compose_can_select_the_tested_phase_split_mode() -> None:
     ) in compose
 
 
+def test_production_compose_pins_the_qualified_phase_split_mode() -> None:
+    production = (ROOT / "docker-compose.production.yml").read_text()
+    assert 'UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE: "phase_split"' in production
+
+
+def test_operator_runbook_has_the_stock_hermes_and_pre_ingress_gates() -> None:
+    runbook = (ROOT / "docs/operator-runbook.md").read_text()
+    assert "## Hermes provider" in runbook
+    assert "provider: shiftedx-proxy" in runbook
+    assert "api: https://proxy.internal/v1" in runbook
+    assert "transport: chat_completions" in runbook
+    assert "validate-then-replay" in runbook
+    assert "deterministic\nexact-image smoke" in runbook
+    assert "live-upstream synthetic smoke pass" in runbook
+    assert "`>2.0`" in runbook
+    assert "`>125%`" in runbook
+
+
 def test_ci_validates_the_merged_exact_image_compose_configuration() -> None:
     workflow = (ROOT / ".github/workflows/ci.yml").read_text()
     assert "Validate exact-image Compose configuration" in workflow
