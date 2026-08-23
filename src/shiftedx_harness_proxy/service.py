@@ -38,6 +38,7 @@ from .transport import Upstream
 
 JsonObject = dict[str, Any]
 REQUIRE_RECEIPT_EXTENSION = "x-shiftedx-require-receipt"
+TOOL_DENY_EXTENSION = "x-shiftedx-denied-tools"
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,7 @@ class ChatService:
         self.upstream = upstream
         self.base_roles = configured_roles(settings)
         self.cache_namespace_fields = settings.cache_namespace_fields()
+        self.denied_tools = settings.denied_tool_names()
 
     async def complete(
         self,
@@ -99,6 +101,12 @@ class ChatService:
             ) from exc
         if payload.get("stream") is True:
             raise ProxyError(400, "streaming_not_supported", "stream=true is not supported by this proxy version.")
+        if TOOL_DENY_EXTENSION in payload:
+            raise ProxyError(
+                400,
+                "tool_deny_override_denied",
+                "Tool deny policy is configured only by the server.",
+            )
 
         forwarded = copy.deepcopy(payload)
         has_receipt_override = REQUIRE_RECEIPT_EXTENSION in forwarded
@@ -263,7 +271,7 @@ class ChatService:
                     )
                     _snapshot_timing(harness, intervention_counts=intervention_counts)
                     continue
-                rejected = _rejected_results(calls, harness)
+                rejected = _rejected_results(calls, harness, self.denied_tools)
                 _snapshot_timing(harness, intervention_counts=intervention_counts)
                 if not rejected:
                     return ChatResult(
@@ -617,7 +625,9 @@ def _call_arguments(call: JsonObject) -> tuple[str, dict[str, Any]]:
     return str(function["name"]), arguments
 
 
-def _rejected_results(calls: list[Any], harness: AgentHarness) -> dict[int, str]:
+def _rejected_results(
+    calls: list[Any], harness: AgentHarness, denied_tools: frozenset[str]
+) -> dict[int, str]:
     rejected: dict[int, str] = {}
     every_rejection_can_finalize = True
     for index, raw_call in enumerate(calls):
@@ -632,6 +642,19 @@ def _rejected_results(calls: list[Any], harness: AgentHarness) -> dict[int, str]
             harness.last_action_blocked = True
             every_rejection_can_finalize = False
             rejected[index] = '{"shiftedx_harness":"invalid_tool_arguments"}'
+            continue
+        if name in denied_tools:
+            harness.last_action_blocked = True
+            every_rejection_can_finalize = False
+            rejected[index] = json.dumps(
+                {
+                    "shiftedx_harness": "tool_denied_by_server",
+                    "execution_status": "blocked_not_executed",
+                    "fact": "This proposed call was blocked by the proxy and did not reach the client executor.",
+                    "instruction": "Choose a permitted tool or return a safe final answer.",
+                },
+                separators=(",", ":"),
+            )
             continue
         stalled = harness.stalled_result(name)
         prior = harness.duplicate(name, arguments) if stalled is None else None

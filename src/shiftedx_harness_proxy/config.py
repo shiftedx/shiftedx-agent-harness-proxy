@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     mutation_tools: str | None = None
     verification_tools: str | None = None
     investigation_tools: str | None = None
+    denied_tools: str | None = None
     max_internal_retries: int = Field(default=4, ge=0, le=20)
     max_upstream_calls: int = Field(default=7, ge=1, le=25)
     upstream_timeout_seconds: float = Field(default=120.0, gt=0, le=3600)
@@ -154,6 +155,10 @@ class Settings(BaseSettings):
     def cache_namespace_fields(self) -> frozenset[str]:
         """Return the process-fixed normalized client namespace denylist."""
         return cache_namespace_field_names(self.upstream_cache_namespace_fields)
+
+    def denied_tool_names(self) -> frozenset[str]:
+        """Return the process-fixed tool names that the harness must withhold."""
+        return frozenset(_csv(self.denied_tools)) if self.denied_tools is not None else frozenset()
 
     def principal_budget_key(self, credential: str) -> str:
         """Return an opaque, process-derived budget key without retaining the credential."""

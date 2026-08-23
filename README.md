@@ -189,6 +189,7 @@ projection, parallel calls, and degraded transcript behavior.
 | `UPSTREAM_CACHE_CAPABILITY_MODE` | `disabled` | Generic cache capability profile; `disabled` and `unknown` reject client namespace controls |
 | `UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE` | `passthrough` | `phase_split` is the qualified MTPLX fallback; experimental `combined_v1` requires the exact upstream capability contract and remains outside qualification |
 | `UPSTREAM_CACHE_NAMESPACE_FIELDS` | unset | Comma-separated, nonblank additional top-level client cache namespace field names to reject |
+| `DENIED_TOOLS` | unset | Comma-separated server-only tool names to withhold before client execution |
 | `MAX_INTERNAL_RETRIES` | `4` | Internal policy retries per request |
 | `MAX_UPSTREAM_CALLS` | `7` | Total upstream-call ceiling per request |
 | `UPSTREAM_TIMEOUT_SECONDS` | `120` | Upstream timeout |

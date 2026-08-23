@@ -140,6 +140,13 @@ one of the four allowed strings; invalid inputs return `400 conflicting_role_ann
 `400 invalid_role_annotation`. A server configuration that assigns the same name to multiple roles
 is invalid.
 
+`DENIED_TOOLS` is a separate comma-separated, server-only deny set. A matching proposed call is
+withheld before client execution and receives a bounded correction result with
+`execution_status=blocked_not_executed`; the result does not reveal the tool name. If one call in a
+parallel batch is denied, the complete batch is withheld. Request-side
+`x-shiftedx-denied-tools` overrides are rejected with `400 tool_deny_override_denied` and are never
+forwarded upstream.
+
 An operator can explicitly authorize a separate authenticated policy-extension principal with
 `TRUSTED_POLICY_EXTENSION_API_KEYS`, a comma-separated list of opaque bearer capabilities. A request
 authenticated with one of those capabilities may change a protected role or use the trusted receipt

@@ -60,6 +60,11 @@ def test_yaml_roles_load_and_environment_style_values_override(tmp_path: Path) -
     assert roles.investigation == {"inspect"}
 
 
+def test_denied_tool_names_are_process_fixed_csv_configuration() -> None:
+    settings = Settings(upstream_base_url="http://model/v1", denied_tools="apply_patch, deploy ,apply_patch")
+    assert settings.denied_tool_names() == {"apply_patch", "deploy"}
+
+
 def test_policy_extension_capabilities_are_explicit_server_configuration() -> None:
     settings = Settings(
         upstream_base_url="http://model/v1",

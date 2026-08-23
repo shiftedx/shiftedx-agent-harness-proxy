@@ -106,6 +106,7 @@ _SETTINGS_KEYS = frozenset(
         "upstream_cache_capability_mode",
         "telemetry_enabled",
         "metrics_enabled",
+        "denied_tools",
         "max_internal_retries",
         "max_upstream_calls",
         "upstream_timeout_seconds",
@@ -2195,6 +2196,7 @@ def _launch_proxy(
         "UPSTREAM_CACHE_CAPABILITY_MODE": settings["upstream_cache_capability_mode"],
         "TELEMETRY_ENABLED": _env_bool(settings["telemetry_enabled"]),
         "METRICS_ENABLED": _env_bool(settings["metrics_enabled"]),
+        "DENIED_TOOLS": settings["denied_tools"],
         "MAX_INTERNAL_RETRIES": str(settings["max_internal_retries"]),
         "MAX_UPSTREAM_CALLS": str(settings["max_upstream_calls"]),
         "UPSTREAM_TIMEOUT_SECONDS": str(settings["upstream_timeout_seconds"]),
@@ -2399,6 +2401,7 @@ def _verify_proxy_environment(value: Any, spec: _RuntimeSpec, stage: RuntimeStag
         "UPSTREAM_CACHE_CAPABILITY_MODE": "disabled",
         "TELEMETRY_ENABLED": "true",
         "METRICS_ENABLED": "true",
+        "DENIED_TOOLS": str(spec.proxy.settings["denied_tools"]),
     }
     if any(environment.get(key) != item for key, item in expected.items()):
         raise QualificationRuntimeFailure("runtime_inspect_drift")

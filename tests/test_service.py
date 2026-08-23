@@ -280,6 +280,96 @@ async def test_same_epoch_duplicate_never_reaches_client_and_is_retried_internal
 
 
 @pytest.mark.asyncio
+async def test_server_denied_first_time_tool_call_is_withheld_and_recovers() -> None:
+    denied = call("denied", "apply_patch", '{"patch":"x"}')
+    allowed = call("allowed", "read_file", '{"path":"a.py"}')
+    upstream = ScriptedUpstream([completion(calls=[denied]), completion(calls=[allowed])])
+
+    result = await ChatService(
+        Settings(upstream_base_url="http://upstream/v1", denied_tools="apply_patch"), upstream
+    ).complete(request([{"role": "user", "content": "repair"}]), {})
+
+    assert result.body["choices"][0]["message"]["tool_calls"] == [allowed]
+    assert result.telemetry.upstream_calls == 2
+    blocked = json.loads(upstream.requests[1]["messages"][-1]["content"])
+    assert blocked == {
+        "shiftedx_harness": "tool_denied_by_server",
+        "execution_status": "blocked_not_executed",
+        "fact": "This proposed call was blocked by the proxy and did not reach the client executor.",
+        "instruction": "Choose a permitted tool or return a safe final answer.",
+    }
+    assert "denied_tools" not in upstream.requests[0]
+    assert "apply_patch" not in blocked.values()
+
+
+@pytest.mark.asyncio
+async def test_server_denied_tool_withholds_the_entire_mixed_batch() -> None:
+    denied = call("denied", "apply_patch", '{"patch":"x"}')
+    sibling = call("sibling", "read_file", '{"path":"a.py"}')
+    reissued = call("reissued", "read_file", '{"path":"a.py"}')
+    upstream = ScriptedUpstream([completion(calls=[denied, sibling]), completion(calls=[reissued])])
+
+    result = await ChatService(
+        Settings(upstream_base_url="http://upstream/v1", denied_tools="apply_patch"), upstream
+    ).complete(request([{"role": "user", "content": "repair"}]), {})
+
+    assert result.body["choices"][0]["message"]["tool_calls"] == [reissued]
+    withheld = upstream.requests[1]["messages"]
+    assert [message["tool_call_id"] for message in withheld[-2:]] == ["denied", "sibling"]
+    assert "tool_denied_by_server" in withheld[-2]["content"]
+    assert "response_withheld_due_to_blocked_sibling" in withheld[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_server_denial_retries_are_bounded() -> None:
+    denied = call("denied", "apply_patch", '{"patch":"x"}')
+    upstream = ScriptedUpstream([completion(calls=[denied]), completion(calls=[denied])])
+
+    with pytest.raises(ProxyError) as raised:
+        await ChatService(
+            Settings(
+                upstream_base_url="http://upstream/v1",
+                denied_tools="apply_patch",
+                max_internal_retries=1,
+            ),
+            upstream,
+        ).complete(request([{"role": "user", "content": "repair"}]), {})
+
+    assert raised.value.code == "harness_retry_exhausted"
+    assert len(upstream.requests) == 2
+    assert "tool_denied_by_server" in str(upstream.requests[1]["messages"])
+
+
+@pytest.mark.asyncio
+async def test_client_cannot_inject_or_override_server_tool_deny_set() -> None:
+    payload = request([{"role": "user", "content": "repair"}])
+    payload["x-shiftedx-denied-tools"] = "read_file"
+    upstream = ScriptedUpstream([])
+
+    with pytest.raises(ProxyError) as raised:
+        await ChatService(
+            Settings(upstream_base_url="http://upstream/v1", denied_tools="apply_patch"), upstream
+        ).complete(payload, {})
+
+    assert raised.value.code == "tool_deny_override_denied"
+    assert upstream.requests == []
+
+
+@pytest.mark.asyncio
+async def test_server_tool_deny_set_leaves_allowed_call_unchanged() -> None:
+    allowed = call("allowed", "read_file", '{"path":"a.py"}')
+    upstream = ScriptedUpstream([completion(calls=[allowed])])
+    payload = request([{"role": "user", "content": "inspect"}])
+
+    result = await ChatService(
+        Settings(upstream_base_url="http://upstream/v1", denied_tools="apply_patch"), upstream
+    ).complete(payload, {})
+
+    assert result.body["choices"][0]["message"]["tool_calls"] == [allowed]
+    assert upstream.requests[0]["tools"] == payload["tools"]
+
+
+@pytest.mark.asyncio
 async def test_identical_read_is_allowed_after_successful_mutation_opens_new_epoch() -> None:
     upstream = ScriptedUpstream([completion(calls=[call("new", "read_file", '{"path":"a.py"}')])])
     messages = [

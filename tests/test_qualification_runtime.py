@@ -313,6 +313,7 @@ def _manifest(tmp_path: Path) -> Path:
                     "upstream_cache_capability_mode": "disabled",
                     "telemetry_enabled": True,
                     "metrics_enabled": True,
+                    "denied_tools": "",
                     "max_internal_retries": 4,
                     "max_upstream_calls": 7,
                     "upstream_timeout_seconds": 120.0,
@@ -1073,6 +1074,7 @@ def _manifest_settings() -> dict[str, object]:
         "upstream_cache_capability_mode": "disabled",
         "telemetry_enabled": True,
         "metrics_enabled": True,
+        "denied_tools": "",
         "max_internal_retries": 4,
         "max_upstream_calls": 7,
         "upstream_timeout_seconds": 120.0,
@@ -1105,6 +1107,7 @@ def _runtime_inspect(
         "UPSTREAM_CACHE_CAPABILITY_MODE=disabled",
         "TELEMETRY_ENABLED=true",
         "METRICS_ENABLED=true",
+        "DENIED_TOOLS=",
     ]
     mounts = [{"Type": "volume", "Name": volume_name, "Destination": "/run/secrets", "RW": False}]
     if scored_proxy:
