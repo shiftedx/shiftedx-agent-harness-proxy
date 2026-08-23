@@ -547,6 +547,7 @@ async def test_stream_replay_deadline_releases_admission_after_headers(tmp_path)
         timing_sink=PrivateTimingSink(ledger),
     )
     first_write = asyncio.Event()
+    messages: list[dict[str, Any]] = []
     received_request = False
 
     async def receive() -> dict[str, Any]:
@@ -562,6 +563,7 @@ async def test_stream_replay_deadline_releases_admission_after_headers(tmp_path)
         raise AssertionError("unreachable")
 
     async def send(message: dict[str, Any]) -> None:
+        messages.append(message)
         if message["type"] == "http.response.body" and message.get("body"):
             first_write.set()
             await asyncio.Event().wait()
@@ -584,8 +586,52 @@ async def test_stream_replay_deadline_releases_admission_after_headers(tmp_path)
     await asyncio.wait_for(first_write.wait(), timeout=1)
     assert app.state.admission.snapshot().active == 1
 
-    with pytest.raises(TimeoutError):
-        await asyncio.wait_for(task, timeout=1)
+    await asyncio.wait_for(task, timeout=1)
+    assert app.state.counters.deadline_expiries == 1
+    assert app.state.counters.errors == 1
+    assert app.state.counters.stream_replays == 0
+    assert app.state.admission.snapshot().active == 0
+    assert read_timing_capture_ledger(ledger)[0]["outcome"] == "deadline"
+    assert messages[0]["type"] == "http.response.start"
+    assert not any(
+        message["type"] == "http.response.body" and not message.get("more_body", False)
+        for message in messages
+    )
+    assert not b"".join(
+        message["body"] for message in messages if message["type"] == "http.response.body"
+    ).endswith(b"data: [DONE]\n\n")
+
+
+@pytest.mark.asyncio
+async def test_stream_replay_deadline_before_headers_remains_json_504(tmp_path) -> None:
+    class WaitingUpstream(EchoUpstream):
+        async def chat(self, payload: dict[str, Any], request_headers: dict[str, str]) -> dict[str, Any]:
+            self.requests.append(payload)
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    ledger = tmp_path / "timing-captures.jsonl"
+    reserve_timing_capture_ledger(ledger)
+    app = create_app(
+        Settings(upstream_base_url="http://upstream/v1", total_request_deadline_seconds=0.01),
+        WaitingUpstream(),
+        timing_sink=PrivateTimingSink(ledger),
+    )
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+            )
+
+    assert response.status_code == 504
+    assert response.json()["error"]["code"] == "request_deadline_exceeded"
+    assert "x-shiftedx-stream-mode" not in response.headers
     assert app.state.counters.deadline_expiries == 1
     assert app.state.counters.errors == 1
     assert app.state.counters.stream_replays == 0

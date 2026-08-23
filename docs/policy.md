@@ -65,12 +65,15 @@ is idle.
 upstream operation at a time. The monotonic `TOTAL_REQUEST_DEADLINE_SECONDS` begins before admission
 queueing and covers queueing, reading up to `MAX_REQUEST_BYTES`, validation, reconstruction, every
 retry/upstream operation, disconnect cleanup, and response construction. The deadline never resets
-for retries. A downstream disconnect cancels in-flight policy/upstream work and releases both gates.
+for retries. For validate-then-replay SSE, it also covers downstream replay delivery. A downstream
+disconnect cancels in-flight policy/upstream work and releases both gates.
 
 Overload has no queue-detail disclosure: admission/concurrency/rate rejection returns `429` with
 `admission_overloaded`, `principal_concurrency_limited`, or `principal_rate_limited`, respectively,
 and only the configured bounded numeric `Retry-After`. Deadline expiry returns
-`504 request_deadline_exceeded`. Upstream-operation queue timeout returns
+`504 request_deadline_exceeded` before response headers are sent. After validate-then-replay SSE
+headers are sent, expiry intentionally terminates the response without a `[DONE]` event; HTTP cannot
+replace an already-started response with a 504. Upstream-operation queue timeout returns
 `503 upstream_concurrency_limited` with the same bounded hint. Metrics are aggregate prompt-free counters for admission/rate
 rejection, deadline expiry, and cancellation; active/queued downstream work and active upstream work
 are gauges without principal labels.

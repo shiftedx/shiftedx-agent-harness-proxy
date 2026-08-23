@@ -10,7 +10,7 @@ import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
-from contextlib import asynccontextmanager, suppress
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -203,7 +203,7 @@ class _ReplayStreamingResponse(StreamingResponse):
                 await send({"type": "http.response.body", "body": b"", "more_body": False})
         except TimeoutError:
             self._record_outcome("deadline")
-            raise
+            return
         except asyncio.CancelledError:
             self._record_outcome("cancelled")
             raise
@@ -341,87 +341,80 @@ def create_app(
         correlation_id = _set_correlation_id(request)
         principal = _authenticate(request, settings)
         deadline_at = _deadline_at(settings)
-        admission_lease = admission.admit(principal.budget_key)
-        admission_entered = False
-        admission_transferred = False
         try:
-            async with asyncio.timeout_at(deadline_at):
-                await admission_lease.__aenter__()
-                admission_entered = True
-                counters.observe_admitted_request()
-                payload = await _timed_read_payload(request, settings)
-                payload, replay_options = prepare_replay_request(payload)
-                harness_header = request.headers.get("x-shiftedx-harness")
-                if harness_header is not None and harness_header.strip().lower() != "off":
-                    raise ProxyError(400, "invalid_harness_opt_out", "X-Shiftedx-Harness supports only off.")
-                opt_out = harness_header is not None
-                if opt_out and not settings.allow_harness_opt_out:
-                    raise ProxyError(403, "harness_opt_out_disabled", "Harness opt-out is disabled.")
-                if opt_out and not principal.policy_extensions_allowed:
-                    raise ProxyError(
-                        403,
-                        "harness_opt_out_denied",
-                        "Harness opt-out is not authorized for this principal.",
+            async with AsyncExitStack() as admission_stack:
+                async with asyncio.timeout_at(deadline_at):
+                    await admission_stack.enter_async_context(admission.admit(principal.budget_key))
+                    counters.observe_admitted_request()
+                    payload = await _timed_read_payload(request, settings)
+                    payload, replay_options = prepare_replay_request(payload)
+                    harness_header = request.headers.get("x-shiftedx-harness")
+                    if harness_header is not None and harness_header.strip().lower() != "off":
+                        raise ProxyError(400, "invalid_harness_opt_out", "X-Shiftedx-Harness supports only off.")
+                    opt_out = harness_header is not None
+                    if opt_out and not settings.allow_harness_opt_out:
+                        raise ProxyError(403, "harness_opt_out_disabled", "Harness opt-out is disabled.")
+                    if opt_out and not principal.policy_extensions_allowed:
+                        raise ProxyError(
+                            403,
+                            "harness_opt_out_denied",
+                            "Harness opt-out is not authorized for this principal.",
+                        )
+                    result = await _complete_while_connected(
+                        request,
+                        _timed_complete(
+                            service,
+                            payload,
+                            _forwarded_request_headers(request, correlation_id),
+                            harness_enabled=not opt_out,
+                            policy_extensions_allowed=principal.policy_extensions_allowed,
+                            trusted_policy_extension_used=opt_out,
+                            server_cache_namespace=principal.server_cache_namespace,
+                        ),
                     )
-                result = await _complete_while_connected(
-                    request,
-                    _timed_complete(
-                        service,
-                        payload,
-                        _forwarded_request_headers(request, correlation_id),
-                        harness_enabled=not opt_out,
-                        policy_extensions_allowed=principal.policy_extensions_allowed,
-                        trusted_policy_extension_used=opt_out,
-                        server_cache_namespace=principal.server_cache_namespace,
-                    ),
-                )
-                headers = _telemetry_headers(result, settings)
-                headers["X-Request-ID"] = correlation_id
-                timing = current_request_timing()
-                response: Response
+                    headers = _telemetry_headers(result, settings)
+                    headers["X-Request-ID"] = correlation_id
+                    timing = current_request_timing()
+                    response: Response
+                    if replay_options is not None:
+                        replay = replay_completion(
+                            result.body,
+                            replay_options,
+                            max_bytes=settings.max_upstream_response_bytes,
+                        )
+
+                        def observe_replay_outcome(outcome: _ReplayOutcome) -> None:
+                            if outcome == "succeeded":
+                                counters.stream_replays += 1
+                            elif outcome == "cancelled":
+                                counters.cancellations += 1
+                            elif outcome == "deadline":
+                                counters.deadline_expiries += 1
+                                counters.errors += 1
+                            else:
+                                counters.errors += 1
+                            if timing is not None:
+                                timing.classify(outcome)
+
+                        headers["Cache-Control"] = "no-cache"
+                        headers["X-Shiftedx-Stream-Mode"] = "validate-then-replay"
+                    else:
+                        response = JSONResponse(result.body, headers=headers)
+                    _ensure_before_deadline(deadline_at)
+                    if replay_options is None and timing is not None:
+                        timing.classify("succeeded")
+                    if timing is not None:
+                        timing.begin_response_finalize()
+                    counters.observe(result)
                 if replay_options is not None:
-                    replay = replay_completion(
-                        result.body,
-                        replay_options,
-                        max_bytes=settings.max_upstream_response_bytes,
-                    )
-
-                    def observe_replay_outcome(outcome: _ReplayOutcome) -> None:
-                        if outcome == "succeeded":
-                            counters.stream_replays += 1
-                        elif outcome == "cancelled":
-                            counters.cancellations += 1
-                        elif outcome == "deadline":
-                            counters.deadline_expiries += 1
-                            counters.errors += 1
-                        else:
-                            counters.errors += 1
-                        if timing is not None:
-                            timing.classify(outcome)
-
-                    async def release_admission() -> None:
-                        await admission_lease.__aexit__(None, None, None)
-
-                    headers["Cache-Control"] = "no-cache"
-                    headers["X-Shiftedx-Stream-Mode"] = "validate-then-replay"
                     response = _ReplayStreamingResponse(
                         _replay_stream(replay),
                         deadline_at=deadline_at,
                         observe_outcome=observe_replay_outcome,
-                        release_admission=release_admission,
+                        release_admission=admission_stack.pop_all().aclose,
                         headers=headers,
                     )
-                else:
-                    response = JSONResponse(result.body, headers=headers)
-                _ensure_before_deadline(deadline_at)
-                if replay_options is None and timing is not None:
-                    timing.classify("succeeded")
-                if timing is not None:
-                    timing.begin_response_finalize()
-                counters.observe(result)
-            if replay_options is not None:
-                admission_transferred = True
-            return response
+                return response
         except TimeoutError as exc:
             timing = current_request_timing()
             if timing is not None:
@@ -433,9 +426,6 @@ def create_app(
             if timing is not None:
                 timing.classify("cancelled")
             raise
-        finally:
-            if admission_entered and not admission_transferred:
-                await admission_lease.__aexit__(None, None, None)
 
     return app
 
