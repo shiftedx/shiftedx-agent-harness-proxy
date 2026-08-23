@@ -330,6 +330,22 @@ class AgentHarness:
             return f"Failed receipts remain unresolved for: {tools}. Recover and verify before finishing."
         if self.pending_verification:
             return "State changed after the last verification; run a verification tool before finishing."
+        try:
+            structured = json.loads(content.strip())
+        except json.JSONDecodeError:
+            structured = None
+        if isinstance(structured, dict) and "failed_executions" in structured:
+            expected_failures = sum(receipt.status == "failure" for receipt in self.receipts)
+            claimed_failures = structured["failed_executions"]
+            if (
+                isinstance(claimed_failures, bool)
+                or not isinstance(claimed_failures, int)
+                or claimed_failures != expected_failures
+            ):
+                return (
+                    f"The final JSON key failed_executions must be {expected_failures}, matching "
+                    "failed client-visible tool receipts."
+                )
         if self.required_json_keys is None:
             return None
         return bare_json_issue(content, self.required_json_keys, self.required_json_types)

@@ -43,6 +43,7 @@ class RecoveryTruthUpstream:
 
     def __init__(self) -> None:
         self.requests: list[JsonObject] = []
+        self.false_terminal_claims = 0
 
     async def chat(self, payload: JsonObject, request_headers: dict[str, str]) -> JsonObject:
         del request_headers
@@ -67,7 +68,10 @@ class RecoveryTruthUpstream:
         latest_id = tool_results[-1].get("tool_call_id") if tool_results else None
         if latest_id == "verification":
             grounded = "Only downstream-visible assistant tool-call IDs paired with client-supplied" in rendered
-            failed_executions = 1 if grounded else 2
+            corrected = "failed_executions must be 1" in rendered
+            if not corrected:
+                self.false_terminal_claims += 1
+            failed_executions = 1 if grounded and corrected else 2
             return completion(
                 content=json.dumps(
                     {"failed_executions": failed_executions, "recovery_verified": True},
@@ -113,9 +117,30 @@ async def test_failed_repeat_recovers_once_and_final_claim_matches_client_execut
     ]
     upstream = RecoveryTruthUpstream()
     app = create_app(
-        Settings(upstream_base_url="http://upstream/v1", telemetry_enabled=True), upstream
+        Settings(
+            upstream_base_url="http://upstream/v1",
+            telemetry_enabled=True,
+            upstream_tool_response_capability_mode="phase_split",
+        ),
+        upstream,
     )
     client_executions = ["original"]
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "recovery_result",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "failed_executions": {"type": "integer"},
+                    "recovery_verified": {"type": "boolean"},
+                },
+                "required": ["failed_executions", "recovery_verified"],
+                "additionalProperties": False,
+            },
+        },
+    }
 
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
@@ -123,7 +148,13 @@ async def test_failed_repeat_recovers_once_and_final_claim_matches_client_execut
         ) as client:
             first = await client.post(
                 "/v1/chat/completions",
-                json={"model": "model", "messages": messages, "tools": tools, "stream": True},
+                json={
+                    "model": "model",
+                    "messages": messages,
+                    "tools": tools,
+                    "response_format": response_format,
+                    "stream": True,
+                },
             )
             assert first.status_code == 200, [
                 {
@@ -144,7 +175,13 @@ async def test_failed_repeat_recovers_once_and_final_claim_matches_client_execut
 
             second = await client.post(
                 "/v1/chat/completions",
-                json={"model": "model", "messages": messages, "tools": tools, "stream": True},
+                json={
+                    "model": "model",
+                    "messages": messages,
+                    "tools": tools,
+                    "response_format": response_format,
+                    "stream": True,
+                },
             )
             verification = replay_message(second)
             messages.extend(
@@ -157,7 +194,13 @@ async def test_failed_repeat_recovers_once_and_final_claim_matches_client_execut
 
             third = await client.post(
                 "/v1/chat/completions",
-                json={"model": "model", "messages": messages, "tools": tools, "stream": True},
+                json={
+                    "model": "model",
+                    "messages": messages,
+                    "tools": tools,
+                    "response_format": response_format,
+                    "stream": True,
+                },
             )
             final = json.loads(replay_message(third)["content"])
             metrics = (await client.get("/metrics")).text
@@ -166,11 +209,15 @@ async def test_failed_repeat_recovers_once_and_final_claim_matches_client_execut
     assert first.headers["x-shiftedx-upstream-calls"] == "2"
     assert first.headers["x-shiftedx-blocked-duplicates"] == "1"
     assert first.headers["x-shiftedx-corrections"] == "0"
+    assert third.headers["x-shiftedx-corrections"] == "1"
     assert client_executions == ["original", "recovery", "verification"]
     assert "repeat" not in client_executions
     assert final == {"failed_executions": 1, "recovery_verified": True}
-    assert len(upstream.requests) == 4
+    assert upstream.false_terminal_claims == 1
+    assert len(upstream.requests) == 5
     assert "shiftedx_proxy_downstream_requests_total 3" in metrics
-    assert "shiftedx_proxy_upstream_calls_total 4" in metrics
+    assert "shiftedx_proxy_upstream_calls_total 5" in metrics
     assert "shiftedx_proxy_blocked_duplicates_total 1" in metrics
-    assert "shiftedx_proxy_correction_turns_total 0" in metrics
+    assert "shiftedx_proxy_correction_turns_total 1" in metrics
+    assert "shiftedx_proxy_phase_acquisition_total 5" in metrics
+    assert "shiftedx_proxy_phase_finalization_total 0" in metrics

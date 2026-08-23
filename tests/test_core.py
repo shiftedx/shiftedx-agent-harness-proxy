@@ -42,6 +42,20 @@ def test_blocked_duplicate_is_explicitly_not_a_client_execution() -> None:
     ) in HARNESS_SYSTEM_SUFFIX
 
 
+def test_structured_failed_execution_claim_must_match_client_visible_receipts() -> None:
+    state = AgentHarness("recover", available_tools={"run_tests", "apply_patch"})
+    state.record("run_tests", {"target": "original"}, "1 failed")
+    state.record("apply_patch", {}, "Patch applied.")
+    state.record("run_tests", {"target": "recovered"}, "8 passed")
+
+    assert "must be 1" in (
+        state.terminal_issue('{"failed_executions":2,"recovery_verified":true}') or ""
+    )
+    assert state.terminal_issue(
+        '{"failed_executions":1,"recovery_verified":true}'
+    ) is None
+
+
 def test_failed_verification_persists_through_investigation_and_stalls_at_three() -> None:
     state = AgentHarness(
         "repair", available_tools={"run_tests", "read_file", "file_search", "apply_patch"}

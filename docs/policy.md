@@ -153,7 +153,11 @@ overlapping capability entries, so an ordinary bearer can never silently become 
 - A blocked duplicate's internal synthetic result carries
   `execution_status=blocked_not_executed` and states that the proposal did not reach the client
   executor. Only downstream-visible assistant call IDs paired with client-supplied `role=tool`
-  results count as executed; final prose must agree with that ledger.
+  results count as executed. The model is instructed to ground free-form prose in that ledger.
+- When terminal JSON includes `failed_executions`, the proxy deterministically requires its integer
+  value to equal the number of failed client-visible receipts; a mismatch enters the existing
+  bounded terminal-correction path. Free-form prose without that field is not semantically parsed
+  and remains prompt-grounded rather than proxy-enforced.
 - Successful mutation opens a verification requirement. A successful verifier closes it.
 - Failed verification remains unresolved through investigation. It closes only after changed
   action and a later successful verifier.
