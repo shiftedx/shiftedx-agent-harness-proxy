@@ -19,6 +19,7 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI
+from pydantic import SecretStr
 
 from shiftedx_harness_proxy.api import create_app
 from shiftedx_harness_proxy.config import Settings
@@ -165,6 +166,7 @@ def write_isolated_config(home: Path, proxy_base_url: str) -> None:
                 "providers:",
                 "  qualification-proxy:",
                 f"    api: {proxy_base_url}/v1",
+                "    key_env: SHIFTEDX_PROXY_API_KEY",
                 "    transport: chat_completions",
                 "    default_model: qualify-model",
                 "    discover_models: false",
@@ -198,8 +200,14 @@ def main() -> int:
     ).stdout.splitlines()[0]
     ledger = ProtocolLedger()
     terminal_marker = secrets.token_urlsafe(24)
+    client_key = secrets.token_urlsafe(32)
     with running_server(upstream_app(ledger, terminal_marker)) as upstream_base_url:
-        proxy = create_app(Settings(upstream_base_url=f"{upstream_base_url}/v1"))
+        proxy = create_app(
+            Settings(
+                upstream_base_url=f"{upstream_base_url}/v1",
+                proxy_api_key=SecretStr(client_key),
+            )
+        )
         capture_downstream_requests(proxy, ledger)
         with running_server(proxy) as proxy_base_url:
             with tempfile.TemporaryDirectory(prefix="hermes-streaming-qualification-") as raw_home:
@@ -207,6 +215,7 @@ def main() -> int:
                 write_isolated_config(home, proxy_base_url)
                 env = os.environ.copy()
                 env["HERMES_HOME"] = str(home)
+                env["SHIFTEDX_PROXY_API_KEY"] = client_key
                 run = subprocess.run(  # noqa: S603 - the operator selects the Hermes executable.
                     [
                         args.hermes,
@@ -238,6 +247,7 @@ def main() -> int:
                 "hermes_version": version,
                 "hermes_exit_code": run.returncode,
                 "terminal_answer_observed": terminal_marker in run.stdout,
+                "proxy_authentication_required": True,
                 "stream_replay_count": proxy.state.counters.stream_replays,
                 **ledger.evidence(),
             }
@@ -245,6 +255,7 @@ def main() -> int:
                 [
                     run.returncode == 0,
                     evidence["terminal_answer_observed"],
+                    evidence["proxy_authentication_required"],
                     evidence["downstream_stream_requested"],
                     evidence["downstream_stream_options_include_usage"],
                     evidence["upstream_stream_controls_removed"],
