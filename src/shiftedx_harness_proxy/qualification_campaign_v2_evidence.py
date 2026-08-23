@@ -18,7 +18,7 @@ from typing import Any, Literal, cast
 
 from shiftedx_harness_proxy.qualification_campaign import _read_regular_file
 from shiftedx_harness_proxy.qualification_campaign_v2 import V2OutcomeRecord
-from shiftedx_harness_proxy.qualification_contract import load_runtime_outcome
+from shiftedx_harness_proxy.qualification_contract import RuntimeOutcomeFailure, load_runtime_outcome
 
 Arm = Literal["direct", "proxy"]
 
@@ -158,7 +158,7 @@ def _authenticated_rows(
             pair_index=spec.pair_index,
             campaign_version="v2",
         )
-    except Exception as error:
+    except (RuntimeOutcomeFailure, OSError) as error:
         raise QualificationV2EvidenceFailure("qualification_v2_evidence_invalid") from error
     if outcome.file_sha256 != source.runtime_outcome_sha256:
         raise QualificationV2EvidenceFailure("qualification_v2_evidence_invalid")
@@ -208,6 +208,7 @@ def _validate_spec(spec: V2EvidenceSpec) -> None:
         or len(set(spec.cohort_case_ids)) != _CASE_COUNT
         or any(_SAFE_ID.fullmatch(value) is None for value in spec.cohort_case_ids)
         or _sha256(spec.cohort_case_ids) != spec.cohort_case_ids_sha256
+        or not spec.critical_cohort_ordinals
         or tuple(sorted(set(spec.critical_cohort_ordinals))) != spec.critical_cohort_ordinals
         or any(
             not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= _CASE_COUNT
