@@ -138,6 +138,10 @@ scenario rather than preflight. The final v2 scorer exit is `3` (`campaign_score
 records completed scoring only. It does not emit `PROMOTE`, authorize deployment, or waive the
 remaining operational evidence and owner decision in the [v2 qualification plan](../benchmark-reports/v2-qualification-plan.md).
 
+The private proxy-to-model observer uses an evidence-flush timeout up to one second shorter than
+the candidate proxy's upstream timeout. This is a conservative qualification-only disadvantage for
+the proxy arm, not literal timeout parity, and cannot turn a failed request into a passing one.
+
 ### Private manifest v1
 
 The manifest is duplicate-rejecting JSON; YAML and JSON last-key-wins parsing are not accepted.

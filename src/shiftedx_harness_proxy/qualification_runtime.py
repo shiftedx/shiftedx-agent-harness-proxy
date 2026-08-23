@@ -2129,11 +2129,26 @@ def _start_observer(
         "QUALIFICATION_OBSERVER_HOST": spec.observer.host,
         "QUALIFICATION_OBSERVER_PORT": str(spec.observer.port),
         "QUALIFICATION_OBSERVER_INSTANCE_SHA256": observer_identity,
+        "QUALIFICATION_OBSERVER_TIMEOUT_SECONDS": _observer_timeout_seconds(spec.proxy.settings),
     }
     try:
         return runner.spawn((sys.executable, "-m", "shiftedx_harness_proxy.qualification_observer"), env=env)
     except Exception as error:
         raise QualificationRuntimeFailure("runtime_observer_start_failed") from error
+
+
+def _observer_timeout_seconds(settings: Mapping[str, Any]) -> str:
+    """Leave a bounded loopback margin without materially changing model time."""
+
+    try:
+        upstream_timeout = Decimal(str(settings["upstream_timeout_seconds"]))
+    except (InvalidOperation, KeyError, ValueError) as error:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid") from error
+    margin = min(Decimal("1"), upstream_timeout / 10)
+    observer_timeout = upstream_timeout - margin
+    if not upstream_timeout.is_finite() or observer_timeout <= 0 or observer_timeout >= upstream_timeout:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    return format(observer_timeout, "f")
 
 
 def _wait_for_observer(runner: RuntimeCommandRunner, observer: _ObserverSpec, observer_identity: str) -> None:

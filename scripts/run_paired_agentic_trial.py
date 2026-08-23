@@ -20,7 +20,7 @@ import uuid
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, NamedTuple, TypeAlias
+from typing import Any, NamedTuple, TypeAlias, cast
 
 from shiftedx_bench.agentic import run_agentic_cases, scenario_set
 from shiftedx_bench.api import OpenAIClient
@@ -137,8 +137,9 @@ _NO_PROXY_OPENER = urllib.request.build_opener(
 class ProxyHTTPFailure(RuntimeError):
     """A body-free proxy HTTP status used only for categorical accounting."""
 
-    def __init__(self, status_code: int) -> None:
+    def __init__(self, status_code: int, *, outcome: RequestOutcome | None = None) -> None:
         self.status_code = status_code
+        self.outcome: RequestOutcome = outcome or ("deadline" if status_code == 504 else "failed")
         super().__init__(f"proxy HTTP {status_code}")
 
 
@@ -159,6 +160,7 @@ class ProvisionalClientTimingRecord(NamedTuple):
     observer_record_count: int
     direct_attempt_wall_ns: tuple[int, ...]
     downstream_request_sha256: str
+    correlation_id_sha256: str | None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -172,6 +174,7 @@ class ProvisionalClientTimingRecord(NamedTuple):
             "observer_record_count": self.observer_record_count,
             "direct_attempt_wall_ns": list(self.direct_attempt_wall_ns),
             "downstream_request_sha256": self.downstream_request_sha256,
+            "correlation_id_sha256": self.correlation_id_sha256,
         }
 
 
@@ -205,6 +208,7 @@ class ProvisionalClientTimingLedger:
         observer_records: tuple[ModelBoundaryRecord, ...],
         direct_attempt_wall_ns: tuple[int, ...],
         downstream_request_sha256: str,
+        correlation_id_sha256: str | None,
     ) -> None:
         if arm not in {"direct", "proxy"}:
             raise ValueError("provisional timing arm is invalid")
@@ -238,6 +242,7 @@ class ProvisionalClientTimingLedger:
                 observer_record_count=len(observer_records),
                 direct_attempt_wall_ns=direct_attempt_wall_ns,
                 downstream_request_sha256=downstream_request_sha256,
+                correlation_id_sha256=correlation_id_sha256,
             )
         )
 
@@ -264,15 +269,25 @@ def _provisional_outcome(error: BaseException | None) -> ProvisionalRequestOutco
         return "succeeded"
     if isinstance(error, asyncio.CancelledError):
         return "cancelled"
+    if isinstance(error, ProxyHTTPFailure):
+        return error.outcome
     if (
-        isinstance(error, ProxyHTTPFailure)
-        and error.status_code == 504
-        or isinstance(error, TimeoutError)
+        isinstance(error, TimeoutError)
         or isinstance(error, urllib.error.URLError)
         and isinstance(error.reason, TimeoutError)
     ):
         return "deadline"
     return "failed"
+
+
+def _proxy_request_outcome(upstream: Any, error: BaseException | None) -> RequestOutcome:
+    observed = getattr(upstream, "qualification_request_outcome", None)
+    outcome = observed() if callable(observed) else None
+    if outcome is None:
+        return _provisional_outcome(error)
+    if outcome not in {"succeeded", "failed", "cancelled", "deadline"}:
+        raise PreflightFailure("proxy request outcome is malformed")
+    return cast(RequestOutcome, outcome)
 
 
 def write_provisional_client_timing_ledger(
@@ -306,6 +321,13 @@ def write_provisional_client_timing_ledger(
             or type(record.observer_record_count) is not int
             or record.observer_record_count < 0
             or _SHA256_HEX.fullmatch(record.downstream_request_sha256) is None
+            or record.arm == "proxy"
+            and (
+                not isinstance(record.correlation_id_sha256, str)
+                or _SHA256_HEX.fullmatch(record.correlation_id_sha256) is None
+            )
+            or record.arm == "direct"
+            and record.correlation_id_sha256 is not None
         ):
             raise ProvisionalTimingLedgerFailure("provisional_request_ledger_invalid")
         has_observer_range = record.observer_sequence_start is not None or record.observer_sequence_end is not None
@@ -400,18 +422,46 @@ class ProjectionAwareOpenAIClient(OpenAIClient):
     """Retain only the validated Local Projection marker dropped by the benchmark normalizer."""
 
     capture_proxy_accounting = False
+    _qualification_request_outcome: RequestOutcome | None = None
+    _qualification_correlation_id_sha256: str | None = None
+    _pending_qualification_correlation_id: str | None = None
+
+    def qualification_request_outcome(self) -> RequestOutcome | None:
+        return self._qualification_request_outcome
+
+    def qualification_correlation_id_sha256(self) -> str | None:
+        return self._qualification_correlation_id_sha256
+
+    def prepare_qualification_request(self) -> str:
+        if self._pending_qualification_correlation_id is not None:
+            raise PreflightFailure("proxy qualification request is already prepared")
+        correlation_id = f"shiftedx-qualification-{uuid.uuid4().hex}"
+        self._pending_qualification_correlation_id = correlation_id
+        self._qualification_correlation_id_sha256 = hashlib.sha256(correlation_id.encode()).hexdigest()
+        return self._qualification_correlation_id_sha256
 
     def complete(self, payload: dict[str, Any], *, stream: bool = False) -> dict[str, Any]:
         if not self.capture_proxy_accounting:
             return super().complete(payload, stream=stream)
         if stream:
             raise PreflightFailure("proxy qualification requires non-streaming responses")
+        self._qualification_request_outcome = None
+        if self._pending_qualification_correlation_id is None:
+            self.prepare_qualification_request()
+        correlation_id = self._pending_qualification_correlation_id
+        self._pending_qualification_correlation_id = None
+        assert correlation_id is not None
         body = dict(payload)
         body["stream"] = False
         request = self._request(body)
+        add_header = getattr(request, "add_header", None)
+        if not callable(add_header):
+            raise PreflightFailure("proxy qualification request is malformed")
+        add_header("X-Request-ID", correlation_id)
         started = time.perf_counter()
         try:
             with _NO_PROXY_OPENER.open(request, timeout=self.timeout_s) as response:  # noqa: S310
+                self._qualification_request_outcome = "succeeded"
                 if response.geturl() != request.full_url:
                     raise PreflightFailure("proxy qualification final URL differed")
                 value = json.loads(_read_bounded_proxy_response(response).decode("utf-8"))
@@ -425,16 +475,22 @@ class ProjectionAwareOpenAIClient(OpenAIClient):
         except urllib.error.HTTPError as error:
             if 300 <= error.code < 400:
                 raise PreflightFailure("proxy qualification redirect rejected") from None
-            raise ProxyHTTPFailure(error.code) from None
+            outcome = _proxy_http_failure_outcome(error)
+            self._qualification_request_outcome = outcome
+            raise ProxyHTTPFailure(error.code, outcome=outcome) from None
         except PreflightFailure:
             raise
         except TimeoutError:
+            self._qualification_request_outcome = "deadline"
             raise TimeoutError("proxy request deadline exceeded") from None
         except urllib.error.URLError as error:
             if isinstance(error.reason, TimeoutError):
+                self._qualification_request_outcome = "deadline"
                 raise TimeoutError("proxy request deadline exceeded") from None
+            self._qualification_request_outcome = "failed"
             raise ConnectionError("proxy transport failed") from None
         except OSError:
+            self._qualification_request_outcome = "failed"
             raise ConnectionError("proxy transport failed") from None
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
             raise PreflightFailure("proxy response is malformed") from None
@@ -474,6 +530,19 @@ def _proxy_accounting_from_headers(headers: Any) -> dict[str, int]:
             raise PreflightFailure("proxy response accounting is unavailable")
         projected[key] = int(values[0])
     return projected
+
+
+def _proxy_http_failure_outcome(error: urllib.error.HTTPError) -> RequestOutcome:
+    if error.code != 504:
+        return "failed"
+    try:
+        document = json.loads(_read_bounded_proxy_response(error).decode("utf-8"))
+    except (PreflightFailure, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return "failed"
+    if not isinstance(document, dict):
+        return "failed"
+    detail = document.get("error")
+    return "deadline" if isinstance(detail, dict) and detail.get("code") == "request_deadline_exceeded" else "failed"
 
 
 def _read_bounded_proxy_response(response: Any) -> bytes:
@@ -595,14 +664,22 @@ class ProxyRequestAccounting:
             blocked_stalls=accounting["blocked_stalls"],
         )
 
-    def record_failure(self, observer_records: tuple[ModelBoundaryRecord, ...], error: BaseException) -> None:
+    def record_failure(
+        self,
+        observer_records: tuple[ModelBoundaryRecord, ...],
+        error: BaseException,
+        *,
+        observed_outcome: RequestOutcome | None = None,
+    ) -> None:
         outcome: RequestOutcome
-        if isinstance(error, asyncio.CancelledError):
+        if observed_outcome is not None:
+            outcome = observed_outcome
+        elif isinstance(error, asyncio.CancelledError):
             outcome = "cancelled"
+        elif isinstance(error, ProxyHTTPFailure):
+            outcome = error.outcome
         elif (
-            isinstance(error, ProxyHTTPFailure)
-            and error.status_code == 504
-            or isinstance(error, TimeoutError)
+            isinstance(error, TimeoutError)
             or isinstance(error, urllib.error.URLError)
             and isinstance(error.reason, TimeoutError)
         ):
@@ -749,10 +826,20 @@ class CompatibilityClient:
                     pair_ordinal=pair_ordinal,
                     arm=self.arm,
                     client_wall_ns=time.perf_counter_ns() - started_ns,
-                    outcome=_provisional_outcome(error),
+                    outcome=(
+                        _proxy_request_outcome(self.upstream, error)
+                        if self.arm == "proxy"
+                        else _provisional_outcome(error)
+                    ),
                     observer_records=observer_records,
                     direct_attempt_wall_ns=direct_attempt_wall_ns,
                     downstream_request_sha256=downstream_request_sha256(payload),
+                    correlation_id_sha256=(
+                        self.upstream.qualification_correlation_id_sha256()
+                        if self.arm == "proxy"
+                        and callable(getattr(self.upstream, "qualification_correlation_id_sha256", None))
+                        else None
+                    ),
                 )
 
     def _complete_direct(self, phase: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -790,18 +877,30 @@ class CompatibilityClient:
         local_projection = False
         response_accounting: dict[str, int] | None = None
         accounting_attempted = False
+        correlation_id_sha256: str | None = None
+        prepare_request = getattr(self.upstream, "prepare_qualification_request", None)
+        if callable(prepare_request):
+            correlation_id_sha256 = prepare_request()
         if self.observer is not None:
-            self.observer.begin_turn()
+            self.observer.begin_turn(correlation_id_sha256=correlation_id_sha256)
         try:
             call_started = True
             response = self._complete_upstream(payload)
             if not isinstance(response, dict):
-                records = self._consume_proxy_observations(payload, require_records=True)
+                records = self._consume_proxy_observations(
+                    payload,
+                    require_records=True,
+                    correlation_id_sha256=correlation_id_sha256,
+                )
                 raise PreflightFailure("preflight_response_malformed")
             local_projection = _is_local_projection(response)
             if self.request_accounting is not None:
                 response_accounting = _take_proxy_response_accounting(response)
-            records = self._consume_proxy_observations(payload, require_records=not local_projection)
+            records = self._consume_proxy_observations(
+                payload,
+                require_records=not local_projection,
+                correlation_id_sha256=correlation_id_sha256,
+            )
             if self.request_accounting is not None:
                 assert response_accounting is not None
                 accounting_attempted = True
@@ -817,7 +916,11 @@ class CompatibilityClient:
                 records = self.observer.record_turns[-1]
             elif call_started:
                 try:
-                    records = self._consume_proxy_observations(payload, require_records=False)
+                    records = self._consume_proxy_observations(
+                        payload,
+                        require_records=False,
+                        correlation_id_sha256=correlation_id_sha256,
+                    )
                 except BaseException:
                     if self.observer is not None and len(self.observer.record_turns) > prior_turn_count:
                         records = self.observer.record_turns[-1]
@@ -833,7 +936,11 @@ class CompatibilityClient:
                         local_projection=local_projection,
                     )
                 else:
-                    self.request_accounting.record_failure(records, error)
+                    self.request_accounting.record_failure(
+                        records,
+                        error,
+                        observed_outcome=_proxy_request_outcome(self.upstream, error),
+                    )
             raise
 
     def _complete_upstream(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -866,11 +973,18 @@ class CompatibilityClient:
         return remaining_s
 
     def _consume_proxy_observations(
-        self, payload: dict[str, Any], *, require_records: bool
+        self,
+        payload: dict[str, Any],
+        *,
+        require_records: bool,
+        correlation_id_sha256: str | None,
     ) -> tuple[ModelBoundaryRecord, ...]:
         if self.observer is None:
             return ()
-        records = self.observer.consume_turn(require_records=require_records)
+        records = self.observer.consume_turn(
+            require_records=require_records,
+            correlation_id_sha256=correlation_id_sha256,
+        )
         self._proxy_model_turns.append(records)
         if self.require_cache_evidence and require_records:
             raw_records = self.observer.record_turns[-1]

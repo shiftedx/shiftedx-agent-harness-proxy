@@ -1317,8 +1317,88 @@ def test_proxy_request_accounting_is_exactly_once_after_post_response_validation
     assert accounting.records[0].blocked_stall_count == 2
 
 
+def test_proxy_request_correlation_never_attributes_a_late_observer_row_to_the_next_turn(
+    monkeypatch, tmp_path
+):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    observer_path = tmp_path / "observer.jsonl"
+    payload = runner.request_payload(scenario, model="model", proxy_policy=True)
+    observed = runner.PhasePlanner().plan(payload, phase="acquisition")
+    observed["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
+    correlations = ("a" * 64, "b" * 64)
+
+    class DelayedProxy:
+        def __init__(self):
+            self.calls = 0
+            self.correlation_id_sha256 = None
+
+        def prepare_qualification_request(self):
+            self.correlation_id_sha256 = correlations[self.calls]
+            return self.correlation_id_sha256
+
+        def qualification_correlation_id_sha256(self):
+            return self.correlation_id_sha256
+
+        def qualification_request_outcome(self):
+            return "deadline" if self.calls == 1 else "succeeded"
+
+        def complete(self, _payload, *, stream=False):
+            assert stream is False
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError("first request timed out")
+            _append_observer_record(
+                runner,
+                observer_path,
+                observed,
+                1,
+                status_code=None,
+                correlation_id_sha256=correlations[0],
+            )
+            _append_observer_record(
+                runner,
+                observer_path,
+                observed,
+                2,
+                correlation_id_sha256=correlations[1],
+            )
+            return {
+                "content": "",
+                "tool_calls": [],
+                runner.PROXY_RESPONSE_ACCOUNTING: {
+                    "upstream_calls": 1,
+                    "corrections": 0,
+                    "blocked_duplicates": 0,
+                    "blocked_stalls": 0,
+                },
+            }
+
+    accounting = runner.ProxyRequestAccounting()
+    observer = runner.ModelBoundaryObserverCursor(observer_path, [scenario.case_id])
+    client = runner.CompatibilityClient(
+        DelayedProxy(),
+        arm="proxy",
+        scenario_order=[scenario.case_id],
+        proxy_policy=True,
+        observer=observer,
+        request_accounting=accounting,
+    )
+
+    with pytest.raises(TimeoutError, match="first request timed out"):
+        client.complete(payload)
+    client.complete(payload)
+
+    assert [record.attempt_count for record in accounting.records] == [0, 1]
+    assert [len(records) for records in observer.record_turns] == [0, 1]
+    assert observer.record_turns[1][0].correlation_id_sha256 == correlations[1]
+    with pytest.raises(runner.PreflightFailure, match="unconsumed records"):
+        observer.require_drained()
+
+
 def test_proxy_http_client_projects_only_exact_safe_telemetry_headers(monkeypatch) -> None:
     runner = load_runner(monkeypatch)
+    requests = []
     headers = Message()
     headers["X-Shiftedx-Upstream-Calls"] = "3"
     headers["X-Shiftedx-Corrections"] = "1"
@@ -1342,11 +1422,15 @@ def test_proxy_http_client_projects_only_exact_safe_telemetry_headers(monkeypatc
         def geturl(self):
             return "http://proxy.invalid/v1/chat/completions"
 
-    monkeypatch.setattr(runner._NO_PROXY_OPENER, "open", lambda *_args, **_kwargs: Response())
+    def open_request(request, **_kwargs):
+        requests.append(request)
+        return Response()
+
+    monkeypatch.setattr(runner._NO_PROXY_OPENER, "open", open_request)
     client = runner.ProjectionAwareOpenAIClient("http://proxy.invalid/v1")
     client.capture_proxy_accounting = True
     client.timeout_s = 1.0
-    client._request = lambda _payload: SimpleNamespace(full_url="http://proxy.invalid/v1/chat/completions")
+    client._request = lambda _payload: runner.urllib.request.Request("http://proxy.invalid/v1/chat/completions")
 
     response = client.complete({"model": "model"})
 
@@ -1357,6 +1441,9 @@ def test_proxy_http_client_projects_only_exact_safe_telemetry_headers(monkeypatc
         "blocked_stalls": 0,
     }
     assert "must-not-survive" not in json.dumps(response)
+    correlation_id = requests[0].get_header("X-request-id")
+    assert correlation_id.startswith("shiftedx-qualification-")
+    assert client.qualification_correlation_id_sha256() == hashlib.sha256(correlation_id.encode()).hexdigest()
 
 
 @pytest.mark.parametrize("mutation", ["missing", "duplicate", "nonnumeric", "negative", "leading-zero"])
@@ -1425,7 +1512,7 @@ def test_proxy_http_client_accepts_canonical_zero_header_local_projection(monkey
     client = runner.ProjectionAwareOpenAIClient("http://proxy.invalid/v1")
     client.capture_proxy_accounting = True
     client.timeout_s = 1.0
-    client._request = lambda _payload: SimpleNamespace(full_url="http://proxy.invalid/v1/chat/completions")
+    client._request = lambda _payload: runner.urllib.request.Request("http://proxy.invalid/v1/chat/completions")
 
     response = client.complete({"model": "model"})
 
@@ -1463,7 +1550,7 @@ def test_proxy_http_client_rejects_oversized_or_redirected_responses(monkeypatch
     client = runner.ProjectionAwareOpenAIClient("http://proxy.invalid/v1")
     client.capture_proxy_accounting = True
     client.timeout_s = 1.0
-    client._request = lambda _payload: SimpleNamespace(full_url="http://proxy.invalid/v1/chat/completions")
+    client._request = lambda _payload: runner.urllib.request.Request("http://proxy.invalid/v1/chat/completions")
     monkeypatch.setattr(runner._NO_PROXY_OPENER, "open", lambda *_args, **_kwargs: Response(redirected=True))
     with pytest.raises(runner.PreflightFailure, match="final URL differed"):
         client.complete({"model": "model"})
@@ -1495,7 +1582,7 @@ def test_proxy_http_client_suppresses_private_malformed_body_and_transport_cause
     client = runner.ProjectionAwareOpenAIClient("http://proxy.invalid/v1")
     client.capture_proxy_accounting = True
     client.timeout_s = 1.0
-    client._request = lambda _payload: SimpleNamespace(full_url="http://proxy.invalid/v1/chat/completions")
+    client._request = lambda _payload: runner.urllib.request.Request("http://proxy.invalid/v1/chat/completions")
     monkeypatch.setattr(runner._NO_PROXY_OPENER, "open", lambda *_args, **_kwargs: MalformedResponse())
 
     with pytest.raises(runner.PreflightFailure) as malformed:
@@ -1517,20 +1604,28 @@ def test_proxy_http_client_suppresses_private_malformed_body_and_transport_cause
     assert private_marker not in str(transport.value)
 
 
-def test_proxy_http_504_is_body_free_and_classified_as_deadline(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("body", "outcome"),
+    [
+        (b'{"error":{"code":"request_deadline_exceeded"}}', "deadline"),
+        (b'{"error":{"code":"upstream_http_error"}}', "failed"),
+        (b"private malformed response body and credential", "failed"),
+    ],
+)
+def test_proxy_http_504_is_body_free_and_uses_the_safe_error_code_for_outcome(monkeypatch, body, outcome) -> None:
     runner = load_runner(monkeypatch)
     failure = runner.urllib.error.HTTPError(
         "http://proxy.invalid/v1/chat/completions",
         504,
         "private reason",
         Message(),
-        io.BytesIO(b"private response body and credential"),
+        io.BytesIO(body),
     )
     monkeypatch.setattr(runner._NO_PROXY_OPENER, "open", lambda *_args, **_kwargs: (_ for _ in ()).throw(failure))
     client = runner.ProjectionAwareOpenAIClient("http://proxy.invalid/v1")
     client.capture_proxy_accounting = True
     client.timeout_s = 1.0
-    client._request = lambda _payload: SimpleNamespace(full_url="http://proxy.invalid/v1/chat/completions")
+    client._request = lambda _payload: runner.urllib.request.Request("http://proxy.invalid/v1/chat/completions")
 
     with pytest.raises(runner.ProxyHTTPFailure) as raised:
         client.complete({"model": "model"})
@@ -1538,9 +1633,10 @@ def test_proxy_http_504_is_body_free_and_classified_as_deadline(monkeypatch) -> 
     assert raised.value.status_code == 504
     assert raised.value.__cause__ is None
     assert "private" not in str(raised.value)
+    assert client.qualification_request_outcome() == outcome
     accounting = runner.ProxyRequestAccounting()
     accounting.record_failure((), raised.value)
-    assert accounting.records[0].outcome == "deadline"
+    assert accounting.records[0].outcome == outcome
 
 
 def test_proxy_request_ledger_is_exact_private_atomic_and_no_clobber(monkeypatch, tmp_path) -> None:
@@ -1863,6 +1959,9 @@ def test_provisional_client_timing_records_safe_matching_digests_and_terminal_ou
             _append_observer_record(runner, observer_path, observed, 1)
             raise TimeoutError("private deadline")
 
+        def qualification_correlation_id_sha256(self):
+            return "c" * 64
+
     clock = iter((100, 180))
     monkeypatch.setattr(runner.time, "perf_counter_ns", lambda: next(clock))
     ledger = runner.ProvisionalClientTimingLedger(cache_lane="warm-prefix")
@@ -1890,6 +1989,7 @@ def test_provisional_client_timing_records_safe_matching_digests_and_terminal_ou
             observer_record_count=1,
             direct_attempt_wall_ns=(),
             downstream_request_sha256=runner.downstream_request_sha256(direct_payload),
+            correlation_id_sha256="c" * 64,
         ),
     )
     output = tmp_path / "provisional.jsonl"
@@ -1901,6 +2001,42 @@ def test_provisional_client_timing_records_safe_matching_digests_and_terminal_ou
     assert output.stat().st_mode & 0o777 == 0o600
     with pytest.raises(runner.ProvisionalTimingLedgerFailure, match="provisional_request_ledger_exists"):
         runner.write_provisional_client_timing_ledger(output, ledger.records)
+
+
+def test_proxy_evidence_uses_observed_http_outcome_after_client_validation_failure(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    observer_path = tmp_path / "observer.jsonl"
+    payload = runner.request_payload(scenario, model="model", proxy_policy=True)
+    observed = runner.PhasePlanner().plan(payload, phase="acquisition")
+    observed["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
+
+    class Proxy:
+        def complete(self, _payload, *, stream=False):
+            assert stream is False
+            _append_observer_record(runner, observer_path, observed, 1)
+            raise runner.PreflightFailure("post-response validation failed")
+
+        def qualification_request_outcome(self):
+            return "succeeded"
+
+    accounting = runner.ProxyRequestAccounting()
+    ledger = runner.ProvisionalClientTimingLedger(cache_lane="cold")
+    client = runner.CompatibilityClient(
+        Proxy(),
+        arm="proxy",
+        scenario_order=[scenario.case_id],
+        proxy_policy=True,
+        observer=runner.ModelBoundaryObserverCursor(observer_path, [scenario.case_id]),
+        request_accounting=accounting,
+        provisional_timing=ledger,
+    )
+
+    with pytest.raises(runner.PreflightFailure, match="post-response validation failed"):
+        client.complete(payload)
+
+    assert accounting.records[0].outcome == "succeeded"
+    assert ledger.records[0].outcome == "succeeded"
 
 
 def test_provisional_client_timing_records_success_failure_and_cancellation_in_invocation_order(monkeypatch):
@@ -2060,6 +2196,7 @@ def test_provisional_direct_timing_rejects_a_noncontiguous_local_attempt_slice(m
             observer_records=(first, third),
             direct_attempt_wall_ns=(1, 1),
             downstream_request_sha256=runner.downstream_request_sha256(payload),
+            correlation_id_sha256=None,
         )
 
 
@@ -2079,6 +2216,7 @@ def test_provisional_timing_writer_requires_a_private_existing_parent_and_safe_b
         observer_record_count=0,
         direct_attempt_wall_ns=(),
         downstream_request_sha256="a" * 64,
+        correlation_id_sha256=None,
     )
 
     with pytest.raises(runner.ProvisionalTimingLedgerFailure, match="provisional_request_ledger_parent_invalid"):
@@ -3496,13 +3634,27 @@ def test_scored_proxy_rows_use_actual_observer_fingerprints_and_failures_keep_sa
     class ObservingProxy:
         def __init__(self, *_args, **_kwargs):
             self.sequence = 0
+            self.correlation_id_sha256 = None
+
+        def prepare_qualification_request(self):
+            self.correlation_id_sha256 = hashlib.sha256(f"request-{self.sequence + 1}".encode()).hexdigest()
+            return self.correlation_id_sha256
+
+        def qualification_correlation_id_sha256(self):
+            return self.correlation_id_sha256
 
         def complete(self, payload, *, stream=False):
             assert stream is False
             observed = planner.plan(payload, phase="acquisition")
             observed["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
             self.sequence += 1
-            _append_observer_record(runner, observer_path, observed, self.sequence)
+            _append_observer_record(
+                runner,
+                observer_path,
+                observed,
+                self.sequence,
+                correlation_id_sha256=self.correlation_id_sha256,
+            )
             return {
                 "content": "",
                 "tool_calls": [{"id": f"call-{self.sequence}"}],
@@ -3614,6 +3766,7 @@ def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_re
 
     def complete(self, _payload, *, stream=False):
         assert stream is False
+        self._pending_qualification_correlation_id = None
         response = self._normalize({LOCAL_PROJECTION_EXTENSION: local_projection_accounting()}, wall_s=0.1, ttft_s=None)
         response[runner.PROXY_RESPONSE_ACCOUNTING] = {
             "upstream_calls": 0,
@@ -3932,7 +4085,16 @@ def _suffix_pair_observations(runner, proxy_system_mutation):
     ]
 
 
-def _append_observer_record(runner, path, payload, sequence, *, cache=True, status_code=200):
+def _append_observer_record(
+    runner,
+    path,
+    payload,
+    sequence,
+    *,
+    cache=True,
+    status_code=200,
+    correlation_id_sha256=None,
+):
     fingerprint = runner.model_boundary_fingerprint(payload)
     bypass = fingerprint.fields["cache_mode_policy"] == "bypass"
     with path.open("a", encoding="utf-8") as handle:
@@ -3943,6 +4105,11 @@ def _append_observer_record(runner, path, payload, sequence, *, cache=True, stat
                     "sequence": sequence,
                     "digest": fingerprint.digest,
                     "fields": fingerprint.fields,
+                    **(
+                        {"correlation_id_sha256": correlation_id_sha256}
+                        if correlation_id_sha256 is not None
+                        else {}
+                    ),
                     "response": {
                         "status_code": status_code,
                         "cache": {

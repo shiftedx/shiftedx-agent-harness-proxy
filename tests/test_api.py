@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 from typing import Any
@@ -163,6 +164,10 @@ async def test_injected_private_timing_sink_captures_chat_lifecycle_without_publ
     captures = read_timing_capture_ledger(ledger)
     assert len(captures) == 1
     capture = captures[0]
+    assert capture["correlation_id_sha256"] == hashlib.sha256(
+        response.headers["x-request-id"].encode("utf-8")
+    ).hexdigest()
+    assert response.headers["x-request-id"] not in ledger.read_text(encoding="utf-8")
     assert capture["outcome"] == "succeeded"
     assert capture["body_read_ns"] > 0
     assert capture["admission_wait_ns"] >= 0
@@ -1714,8 +1719,9 @@ async def test_invalid_correlation_id_is_not_emitted_as_log_structure(caplog: py
             )
     correlation_id = response.headers["x-request-id"]
     assert correlation_id.startswith("shiftedx-")
-    assert f"correlation_id={correlation_id}" in caplog.text
-    assert "correlation_id=not safe" not in caplog.text
+    assert hashlib.sha256(correlation_id.encode("utf-8")).hexdigest() in caplog.text
+    assert correlation_id not in caplog.text
+    assert "not safe" not in caplog.text
     assert upstream.requests == []
 
 

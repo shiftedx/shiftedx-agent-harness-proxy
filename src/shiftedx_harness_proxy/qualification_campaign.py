@@ -1126,8 +1126,12 @@ def _event_record(
     }
     if spec.campaign_version == "v2":
         if request.stage in {"score-direct", "score-proxy"} and (
-            not isinstance(result.model_identity_sha256, str)
-            or _SHA256.fullmatch(result.model_identity_sha256) is None
+            result.model_identity_sha256 is not None
+            and (
+                not isinstance(result.model_identity_sha256, str)
+                or _SHA256.fullmatch(result.model_identity_sha256) is None
+            )
+            or result.status == "passed" and result.model_identity_sha256 is None
         ):
             raise CampaignFailure("campaign_stage_outcome_invalid")
         if request.stage == "score-proxy" and (

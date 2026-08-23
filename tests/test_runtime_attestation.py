@@ -8,6 +8,7 @@ import pytest
 from shiftedx_harness_proxy.qualification_contract import (
     BENCHMARK_REVISION,
     CacheObservation,
+    ModelBoundaryObserverCursor,
     ModelBoundaryRecord,
     ModelEvidence,
     ModelEvidenceFailure,
@@ -202,6 +203,41 @@ def test_model_boundary_records_load_exact_safe_response_cache_projection(tmp_pa
     )
     assert "private-model" not in path.read_text(encoding="utf-8")
     assert "private prompt" not in path.read_text(encoding="utf-8")
+
+
+def test_model_boundary_cursor_consumes_only_its_correlation_and_rejects_leftovers(tmp_path) -> None:
+    fingerprint = model_boundary_fingerprint({"model": "model", "messages": []})
+    path = tmp_path / "observer.jsonl"
+    path.touch()
+    path.chmod(0o600)
+    cursor = ModelBoundaryObserverCursor(path, ["scenario"])
+    late = ModelBoundaryRecord(1, fingerprint.digest, fingerprint.fields, 200, None, "a" * 64)
+    current = ModelBoundaryRecord(2, fingerprint.digest, fingerprint.fields, 200, None, "b" * 64)
+    rows = "\n".join(json.dumps(record.to_dict(), sort_keys=True, separators=(",", ":")) for record in (late, current))
+    path.write_text(rows + "\n", encoding="utf-8")
+
+    cursor.begin_turn(correlation_id_sha256="b" * 64)
+    assert len(cursor.consume_turn(require_records=True, correlation_id_sha256="b" * 64)) == 1
+    with pytest.raises(PreflightFailure, match="unconsumed"):
+        cursor.require_drained()
+
+    cursor.begin_turn(correlation_id_sha256="a" * 64)
+    assert len(cursor.consume_turn(require_records=True)) == 1
+    cursor.require_drained()
+
+
+def test_model_boundary_reader_rejects_malformed_correlation_but_accepts_direct_record(tmp_path) -> None:
+    fingerprint = model_boundary_fingerprint({"model": "model", "messages": []})
+    direct = ModelBoundaryRecord(1, fingerprint.digest, fingerprint.fields, 200, None)
+    path = tmp_path / "direct.jsonl"
+    path.write_text(json.dumps(direct.to_dict(), sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+    assert read_model_boundary_observer_records(path) == (direct,)
+
+    malformed = direct.to_dict() | {"correlation_id_sha256": "not-a-hash"}
+    path.write_text(json.dumps(malformed, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    with pytest.raises(PreflightFailure, match="observer ledger is invalid"):
+        read_model_boundary_observer_records(path)
 
 
 @pytest.mark.parametrize(

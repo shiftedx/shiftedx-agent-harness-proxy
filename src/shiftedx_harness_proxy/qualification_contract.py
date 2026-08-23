@@ -101,13 +101,14 @@ class ModelBoundaryRecord:
     fields: dict[str, Any]
     status_code: int | None
     cache: CacheObservation | None
+    correlation_id_sha256: str | None = None
 
     @property
     def fingerprint(self) -> SafeFingerprint:
         return SafeFingerprint("model_facing_observed", self.digest, self.fields)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        record = {
             "record_type": "qualification_model_boundary",
             "sequence": self.sequence,
             "digest": self.digest,
@@ -117,6 +118,9 @@ class ModelBoundaryRecord:
                 "cache": None if self.cache is None else self.cache.to_dict(),
             },
         }
+        if self.correlation_id_sha256 is not None:
+            record["correlation_id_sha256"] = self.correlation_id_sha256
+        return record
 
 
 @dataclass(frozen=True)
@@ -843,15 +847,19 @@ def model_boundary_record(
     sequence: int,
     status_code: int | None,
     response: Any,
+    correlation_id_sha256: str | None = None,
 ) -> ModelBoundaryRecord:
     """Build one safe actual-attempt record from ephemeral request/response values."""
     fingerprint = model_boundary_fingerprint(payload)
+    if correlation_id_sha256 is not None and not _sha256_value(correlation_id_sha256):
+        raise PreflightFailure("model-boundary correlation is invalid")
     return ModelBoundaryRecord(
         sequence=sequence,
         digest=fingerprint.digest,
         fields=fingerprint.fields,
         status_code=status_code,
         cache=cache_observation_from_response(response),
+        correlation_id_sha256=correlation_id_sha256,
     )
 
 
@@ -877,9 +885,13 @@ def read_model_boundary_observer_records(path: Path, *, allow_missing: bool = Fa
         fields = row.get("fields") if isinstance(row, dict) else None
         digest = row.get("digest") if isinstance(row, dict) else None
         response = row.get("response") if isinstance(row, dict) else None
+        correlation_id_sha256 = row.get("correlation_id_sha256") if isinstance(row, dict) else None
+        keys = {"record_type", "sequence", "digest", "fields", "response"}
+        if correlation_id_sha256 is not None:
+            keys.add("correlation_id_sha256")
         if (
             not isinstance(row, dict)
-            or set(row) != {"record_type", "sequence", "digest", "fields", "response"}
+            or set(row) != keys
             or row.get("record_type") != "qualification_model_boundary"
             or row.get("sequence") != expected_sequence
             or isinstance(row.get("sequence"), bool)
@@ -891,6 +903,7 @@ def read_model_boundary_observer_records(path: Path, *, allow_missing: bool = Fa
             or not isinstance(response, dict)
             or set(response) != {"status_code", "cache"}
             or not _safe_status_code(response.get("status_code"))
+            or ("correlation_id_sha256" in row and not _sha256_value(correlation_id_sha256))
         ):
             raise PreflightFailure("proxy model-boundary observer ledger is invalid")
         cache = _cache_observation(response.get("cache"))
@@ -903,6 +916,7 @@ def read_model_boundary_observer_records(path: Path, *, allow_missing: bool = Fa
                 fields=fields,
                 status_code=response.get("status_code"),
                 cache=cache,
+                correlation_id_sha256=correlation_id_sha256,
             )
         )
     return tuple(records)
@@ -1028,6 +1042,8 @@ class ModelBoundaryObserverCursor:
     path: Path
     scenario_order: list[str]
     _cursor: int = 0
+    _consumed_sequences: set[int] = field(default_factory=set)
+    _active_correlation_id_sha256: str | None = None
     _turns: list[tuple[SafeFingerprint, ...]] = field(default_factory=list)
     _record_turns: list[tuple[ModelBoundaryRecord, ...]] = field(default_factory=list)
 
@@ -1043,21 +1059,40 @@ class ModelBoundaryObserverCursor:
     def record_turns(self) -> tuple[tuple[ModelBoundaryRecord, ...], ...]:
         return tuple(self._record_turns)
 
-    def begin_turn(self) -> None:
+    def begin_turn(self, *, correlation_id_sha256: str | None = None) -> None:
         """Reject records not consumed by the preceding proxy turn."""
         observed = read_model_boundary_observer_records(self.path, allow_missing=True)
+        if correlation_id_sha256 is not None:
+            if not _sha256_value(correlation_id_sha256) or self._active_correlation_id_sha256 is not None:
+                raise PreflightFailure("proxy model-boundary observer correlation is invalid")
+            self._active_correlation_id_sha256 = correlation_id_sha256
+            return
         if len(observed) != self._cursor:
             raise PreflightFailure("proxy model-boundary observer ledger has stale or missing records")
 
-    def consume_turn(self, *, require_records: bool) -> tuple[SafeFingerprint, ...]:
+    def consume_turn(
+        self, *, require_records: bool, correlation_id_sha256: str | None = None
+    ) -> tuple[SafeFingerprint, ...]:
         """Return exactly the records written during the current proxy turn."""
         observed = read_model_boundary_observer_records(self.path, allow_missing=True)
         if len(observed) < self._cursor:
             raise PreflightFailure("proxy model-boundary observer ledger was truncated")
-        records = observed[self._cursor :]
+        expected = correlation_id_sha256 or self._active_correlation_id_sha256
+        if correlation_id_sha256 is not None and not _sha256_value(correlation_id_sha256):
+            raise PreflightFailure("proxy model-boundary observer correlation is invalid")
+        if expected is None:
+            records = observed[self._cursor :]
+        else:
+            records = tuple(
+                record
+                for record in observed
+                if record.sequence not in self._consumed_sequences and record.correlation_id_sha256 == expected
+            )
         if require_records and not records:
             raise PreflightFailure("proxy model-boundary observer record count differed")
-        self._cursor = len(observed)
+        self._consumed_sequences.update(record.sequence for record in records)
+        self._cursor = len(observed) if expected is None else self._cursor
+        self._active_correlation_id_sha256 = None
         self._record_turns.append(records)
         bound = bind_model_boundary_context(tuple(record.fingerprint for record in records), self.scenario_order)
         self._turns.append(bound)
@@ -1066,7 +1101,9 @@ class ModelBoundaryObserverCursor:
     def require_drained(self) -> None:
         """Reject observer records that appeared outside the runner's ordered turn sequence."""
         observed = read_model_boundary_observer_records(self.path, allow_missing=True)
-        if len(observed) != self._cursor:
+        if self._active_correlation_id_sha256 is not None or any(
+            record.sequence not in self._consumed_sequences for record in observed
+        ):
             raise PreflightFailure("proxy model-boundary observer ledger has unconsumed records")
 
 
@@ -1746,6 +1783,7 @@ def write_model_boundary_attempt_ledger(
             or record.digest != _sha256(record.fields)
             or not _safe_status_code(record.status_code)
             or (record.cache is not None and _cache_observation(record.cache.to_dict()) != record.cache)
+            or (record.correlation_id_sha256 is not None and not _sha256_value(record.correlation_id_sha256))
         ):
             raise PreflightFailure("model-boundary attempt evidence is invalid")
         serialized.append(
@@ -1755,6 +1793,7 @@ def write_model_boundary_attempt_ledger(
                 fields=record.fields,
                 status_code=record.status_code,
                 cache=record.cache,
+                correlation_id_sha256=record.correlation_id_sha256,
             ).to_dict()
         )
     _atomic_write_jsonl(output, serialized)

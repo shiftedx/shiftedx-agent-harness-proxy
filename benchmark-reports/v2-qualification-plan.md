@@ -42,6 +42,11 @@ deadline-penalized time-to-valid-outcome and conditional both-valid latency supp
 qualification and safety decisions only; they do not support a randomized causal claim that the
 proxy improves speed.
 
+The qualification-only proxy observer reserves up to one second of the configured upstream
+timeout for terminal evidence flush. That makes the proxy boundary conservatively shorter than
+direct at the deadline edge; reports must disclose it and must not describe the timeouts as exactly
+equal.
+
 V2 hash-chained campaign events bind each proxy stage to its authenticated direct-outcome
 predecessor, attestation, model and arm-specific cache evidence, and exact proxy-reconciliation
 artifact. Missing, mismatched, malformed, or incomplete evidence blocks qualification rather than

@@ -52,6 +52,29 @@ def _canonical_sha256(value: object) -> str:
     ).hexdigest()
 
 
+def test_observer_timeout_leaves_a_small_strict_margin_below_the_proxy_timeout() -> None:
+    assert runtime_module._observer_timeout_seconds({"upstream_timeout_seconds": 120.0}) == "119.0"
+    assert runtime_module._observer_timeout_seconds({"upstream_timeout_seconds": 0.5}) == "0.45"
+    with pytest.raises(runtime_module.QualificationRuntimeFailure, match="runtime_manifest_invalid"):
+        runtime_module._observer_timeout_seconds({"upstream_timeout_seconds": 0})
+
+
+def test_runtime_supervisor_passes_the_bounded_observer_timeout(tmp_path) -> None:
+    runner = _FakeRuntimeRunner()
+    outcome = _supervise(
+        manifest=_manifest(tmp_path),
+        stage="preflight",
+        private_run_dir=_private_run(tmp_path),
+        action=_write_complete_ledger,
+        command_runner=runner,
+    )
+
+    assert outcome.status == "passed"
+    environment = next(call[2] for call in runner.calls if call[0] == "spawn")
+    assert environment is not None
+    assert float(environment["QUALIFICATION_OBSERVER_TIMEOUT_SECONDS"]) < 120.0
+
+
 def _private_file(path: Path, value: bytes) -> Path:
     path.write_bytes(value)
     path.chmod(0o600)
@@ -1472,6 +1495,7 @@ def _write_proxy_timing(
             "schema_version": "2.1",
             "record_type": "qualification_timing_capture",
             "sequence": request.sequence,
+            "correlation_id_sha256": "c" * 64,
             "outcome": request.outcome,
             "downstream_wall_ns": len(attempts) + 1,
             "admission_wait_ns": 0,
@@ -1502,6 +1526,7 @@ def _write_proxy_timing(
             "observer_record_count": request.attempt_count,
             "direct_attempt_wall_ns": [],
             "downstream_request_sha256": "a" * 64,
+            "correlation_id_sha256": "c" * 64,
         }
         for request in requests
     ]
@@ -1527,6 +1552,7 @@ def _write_direct_provisional(lease: RuntimeLease, *, attempt_count: int = 1) ->
                 "observer_record_count": attempt_count,
                 "direct_attempt_wall_ns": [1] * attempt_count,
                 "downstream_request_sha256": "a" * 64,
+                "correlation_id_sha256": None,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -1542,6 +1568,7 @@ def _model_attempt(
     cache: CacheObservation | None,
     *,
     status_code: int | None = 200,
+    correlation_id_sha256: str | None = None,
 ) -> ModelBoundaryRecord:
     fingerprint = model_boundary_fingerprint(
         {
@@ -1551,7 +1578,9 @@ def _model_attempt(
             "tools": [{"type": "function", "function": {"name": "safe"}}],
         }
     )
-    return ModelBoundaryRecord(sequence, fingerprint.digest, fingerprint.fields, status_code, cache)
+    return ModelBoundaryRecord(
+        sequence, fingerprint.digest, fingerprint.fields, status_code, cache, correlation_id_sha256
+    )
 
 
 def _cold_cache() -> CacheObservation:
@@ -1942,7 +1971,7 @@ def test_proxy_stage_adapts_only_its_fresh_observer_attempts(tmp_path) -> None:
         _write_scored_output(lease)
         assert lease.observer_ledger is not None
         assert lease.proxy_request_accounting_provisional_ledger is not None
-        observer_record = _model_attempt(1, _cold_cache())
+        observer_record = _model_attempt(1, _cold_cache(), correlation_id_sha256="c" * 64)
         lease.observer_ledger.write_text(
             json.dumps(observer_record.to_dict(), sort_keys=True, separators=(",", ":")) + "\n"
         )
@@ -2058,7 +2087,7 @@ def test_warm_proxy_attestation_keeps_the_single_preflight_runtime_contract(tmp_
         assert lease.proxy_request_accounting_provisional_ledger is not None
         assert lease.prime_model_attempt_ledger is not None
         write_model_boundary_attempt_ledger(lease.prime_model_attempt_ledger, [_model_attempt(1, _warm_prime_cache())])
-        observer_record = _model_attempt(1, _warm_hit_cache())
+        observer_record = _model_attempt(1, _warm_hit_cache(), correlation_id_sha256="c" * 64)
         lease.observer_ledger.write_text(
             json.dumps(observer_record.to_dict(), sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"
         )

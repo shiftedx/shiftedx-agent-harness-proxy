@@ -975,3 +975,73 @@ def test_v2_failure_is_terminal_and_never_reruns(tmp_path: Path) -> None:
     assert second.kind == "campaign_failed"
     assert second.event_sha256 == first.event_sha256
     assert len(runner.requests) == 3
+
+
+def test_v2_failed_scored_stage_without_model_identity_is_terminal(tmp_path: Path) -> None:
+    class FailedWithoutIdentityRunner(_V2FakeStageRunner):
+        def run(self, request: StageRequest) -> StageResult:
+            result = super().run(request)
+            if request.sequence == 3:
+                result = replace(
+                    result,
+                    model_runtime_instance_sha256=None,
+                    proxy_reconciliation_sha256=None,
+                    model_identity_sha256=None,
+                )
+                self.results[request.outcome_path] = result
+            return result
+
+    manifest, _scenario_case_ids = _v2_campaign_manifest(tmp_path / "manifest.json")
+    private = _private_campaign(tmp_path / "campaign")
+    runner = FailedWithoutIdentityRunner(statuses={3: "failed"})
+
+    result = [
+        advance_qualification_campaign(
+            manifest,
+            private,
+            stage_runner=runner,
+            readiness_probe=_ReadyProbe(),
+        )
+        for _ in range(3)
+    ][-1]
+    reloaded = advance_qualification_campaign(
+        manifest,
+        private,
+        stage_runner=runner,
+        readiness_probe=_ReadyProbe(),
+    )
+
+    assert result.kind == "campaign_failed"
+    assert result.failure_category == "stage_failed"
+    assert reloaded.event_sha256 == result.event_sha256
+    assert len(runner.requests) == 3
+    assert (private / "campaign-events" / "0003.json").is_file()
+
+
+def test_v2_failed_scored_stage_rejects_malformed_model_identity(tmp_path: Path) -> None:
+    class FailedWithMalformedIdentityRunner(_V2FakeStageRunner):
+        def run(self, request: StageRequest) -> StageResult:
+            result = super().run(request)
+            if request.sequence == 3:
+                result = replace(result, model_identity_sha256="malformed")
+                self.results[request.outcome_path] = result
+            return result
+
+    manifest, _scenario_case_ids = _v2_campaign_manifest(tmp_path / "manifest.json")
+    private = _private_campaign(tmp_path / "campaign")
+    runner = FailedWithMalformedIdentityRunner(statuses={3: "failed"})
+
+    for _ in range(2):
+        advance_qualification_campaign(
+            manifest,
+            private,
+            stage_runner=runner,
+            readiness_probe=_ReadyProbe(),
+        )
+    with pytest.raises(CampaignFailure, match="^campaign_stage_outcome_invalid$"):
+        advance_qualification_campaign(
+            manifest,
+            private,
+            stage_runner=runner,
+            readiness_probe=_ReadyProbe(),
+        )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
@@ -130,7 +131,8 @@ class _TimingCaptureMiddleware:
         if scope["type"] != "http" or scope.get("path") != "/v1/chat/completions":
             await self.app(scope, receive, send)
             return
-        capture, token = begin_request_timing()
+        correlation_id = _set_correlation_id(Request(scope))
+        capture, token = begin_request_timing(correlation_id)
         sequence = self.sink.allocate_sequence()
         status_code: int | None = None
 
@@ -300,7 +302,11 @@ def create_app(
         if exc.code == "downstream_disconnected":
             counters.cancellations += 1
         correlation_id = getattr(request.state, "correlation_id", None) or _new_correlation_id(request)
-        LOGGER.warning("proxy_request_failed code=%s correlation_id=%s", exc.code, correlation_id)
+        LOGGER.warning(
+            "proxy_request_failed code=%s correlation_id_sha256=%s",
+            exc.code,
+            hashlib.sha256(correlation_id.encode("utf-8")).hexdigest(),
+        )
         headers = {"X-Request-ID": correlation_id, **exc.headers}
         return JSONResponse(
             status_code=exc.status_code,
@@ -495,6 +501,9 @@ def _new_correlation_id(request: Request) -> str:
 
 
 def _set_correlation_id(request: Request) -> str:
+    existing = getattr(request.state, "correlation_id", None)
+    if isinstance(existing, str) and _SAFE_CORRELATION_ID.fullmatch(existing):
+        return existing
     correlation_id = _new_correlation_id(request)
     request.state.correlation_id = correlation_id
     return correlation_id
