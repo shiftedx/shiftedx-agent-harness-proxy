@@ -424,6 +424,7 @@ async def test_stream_replay_paces_complete_sse_events_for_fragmented_downstream
     first_write = asyncio.Event()
     release_write = asyncio.Event()
     body_chunks: list[bytes] = []
+    terminal_body_count = 0
     received_request = False
 
     async def receive() -> dict[str, Any]:
@@ -445,7 +446,12 @@ async def test_stream_replay_paces_complete_sse_events_for_fragmented_downstream
         raise AssertionError("unreachable")
 
     async def send(message: dict[str, Any]) -> None:
-        if message["type"] != "http.response.body" or not message.get("body"):
+        nonlocal terminal_body_count
+        if message["type"] != "http.response.body":
+            return
+        if not message.get("body"):
+            if not message.get("more_body", False):
+                terminal_body_count += 1
             return
         body_chunks.append(message["body"])
         if len(body_chunks) == 1:
@@ -475,6 +481,7 @@ async def test_stream_replay_paces_complete_sse_events_for_fragmented_downstream
     release_write.set()
     await asyncio.wait_for(task, timeout=1)
     assert b"".join(body_chunks).endswith(b"data: [DONE]\n\n")
+    assert terminal_body_count == 1
 
 
 @pytest.mark.asyncio
@@ -547,6 +554,7 @@ async def test_stream_replay_deadline_releases_admission_after_headers(tmp_path)
         timing_sink=PrivateTimingSink(ledger),
     )
     first_write = asyncio.Event()
+    terminal_write = asyncio.Event()
     messages: list[dict[str, Any]] = []
     received_request = False
 
@@ -567,6 +575,10 @@ async def test_stream_replay_deadline_releases_admission_after_headers(tmp_path)
         if message["type"] == "http.response.body" and message.get("body"):
             first_write.set()
             await asyncio.Event().wait()
+        if message["type"] == "http.response.body" and not message.get("more_body", False):
+            terminal_write.set()
+            assert app.state.admission.snapshot().active == 0
+            await asyncio.Event().wait()
 
     scope: dict[str, Any] = {
         "type": "http",
@@ -586,6 +598,7 @@ async def test_stream_replay_deadline_releases_admission_after_headers(tmp_path)
     await asyncio.wait_for(first_write.wait(), timeout=1)
     assert app.state.admission.snapshot().active == 1
 
+    await asyncio.wait_for(terminal_write.wait(), timeout=1)
     await asyncio.wait_for(task, timeout=1)
     assert app.state.counters.deadline_expiries == 1
     assert app.state.counters.errors == 1

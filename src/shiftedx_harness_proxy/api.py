@@ -163,6 +163,7 @@ class _TimingCaptureMiddleware:
 
 
 _ReplayOutcome = Literal["succeeded", "cancelled", "deadline", "failed"]
+_REPLAY_EOF_SEND_GRACE_SECONDS = 0.1
 
 
 class _ReplayStreamingResponse(StreamingResponse):
@@ -203,7 +204,12 @@ class _ReplayStreamingResponse(StreamingResponse):
                 await send({"type": "http.response.body", "body": b"", "more_body": False})
         except TimeoutError:
             self._record_outcome("deadline")
-            await send({"type": "http.response.body", "body": b"", "more_body": False})
+            await self._release_once()
+            with suppress(TimeoutError, OSError):
+                await asyncio.wait_for(
+                    send({"type": "http.response.body", "body": b"", "more_body": False}),
+                    timeout=_REPLAY_EOF_SEND_GRACE_SECONDS,
+                )
             return
         except asyncio.CancelledError:
             self._record_outcome("cancelled")
