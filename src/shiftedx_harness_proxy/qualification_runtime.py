@@ -2576,6 +2576,7 @@ def _model_evidence_contract(spec: _RuntimeSpec, stage: RuntimeStage, binding: _
         health_contract_sha256=spec.model.health_contract_sha256,
         settings_contract_sha256=spec.model.settings_contract_sha256,
         cache_lane=lane,
+        sampler_profile=spec.benchmark.sampler_profile,
     )
 
 

@@ -321,6 +321,42 @@ def test_manifest_accepts_ornith_productization_sampler_profile(tmp_path) -> Non
     assert spec.benchmark.sampler_profile == "ornith-productization-v1"
 
 
+def test_ornith_sampler_profile_binds_enabled_ssd_cache_in_model_evidence_contract(tmp_path) -> None:
+    manifest = _manifest(tmp_path)
+    document = _manifest_document(manifest)
+    runtime = document["qualification_runtime"]
+    assert isinstance(runtime, dict)
+    benchmark = runtime["benchmark"]
+    model = runtime["model"]
+    assert isinstance(benchmark, dict)
+    assert isinstance(model, dict)
+    benchmark["sampler_profile"] = "ornith-productization-v1"
+    model["required_launch_flags"] = [
+        "--host=127.0.0.1",
+        "--port=19999",
+        "--no-auth",
+        "--generation-mode=mtp",
+        "--depth=3",
+        "--temperature=0",
+        "--ssd-session-cache=on",
+    ]
+    _store_manifest(manifest, document)
+
+    spec = runtime_module._load_runtime_spec(manifest, _FakeRuntimeRunner())
+    binding = runtime_module._StageBinding(
+        spec.campaign.campaign_id_sha256,
+        1,
+        "cold",
+        1,
+        spec.campaign.slots[0].run_id,
+        tmp_path,
+    )
+    contract = runtime_module._model_evidence_contract(spec, "score-direct", binding)
+
+    assert contract.sampler_profile == "ornith-productization-v1"
+    assert "--ssd-session-cache=on" in contract.required_launch_flags
+
+
 def _supervise(
     *,
     manifest: Path,
@@ -3617,7 +3653,8 @@ def test_benchmarking_manifest_example_is_duplicate_rejecting_json_with_c1_model
         "failure_policy",
     }
     assert len(campaign["slots"]) == 6
-    assert "--ssd-session-cache=off" in model["required_launch_flags"]
+    assert runtime["benchmark"]["sampler_profile"] == "ornith-productization-v1"
+    assert "--ssd-session-cache=on" in model["required_launch_flags"]
     assert runtime["benchmark"]["scenario_count"] > 0
     assert "restart it from the exact frozen model" in document
     assert "Preflight always sends" in document

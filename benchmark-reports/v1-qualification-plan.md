@@ -23,13 +23,14 @@ reviewers can verify that thresholds were not changed after results were known.
   `mtplx_runtime.json` `0f4619009ce61b168091d891c2a204ba960703f993229390609118b8e84478b3`;
   `model.safetensors.index.json` `5ea79f00036b670d13ef98ae1a4d597437921cdcf6896d1e95c151ead09b24ba`
 - Sampler profile: `ornith-productization-v1` — temperature `1.0`, top-p `0.95`, top-k `20`,
-  thinking enabled, reasoning effort `medium`, and `max_tokens=8192`
+  thinking enabled, reasoning effort `medium`, and `max_tokens=8192`; this immutable profile
+  requires `--ssd-session-cache=on` in the model launch contract
 - Treatments: direct upstream baseline and proxy-assisted, both using the benchmark runner's
   `baseline` control profile
 - Trials: at least three complete matched pairs for every declared lane
 
-A different model, sampler, reasoning mode, benchmark revision, or treatment contract requires a
-reviewed plan revision committed before trial 1. It may not be changed in response to results.
+A different model, sampler, profile-bound cache mode, reasoning mode, benchmark revision, or treatment
+contract requires a reviewed plan revision committed before trial 1. It may not be changed in response to results.
 
 ## Immutable run manifest
 

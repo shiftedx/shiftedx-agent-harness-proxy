@@ -32,19 +32,20 @@ an evaluation adapter, not benchmark or proxy policy derived from expected answe
 
 The frozen Ornith productization campaign uses the named `ornith-productization-v1` sampler:
 `temperature=1.0`, `top_p=0.95`, `top_k=20`, thinking enabled, reasoning effort `medium`, and
-`max_tokens=8192`.
+`max_tokens=8192`. Its immutable model contract requires `--ssd-session-cache=on`.
 
 `corrected-parity-v1` remains the separate temperature-0 replacement-qualification profile. It uses
 exactly `temperature=0.0`, `top_p=0.95`, `top_k=20`, thinking enabled, reasoning effort `medium`,
-and `max_tokens=1024`.
+and `max_tokens=1024`, with `--ssd-session-cache=off`.
 
 `historical-aeon-v1` is the separate historical AEON parity profile. It uses exactly
 `temperature=1.0`, `top_p=0.95`, `top_k=20`, thinking enabled, reasoning effort `medium`, and
 `max_tokens=1024`, matching the recorded AEON benchmark setting. The profile name is immutable
 manifest material: it is forwarded to preflight, cold scoring, warm priming, and scoring; its
 constants are therefore included in the downstream/model-boundary fingerprints and score gates.
-There are no individual sampler command-line overrides, and ledgers from these profiles must never
-be compared or combined.
+It also selects the sole allowed SSD-cache launch flag: `on` only for Ornith productization and `off`
+for the two parity profiles. There are no individual sampler or cache command-line overrides, and
+ledgers from these profiles must never be compared or combined.
 
 Before a scored command, run the paired preflight against the direct and proxy arms. It uses the
 same versioned phase planner on each arm while keeping the proxy's downstream request standard:
@@ -158,7 +159,7 @@ uses `"schema_version": "1.0"` and exactly these keys:
         "--generation-mode=mtp",
         "--depth=3",
         "--temperature=0",
-        "--ssd-session-cache=off"
+        "--ssd-session-cache=on"
       ],
       "health_contract_sha256": "0303030303030303030303030303030303030303030303030303030303030303",
       "settings_contract_sha256": "0404040404040404040404040404040404040404040404040404040404040404"
@@ -250,9 +251,9 @@ put endpoint bodies in the manifest. The placeholder flag list above is illustra
 manifest carries the complete frozen semantic vector for that model process.
 
 The supervisor probes only `/health`, `/v1/models`, and `/v1/mtplx/settings`, joins the health
-startup PID to the sole loopback listener, and verifies the executable, launch vector (including
-`--ssd-session-cache=off`), package, model identity, and quiescent request count before and after
-each stage. A scored lane requires a newly restarted instance with `requests_completed == 0`; an
+startup PID to the sole loopback listener, and verifies the executable, launch vector (including the
+sampler-profile-bound SSD-cache flag), package, model identity, and quiescent request count before
+and after each stage. A scored lane requires a newly restarted instance with `requests_completed == 0`; an
 already-ready unrelated service, a replacement PID, a reused preceding-stage instance, or
 intervening model traffic fails the exclusive qualification window. No model endpoint, path, PID,
 launch argv, or server response is emitted into an attestation, outcome, or cache-evidence artifact.
@@ -308,14 +309,14 @@ treatments and derives variants as `<cache_lane>-pair<pair_index>-direct|proxy-<
 `--cache-mode bypass`, including a later `warm-prefix` campaign: every successful preflight attempt
 must report bypass, no RAM or SSD hit, zero cached tokens, a full new prefill, and no postcommit
 store. The `cold` scored lane enforces the same evidence on its dedicated zero-counter process. In
-the `warm-prefix` scored lane, that separate process has persistent SSD cache disabled and the
-supervisor first runs one direct-to-model prime child with the same frozen run ID, scenario order,
-variant, and a `direct` or `proxy` prime arm. It records exactly one safe prime attempt, then runs
-the scored child. The prime request digest must equal the first measured request digest; that first
-measured attempt must be a non-bypass **RAM** hit with positive cached tokens and no SSD-hit fields,
-and the server request-count delta must leave no room for intervening traffic. A pending postcommit
-flag is corroborating information only, because a tool-required MTPLX prime can commit after the
-first matching request.
+the `warm-prefix` scored lane, the supervisor first runs one direct-to-model prime child with the
+same frozen run ID, scenario order, variant, and a `direct` or `proxy` prime arm. It records exactly
+one safe prime attempt, then runs the scored child. The prime request digest must equal the first
+measured request digest; that first measured attempt must be a non-bypass **RAM** hit with positive
+cached tokens and no SSD-hit fields, and the server request-count delta must leave no room for
+intervening traffic. This server-authored no-SSD-hit proof applies even when the frozen Ornith
+service has SSD cache enabled. A pending postcommit flag is corroborating information only, because
+a tool-required MTPLX prime can commit after the first matching request.
 
 The paired child still fails before any scored row when either arm produces zero native acquisition
 calls, phase/field fingerprints differ outside the declared proxy receipt policy, proxy phase

@@ -493,28 +493,49 @@ def test_scored_cache_evidence_requires_a_fresh_model_request_window_before_acti
     assert probe.calls == ["snapshot"]
 
 
-def test_launch_semantics_requires_ssd_cache_to_be_disabled(tmp_path: Path) -> None:
-    """A warm RAM proof is invalid when persistent SSD cache can satisfy the hit."""
+@pytest.mark.parametrize(
+    ("sampler_profile", "cache_flag", "accepted"),
+    [
+        ("ornith-productization-v1", "--ssd-session-cache=on", True),
+        ("ornith-productization-v1", "--ssd-session-cache=off", False),
+        ("historical-aeon-v1", "--ssd-session-cache=on", False),
+    ],
+)
+def test_launch_semantics_binds_ssd_cache_to_sampler_profile(
+    tmp_path: Path, sampler_profile: str, cache_flag: str, accepted: bool
+) -> None:
+    """The immutable sampler profile, rather than an operator choice, fixes SSD cache mode."""
 
-    contract = replace(
-        _contract(tmp_path),
-        required_launch_flags=(
-            "--host=127.0.0.1",
-            "--port=8999",
-            "--ssd-session-cache=on",
-        ),
-    )
+    flags = ("--host=127.0.0.1", "--port=8999", cache_flag)
+    contract = replace(_contract(tmp_path), sampler_profile=sampler_profile, required_launch_flags=flags)
     credential = _private(tmp_path / "credential", b"model-api-token")
+    probe = _probe_for(contract)
+    for name in ("before", "after"):
+        snapshot = getattr(probe, name)
+        owner = dict(snapshot.listener_owners[0])
+        owner["command_flags"] = flags
+        setattr(probe, name, replace(snapshot, listener_owners=(owner,)))
 
-    with pytest.raises(ModelEvidenceFailure, match="model_contract_invalid"):
-        ModelEvidenceSession.begin(
+    if accepted:
+        session = ModelEvidenceSession.begin(
             contract,
             stage="score-direct",
             run_manifest_sha256="f" * 64,
             evidence_path=tmp_path / "ssd-cache.json",
             credential_file=credential,
-            probe=_probe_for(contract),
+            probe=probe,
         )
+        assert session.complete([_attempt()]).status == "passed"
+    else:
+        with pytest.raises(ModelEvidenceFailure, match="model_contract_invalid"):
+            ModelEvidenceSession.begin(
+                contract,
+                stage="score-direct",
+                run_manifest_sha256="f" * 64,
+                evidence_path=tmp_path / "ssd-cache.json",
+                credential_file=credential,
+                probe=probe,
+            )
 
 
 def test_model_identity_excludes_only_cache_lane(tmp_path: Path) -> None:
@@ -548,10 +569,13 @@ def test_model_identity_excludes_only_cache_lane(tmp_path: Path) -> None:
     # lane.  A same-root lane comparison below isolates the intended distinction.
     base = _contract(tmp_path / "same", lane="cold")
     same_warm = replace(base, cache_lane="warm-prefix")
+    historical = replace(base, sampler_profile="historical-aeon-v1")
     base_probe = _probe_for(base, after_requests=7)
     warm_base_probe = _probe_for(same_warm, after_requests=7)
+    historical_probe = _probe_for(historical, after_requests=7)
     base_probe.expected_api_key = None
     warm_base_probe.expected_api_key = None
+    historical_probe.expected_api_key = None
     cold_same = ModelEvidenceSession.begin(
         base,
         stage="score-direct",
@@ -568,10 +592,20 @@ def test_model_identity_excludes_only_cache_lane(tmp_path: Path) -> None:
         credential_file=None,
         probe=warm_base_probe,
     )
+    historical_same = ModelEvidenceSession.begin(
+        historical,
+        stage="score-direct",
+        run_manifest_sha256="f" * 64,
+        evidence_path=tmp_path / "same-historical.json",
+        credential_file=None,
+        probe=historical_probe,
+    )
 
     assert cold.model_identity_sha256 != warm.model_identity_sha256
     assert cold_same.model_identity_sha256 == warm_same.model_identity_sha256
     assert cold_same.model_contract_sha256 != warm_same.model_contract_sha256
+    assert cold_same.model_identity_sha256 == historical_same.model_identity_sha256
+    assert cold_same.model_contract_sha256 != historical_same.model_contract_sha256
 
 
 @pytest.mark.parametrize(
