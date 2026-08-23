@@ -6,6 +6,7 @@ from typing import Any
 import httpx
 import pytest
 from pydantic import SecretStr
+from starlette.requests import ClientDisconnect
 
 from shiftedx_harness_proxy.api import create_app
 from shiftedx_harness_proxy.config import Settings
@@ -477,9 +478,16 @@ async def test_stream_replay_paces_complete_sse_events_for_fragmented_downstream
 
 
 @pytest.mark.asyncio
-async def test_stream_replay_disconnect_stops_after_the_current_sse_event() -> None:
-    app = create_app(Settings(upstream_base_url="http://upstream/v1"), EchoUpstream())
+async def test_stream_replay_disconnect_stops_after_the_current_sse_event(tmp_path) -> None:
+    ledger = tmp_path / "timing-captures.jsonl"
+    reserve_timing_capture_ledger(ledger)
+    app = create_app(
+        Settings(upstream_base_url="http://upstream/v1"),
+        EchoUpstream(),
+        timing_sink=PrivateTimingSink(ledger),
+    )
     first_write = asyncio.Event()
+    allow_disconnect = asyncio.Event()
     body_chunks: list[bytes] = []
     received_request = False
 
@@ -493,6 +501,7 @@ async def test_stream_replay_disconnect_stops_after_the_current_sse_event() -> N
                 "more_body": False,
             }
         await first_write.wait()
+        await allow_disconnect.wait()
         return {"type": "http.disconnect"}
 
     async def send(message: dict[str, Any]) -> None:
@@ -515,8 +524,113 @@ async def test_stream_replay_disconnect_stops_after_the_current_sse_event() -> N
         "server": ("testserver", 80),
     }
 
-    await asyncio.wait_for(app(scope, receive, send), timeout=1)
+    task = asyncio.create_task(app(scope, receive, send))
+    await asyncio.wait_for(first_write.wait(), timeout=1)
     assert len(body_chunks) == 1
+    assert app.state.admission.snapshot().active == 1
+
+    allow_disconnect.set()
+    await asyncio.wait_for(task, timeout=1)
+    assert app.state.counters.cancellations == 1
+    assert app.state.counters.stream_replays == 0
+    assert read_timing_capture_ledger(ledger)[0]["outcome"] == "cancelled"
+    assert app.state.admission.snapshot().active == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_replay_deadline_releases_admission_after_headers(tmp_path) -> None:
+    ledger = tmp_path / "timing-captures.jsonl"
+    reserve_timing_capture_ledger(ledger)
+    app = create_app(
+        Settings(upstream_base_url="http://upstream/v1", total_request_deadline_seconds=0.01),
+        EchoUpstream(),
+        timing_sink=PrivateTimingSink(ledger),
+    )
+    first_write = asyncio.Event()
+    received_request = False
+
+    async def receive() -> dict[str, Any]:
+        nonlocal received_request
+        if not received_request:
+            received_request = True
+            return {
+                "type": "http.request",
+                "body": b'{"model":"model","messages":[{"role":"user","content":"hello"}],"stream":true}',
+                "more_body": False,
+            }
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def send(message: dict[str, Any]) -> None:
+        if message["type"] == "http.response.body" and message.get("body"):
+            first_write.set()
+            await asyncio.Event().wait()
+
+    scope: dict[str, Any] = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/chat/completions",
+        "raw_path": b"/v1/chat/completions",
+        "query_string": b"",
+        "headers": [],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+    }
+
+    task = asyncio.create_task(app(scope, receive, send))
+    await asyncio.wait_for(first_write.wait(), timeout=1)
+    assert app.state.admission.snapshot().active == 1
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(task, timeout=1)
+    assert app.state.counters.deadline_expiries == 1
+    assert app.state.counters.errors == 1
+    assert app.state.counters.stream_replays == 0
+    assert app.state.admission.snapshot().active == 0
+    assert read_timing_capture_ledger(ledger)[0]["outcome"] == "deadline"
+
+
+@pytest.mark.asyncio
+async def test_stream_replay_send_disconnect_counts_cancellation_once() -> None:
+    app = create_app(Settings(upstream_base_url="http://upstream/v1"), EchoUpstream())
+    sent_first_event = False
+
+    async def receive() -> dict[str, Any]:
+        return {
+            "type": "http.request",
+            "body": b'{"model":"model","messages":[{"role":"user","content":"hello"}],"stream":true}',
+            "more_body": False,
+        }
+
+    async def send(message: dict[str, Any]) -> None:
+        nonlocal sent_first_event
+        if message["type"] == "http.response.body" and message.get("body"):
+            sent_first_event = True
+            raise OSError("downstream disconnected")
+
+    scope: dict[str, Any] = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/chat/completions",
+        "raw_path": b"/v1/chat/completions",
+        "query_string": b"",
+        "headers": [],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+    }
+
+    with pytest.raises(ClientDisconnect):
+        await app(scope, receive, send)
+    assert sent_first_event
+    assert app.state.counters.cancellations == 1
+    assert app.state.counters.stream_replays == 0
+    assert app.state.admission.snapshot().active == 0
 
 
 @pytest.mark.asyncio
