@@ -96,6 +96,7 @@ _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _IMAGE_REFERENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]*$")
 _FAILURE_CATEGORY = re.compile(r"^[a-z0-9_]+$")
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_V2_CRITICAL_SCENARIO_ORDINALS = [29, 30]
 _HTTP_BEARER_TOKEN = re.compile(r"^[A-Za-z0-9\-._~+/]+={0,}$")
 _SETTINGS_KEYS = frozenset(
     {
@@ -1536,36 +1537,23 @@ def _parse_campaign(value: Any) -> _CampaignSpec:
                 "treatment_order",
                 "model_instance_policy",
                 "failure_policy",
-                "cohort_case_ids",
-                "cohort_case_ids_sha256",
-                "critical_cohort_ordinals",
-                "critical_cohort_ordinals_sha256",
+                "critical_scenario_ordinals",
+                "critical_scenario_ordinals_sha256",
                 "scenario_deadline_seconds",
             },
         )
-        raw_cohort_case_ids = campaign.get("cohort_case_ids")
-        raw_critical_ordinals = campaign.get("critical_cohort_ordinals")
+        raw_critical_ordinals = campaign.get("critical_scenario_ordinals")
         if (
-            not isinstance(raw_cohort_case_ids, list)
-            or len(raw_cohort_case_ids) != 22
-            or any(
-                not isinstance(case_id, str) or _RUN_ID.fullmatch(case_id) is None
-                for case_id in raw_cohort_case_ids
-            )
-            or len(set(raw_cohort_case_ids)) != 22
-            or not isinstance(raw_critical_ordinals, list)
+            not isinstance(raw_critical_ordinals, list)
             or not raw_critical_ordinals
             or any(
-                not isinstance(ordinal, int) or isinstance(ordinal, bool) or not 1 <= ordinal <= 22
+                not isinstance(ordinal, int) or isinstance(ordinal, bool) or not 1 <= ordinal <= 30
                 for ordinal in raw_critical_ordinals
             )
-            or raw_critical_ordinals != sorted(set(raw_critical_ordinals))
-            or not isinstance(campaign.get("cohort_case_ids_sha256"), str)
-            or _SHA256.fullmatch(campaign["cohort_case_ids_sha256"]) is None
-            or campaign["cohort_case_ids_sha256"] != _canonical_sha256(raw_cohort_case_ids)
-            or not isinstance(campaign.get("critical_cohort_ordinals_sha256"), str)
-            or _SHA256.fullmatch(campaign["critical_cohort_ordinals_sha256"]) is None
-            or campaign["critical_cohort_ordinals_sha256"] != _canonical_sha256(raw_critical_ordinals)
+            or raw_critical_ordinals != _V2_CRITICAL_SCENARIO_ORDINALS
+            or not isinstance(campaign.get("critical_scenario_ordinals_sha256"), str)
+            or _SHA256.fullmatch(campaign["critical_scenario_ordinals_sha256"]) is None
+            or campaign["critical_scenario_ordinals_sha256"] != _canonical_sha256(raw_critical_ordinals)
             or campaign.get("scenario_deadline_seconds") != 600
         ):
             raise QualificationRuntimeFailure("runtime_manifest_invalid")

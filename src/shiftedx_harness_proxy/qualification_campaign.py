@@ -34,6 +34,7 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _FAILURE_CATEGORY = re.compile(r"^[a-z0-9_]{1,64}$")
 _STAGES: tuple[CampaignStage, ...] = ("preflight", "score-direct", "score-proxy")
+_V2_CRITICAL_SCENARIO_ORDINALS = [29, 30]
 _OUTCOME_NAMES: dict[CampaignStage, str] = {
     "preflight": "preflight-runtime-outcome.json",
     "score-direct": "scored-direct-runtime-outcome.json",
@@ -134,8 +135,7 @@ class _CampaignSpec:
     benchmark_scenario_count: int
     benchmark_scenario_order_sha256: str
     campaign_version: Literal["v1", "v2"] = "v1"
-    cohort_case_ids: tuple[str, ...] = ()
-    critical_cohort_ordinals: tuple[int, ...] = ()
+    critical_scenario_ordinals: tuple[int, ...] = ()
     scenario_deadline_seconds: Decimal | None = None
 
 
@@ -550,13 +550,9 @@ def _complete_v2_campaign(
                 manifest_sha256=spec.manifest_sha256,
                 campaign_id_sha256=spec.campaign_id_sha256,
                 scenario_order_sha256=spec.benchmark_scenario_order_sha256,
-                cohort_case_ids=spec.cohort_case_ids,
-                cohort_case_ids_sha256=hashlib.sha256(
-                    json.dumps(spec.cohort_case_ids, separators=(",", ":")).encode()
-                ).hexdigest(),
-                critical_cohort_ordinals=spec.critical_cohort_ordinals,
-                critical_cohort_ordinals_sha256=hashlib.sha256(
-                    json.dumps(spec.critical_cohort_ordinals, separators=(",", ":")).encode()
+                critical_scenario_ordinals=spec.critical_scenario_ordinals,
+                critical_scenario_ordinals_sha256=hashlib.sha256(
+                    json.dumps(spec.critical_scenario_ordinals, separators=(",", ":")).encode()
                 ).hexdigest(),
                 cache_lane=slot.cache_lane,
                 replicate=slot.pair_index,
@@ -873,10 +869,8 @@ def _load_campaign_spec(path: Path) -> _CampaignSpec:
         "treatment_order",
         "model_instance_policy",
         "failure_policy",
-        "cohort_case_ids",
-        "cohort_case_ids_sha256",
-        "critical_cohort_ordinals",
-        "critical_cohort_ordinals_sha256",
+        "critical_scenario_ordinals",
+        "critical_scenario_ordinals_sha256",
         "scenario_deadline_seconds",
     }
     if not isinstance(campaign, dict):
@@ -906,7 +900,7 @@ def _load_campaign_spec(path: Path) -> _CampaignSpec:
         or len(raw_slots) != (6 if campaign_version == "v1" else 8)
         or not isinstance(scenario_count, int)
         or isinstance(scenario_count, bool)
-        or scenario_count < (case_count if isinstance(case_count, int) else 22)
+        or scenario_count < (case_count if isinstance(case_count, int) else 30)
         or (campaign_version == "v2" and scenario_count != 30)
         or not isinstance(scenario_order_sha256, str)
         or _SHA256.fullmatch(scenario_order_sha256) is None
@@ -960,35 +954,26 @@ def _load_campaign_spec(path: Path) -> _CampaignSpec:
             raise CampaignFailure("campaign_manifest_invalid")
         run_ids.add(run_id)
         slots.append(CampaignSlot(ordinal, lane, pair, run_id))
-    cohort_case_ids: tuple[str, ...] = ()
     critical_ordinals: tuple[int, ...] = ()
     deadline: Decimal | None = None
     if campaign_version == "v2":
-        raw_cohort = campaign.get("cohort_case_ids")
-        raw_critical = campaign.get("critical_cohort_ordinals")
+        raw_critical = campaign.get("critical_scenario_ordinals")
         deadline_value = campaign.get("scenario_deadline_seconds")
         if (
-            not isinstance(raw_cohort, list)
-            or len(raw_cohort) != 22
-            or any(not isinstance(value, str) or _SAFE_ID.fullmatch(value) is None for value in raw_cohort)
-            or len(set(raw_cohort)) != 22
-            or campaign.get("cohort_case_ids_sha256")
-            != hashlib.sha256(json.dumps(raw_cohort, separators=(",", ":")).encode()).hexdigest()
-            or not isinstance(raw_critical, list)
+            not isinstance(raw_critical, list)
             or not raw_critical
             or any(
-                not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 22
+                not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 30
                 for value in raw_critical
             )
-            or raw_critical != sorted(set(raw_critical))
-            or campaign.get("critical_cohort_ordinals_sha256")
+            or raw_critical != _V2_CRITICAL_SCENARIO_ORDINALS
+            or campaign.get("critical_scenario_ordinals_sha256")
             != hashlib.sha256(json.dumps(raw_critical, separators=(",", ":")).encode()).hexdigest()
             or isinstance(deadline_value, bool)
             or not isinstance(deadline_value, int | Decimal)
             or Decimal(deadline_value) != Decimal(600)
         ):
             raise CampaignFailure("campaign_manifest_invalid")
-        cohort_case_ids = tuple(raw_cohort)
         critical_ordinals = tuple(raw_critical)
         deadline = Decimal(deadline_value)
     return _CampaignSpec(
@@ -1002,8 +987,7 @@ def _load_campaign_spec(path: Path) -> _CampaignSpec:
         benchmark_scenario_count=scenario_count,
         benchmark_scenario_order_sha256=scenario_order_sha256,
         campaign_version=campaign_version,
-        cohort_case_ids=cohort_case_ids,
-        critical_cohort_ordinals=critical_ordinals,
+        critical_scenario_ordinals=critical_ordinals,
         scenario_deadline_seconds=deadline,
     )
 

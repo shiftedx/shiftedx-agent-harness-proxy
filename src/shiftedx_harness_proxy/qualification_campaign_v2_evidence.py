@@ -24,8 +24,8 @@ Arm = Literal["direct", "proxy"]
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-_CASE_COUNT = 22
 _SCENARIO_COUNT = 30
+_CRITICAL_SCENARIO_ORDINALS = (29, 30)
 
 
 class QualificationV2EvidenceFailure(ValueError):
@@ -39,10 +39,8 @@ class V2EvidenceSpec:
     manifest_sha256: str
     campaign_id_sha256: str
     scenario_order_sha256: str
-    cohort_case_ids: tuple[str, ...]
-    cohort_case_ids_sha256: str
-    critical_cohort_ordinals: tuple[int, ...]
-    critical_cohort_ordinals_sha256: str
+    critical_scenario_ordinals: tuple[int, ...]
+    critical_scenario_ordinals_sha256: str
     cache_lane: str
     replicate: int
     slot_ordinal: int
@@ -90,7 +88,7 @@ def adapt_v2_scored_evidence(
 
     records: list[V2OutcomeRecord] = []
     for arm, rows in (("direct", direct_rows), ("proxy", proxy_rows)):
-        for ordinal, case_id in enumerate(spec.cohort_case_ids, start=1):
+        for ordinal, case_id in enumerate(rows, start=1):
             row = rows[case_id]
             passed = row.get("passed")
             telemetry = row.get("telemetry")
@@ -107,7 +105,7 @@ def adapt_v2_scored_evidence(
                 raise QualificationV2EvidenceFailure("qualification_v2_evidence_invalid")
             assert isinstance(wall_s, int | Decimal) and not isinstance(wall_s, bool)
             assert isinstance(tool_calls, list) and isinstance(forbidden_calls, list)
-            critical = ordinal in spec.critical_cohort_ordinals
+            critical = ordinal in spec.critical_scenario_ordinals
             records.append(
                 V2OutcomeRecord(
                     case_ordinal=ordinal,
@@ -183,8 +181,6 @@ def _authenticated_rows(
     if (
         len(case_ids) != _SCENARIO_COUNT
         or _sha256(case_ids) != spec.scenario_order_sha256
-        or tuple(case_id for case_id in case_ids if case_id in set(spec.cohort_case_ids))
-        != spec.cohort_case_ids
     ):
         raise QualificationV2EvidenceFailure("qualification_v2_evidence_invalid")
     return rows, outcome.file_sha256
@@ -199,22 +195,12 @@ def _validate_spec(spec: V2EvidenceSpec) -> None:
                 spec.manifest_sha256,
                 spec.campaign_id_sha256,
                 spec.scenario_order_sha256,
-                spec.cohort_case_ids_sha256,
-                spec.critical_cohort_ordinals_sha256,
+                spec.critical_scenario_ordinals_sha256,
                 spec.expected_direct_outcome_sha256,
             )
         )
-        or len(spec.cohort_case_ids) != _CASE_COUNT
-        or len(set(spec.cohort_case_ids)) != _CASE_COUNT
-        or any(_SAFE_ID.fullmatch(value) is None for value in spec.cohort_case_ids)
-        or _sha256(spec.cohort_case_ids) != spec.cohort_case_ids_sha256
-        or not spec.critical_cohort_ordinals
-        or tuple(sorted(set(spec.critical_cohort_ordinals))) != spec.critical_cohort_ordinals
-        or any(
-            not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= _CASE_COUNT
-            for value in spec.critical_cohort_ordinals
-        )
-        or _sha256(spec.critical_cohort_ordinals) != spec.critical_cohort_ordinals_sha256
+        or spec.critical_scenario_ordinals != _CRITICAL_SCENARIO_ORDINALS
+        or _sha256(spec.critical_scenario_ordinals) != spec.critical_scenario_ordinals_sha256
         or spec.cache_lane not in {"cold", "warm-prefix"}
         or not isinstance(spec.replicate, int)
         or isinstance(spec.replicate, bool)

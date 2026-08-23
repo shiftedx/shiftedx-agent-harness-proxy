@@ -312,8 +312,7 @@ def _manifest(tmp_path: Path) -> Path:
 
 
 def _v2_campaign() -> dict[str, object]:
-    cohort_case_ids = [f"case-{ordinal:02d}" for ordinal in range(1, 23)]
-    critical_cohort_ordinals = [1, 2]
+    critical_scenario_ordinals = [29, 30]
     return {
         "campaign_version": "v2",
         "campaign_id": "qualification-campaign-v2",
@@ -326,10 +325,8 @@ def _v2_campaign() -> dict[str, object]:
         "treatment_order": ["direct", "proxy"],
         "model_instance_policy": "fresh-per-scored-treatment",
         "failure_policy": "terminal-no-rerun",
-        "cohort_case_ids": cohort_case_ids,
-        "cohort_case_ids_sha256": _canonical_sha256(cohort_case_ids),
-        "critical_cohort_ordinals": critical_cohort_ordinals,
-        "critical_cohort_ordinals_sha256": _canonical_sha256(critical_cohort_ordinals),
+        "critical_scenario_ordinals": critical_scenario_ordinals,
+        "critical_scenario_ordinals_sha256": _canonical_sha256(critical_scenario_ordinals),
         "scenario_deadline_seconds": 600,
     }
 
@@ -2612,8 +2609,13 @@ def test_v2_runtime_manifest_requires_the_fixed_thirty_scenario_denominator(tmp_
             {"cache_lane": "warm-prefix", "pair_index": 4, "run_id": "wrong"},
         ),
         lambda campaign: campaign.__setitem__("scenario_deadline_seconds", 599),
-        lambda campaign: campaign.__setitem__("cohort_case_ids_sha256", "0" * 64),
-        lambda campaign: campaign.__setitem__("critical_cohort_ordinals", []),
+        lambda campaign: campaign.__setitem__("critical_scenario_ordinals_sha256", "0" * 64),
+        lambda campaign: campaign.__setitem__("critical_scenario_ordinals", []),
+        lambda campaign: campaign.__setitem__("critical_scenario_ordinals", [31]),
+        lambda campaign: campaign.update(
+            critical_scenario_ordinals=[1],
+            critical_scenario_ordinals_sha256=hashlib.sha256(b"[1]").hexdigest(),
+        ),
         lambda campaign: campaign.__setitem__("campaign_version", "v3"),
     ],
 )

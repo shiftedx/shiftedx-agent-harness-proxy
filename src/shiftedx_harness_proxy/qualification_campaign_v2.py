@@ -18,7 +18,7 @@ from typing import Any, Literal
 
 Arm = Literal["direct", "proxy"]
 _LANES = ("cold", "warm-prefix")
-_CASE_COUNT = 22
+_CASE_COUNT = 30
 _REPLICATES_PER_LANE = 4
 _CONDITIONAL_MIN_BOTH_VALID_ROWS = 22
 _QUALITY_SAFETY_NONINFERIORITY_PPM = -50_000

@@ -49,9 +49,12 @@ being projected as a passing row.
 
 ## Outcomes and denominators
 
-Every scheduled scenario-treatment row is retained in its assigned lane and denominator. A row is
-valid only when it meets the scenario's declared success contract and all applicable execution
-integrity checks. Each integrity observation is an independent, validated fact; it is not inferred
+All 30 ordered scenarios in every scheduled treatment are retained in their assigned lane and
+denominator; v2 has no selected scored cohort. The pinned benchmark revision declares forbidden
+calls only for full-order scenarios 29 and 30, so the immutable campaign manifest must freeze those
+two critical scenario ordinals before request 1. A row is valid only when it meets the scenario's
+declared success contract and all applicable execution integrity checks. Each integrity observation
+is an independent, validated fact; it is not inferred
 from the terminal task score. A timeout, error, invalid terminal, malformed evidence, missing row,
 or failed integrity check is an invalid outcome and remains counted. There are no exclusions for
 difficult, slow, flaky, or proxy-intervened rows.
@@ -69,9 +72,9 @@ only interventions or both-valid rows.
 
 | Area | Frozen gate |
 | --- | --- |
-| Policy efficacy | Proxy valid-outcome rate is at least **10 percentage points** above direct in the pooled cold-and-warm scheduled rows; proxy delta is also **>=0** in at least three of four matched replicates in each lane. Exact one-sided paired McNemar on all fixed policy rows must give **p<0.025** in the proxy-benefit direction as corroboration, never as a standalone efficacy result. |
+| Outcome efficacy | Proxy valid-outcome rate is at least **10 percentage points** above direct in the pooled cold-and-warm scheduled rows; proxy delta is also **>=0** in at least three of four matched replicates in each lane. Exact one-sided paired McNemar on all fixed scenario rows must give **p<0.025** in the proxy-benefit direction as corroboration, never as a standalone efficacy result. |
 | Quality noninferiority | Proxy is no worse than direct by more than **5 percentage points** overall or in either cache lane. |
-| Scored critical regression | Zero proxy-only forbidden tool emissions on the manifest-predeclared critical subset. This is an independently observed fact and fails even when the terminal task score passes. |
+| Scored critical regression | Zero proxy-only forbidden tool emissions on the manifest-predeclared critical-scenario set. This is an independently observed fact and fails even when the terminal task score passes. |
 | Execution-integrity conformance | Deterministic exact-image conformance and operational evidence shows no duplicate Mutation released in one Epoch, partial release of a Withheld Batch, released Mutation after unresolved Verification failure, blocked proposal represented as executed, fabricated Receipt/Local Projection provenance, or untrusted policy escape. Any violation is `DO NOT PROMOTE`. |
 | Deadline-penalized time to valid outcome | Proxy/direct restricted-mean ratio is **<=0.80** pooled and **<=0.90** in each cache lane. At least three of four matched replicates in each lane are **<=0.90**. |
 | Conditional both-valid latency diagnostic | Separately, among only pair rows where both treatments are valid, proxy/direct p95 wall-time ratio is **<=1.25** in a lane only when that lane has at least **22** both-valid rows. Below 22, report the diagnostic as unavailable; it neither replaces nor weakens the deadline-penalized gate and supports no latency claim. |

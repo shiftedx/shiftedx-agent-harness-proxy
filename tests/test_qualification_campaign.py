@@ -67,8 +67,7 @@ def _private_campaign(path: Path) -> Path:
 
 def _v2_campaign_manifest(path: Path) -> tuple[Path, tuple[str, ...]]:
     scenario_case_ids = tuple(f"v2-case-{ordinal:02d}" for ordinal in range(1, 31))
-    cohort_case_ids = scenario_case_ids[:22]
-    critical_ordinals = [1, 2]
+    critical_ordinals = [29, 30]
     slots = [
         {"cache_lane": lane, "pair_index": pair, "run_id": f"qualification-v2-{lane}-{pair}"}
         for lane in ("cold", "warm-prefix")
@@ -90,12 +89,8 @@ def _v2_campaign_manifest(path: Path) -> tuple[Path, tuple[str, ...]]:
                 "treatment_order": ["direct", "proxy"],
                 "model_instance_policy": "fresh-per-scored-treatment",
                 "failure_policy": "terminal-no-rerun",
-                "cohort_case_ids": list(cohort_case_ids),
-                "cohort_case_ids_sha256": hashlib.sha256(
-                    json.dumps(cohort_case_ids, separators=(",", ":")).encode()
-                ).hexdigest(),
-                "critical_cohort_ordinals": critical_ordinals,
-                "critical_cohort_ordinals_sha256": hashlib.sha256(
+                "critical_scenario_ordinals": critical_ordinals,
+                "critical_scenario_ordinals_sha256": hashlib.sha256(
                     json.dumps(critical_ordinals, separators=(",", ":")).encode()
                 ).hexdigest(),
                 "scenario_deadline_seconds": 600,
@@ -271,7 +266,7 @@ def _v2_adapted_records(spec: Any, ledgers: Any) -> list[V2OutcomeRecord]:
     del ledgers
     records: list[V2OutcomeRecord] = []
     for arm in ("direct", "proxy"):
-        for ordinal in range(1, 23):
+        for ordinal in range(1, 31):
             records.append(
                 V2OutcomeRecord(
                     case_ordinal=ordinal,
@@ -843,6 +838,7 @@ def test_v2_campaign_runs_exact_direct_then_proxy_topology_and_writes_public_agg
     assert outcome["slot_count"] == 8
     assert outcome["scored_stage_count"] == 16
     assert outcome["scored_model_instance_count"] == 16
+    assert outcome["evaluator"]["row_count_per_arm"] == 240
     serialized_outcome = json.dumps(outcome, sort_keys=True)
     assert "case_id" not in serialized_outcome
     assert str(private) not in serialized_outcome
@@ -859,7 +855,11 @@ def test_v2_campaign_runs_exact_direct_then_proxy_topology_and_writes_public_agg
         lambda campaign: campaign.update(scenario_deadline_seconds=599),
         lambda campaign: campaign["slots"].reverse(),
         lambda campaign: campaign.update(policy_benefit_case_count=22),
-        lambda campaign: campaign.update(critical_cohort_ordinals=[]),
+        lambda campaign: campaign.update(critical_scenario_ordinals=[]),
+        lambda campaign: campaign.update(
+            critical_scenario_ordinals=[1],
+            critical_scenario_ordinals_sha256=hashlib.sha256(b"[1]").hexdigest(),
+        ),
     ],
 )
 def test_v2_manifest_freezes_the_campaign_topology_and_deadline(tmp_path: Path, mutation: Any) -> None:

@@ -27,7 +27,7 @@ def _records(
     values: list[V2OutcomeRecord] = []
     for lane in _LANES:
         for replicate in range(1, 5):
-            for ordinal in range(1, 23):
+            for ordinal in range(1, 31):
                 for arm in ("direct", "proxy"):
                     values.append(
                         V2OutcomeRecord(
@@ -52,13 +52,13 @@ def test_fixed_topology_retains_direct_failure_proxy_success_and_uses_deadline_p
         )
     )
 
-    assert result["row_count_per_arm"] == 176
-    assert result["pooled"]["direct_valid_count"] == 175
-    assert result["pooled"]["proxy_valid_count"] == 176
+    assert result["row_count_per_arm"] == 240
+    assert result["pooled"]["direct_valid_count"] == 239
+    assert result["pooled"]["proxy_valid_count"] == 240
     assert result["pooled"]["direct_only_success_count"] == 0
     assert result["pooled"]["proxy_only_success_count"] == 1
-    assert result["pooled"]["direct_penalized_mean_wall_us"] == 10_511_364
-    assert result["pooled"]["both_valid_count"] == 175
+    assert result["pooled"]["direct_penalized_mean_wall_us"] == 10_375_000
+    assert result["pooled"]["both_valid_count"] == 239
 
 
 def test_proxy_failure_and_both_failure_receive_declared_deadline_penalties() -> None:
@@ -69,9 +69,9 @@ def test_proxy_failure_and_both_failure_receive_declared_deadline_penalties() ->
 
     result = evaluate_qualification_v2(_records(passed=passed))
 
-    assert result["pooled"]["direct_penalized_mean_wall_us"] == 10_511_364
-    assert result["pooled"]["proxy_penalized_mean_wall_us"] == 9_045_455
-    assert result["pooled"]["both_valid_count"] == 174
+    assert result["pooled"]["direct_penalized_mean_wall_us"] == 10_375_000
+    assert result["pooled"]["proxy_penalized_mean_wall_us"] == 8_766_667
+    assert result["pooled"]["both_valid_count"] == 238
 
 
 @pytest.mark.parametrize("broken", ("duplicate", "missing", "mismatch"))
@@ -96,7 +96,7 @@ def test_proxy_only_integrity_violation_fails_safety_even_when_both_outcomes_pas
         _records(
             passed=lambda _lane, _replicate, ordinal, arm: not (ordinal <= 3 and arm == "direct"),
             integrity=lambda lane, replicate, ordinal, arm: (
-                (lane, replicate, ordinal, arm) == ("cold", 1, 22, "proxy")
+                (lane, replicate, ordinal, arm) == ("cold", 1, 30, "proxy")
             )
         )
     )
@@ -179,7 +179,7 @@ def test_conditional_diagnostic_is_unavailable_below_the_frozen_floor() -> None:
     result = evaluate_qualification_v2(
         _records(
             passed=lambda lane, replicate, ordinal, arm: not (
-                lane == "cold" and (replicate < 4 or ordinal == 1) and arm == "proxy"
+                lane == "cold" and (replicate < 4 or ordinal <= 9) and arm == "proxy"
             )
         )
     )
@@ -190,7 +190,7 @@ def test_conditional_diagnostic_is_unavailable_below_the_frozen_floor() -> None:
 
 def test_result_contract_exposes_all_fixed_v2_values() -> None:
     assert evaluate_qualification_v2(_records())["contract"] == {
-        "case_count": 22,
+        "case_count": 30,
         "lanes": ["cold", "warm-prefix"],
         "replicates_per_lane": 4,
         "arm_order_per_replicate": ["direct", "proxy"],

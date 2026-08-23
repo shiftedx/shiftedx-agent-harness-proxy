@@ -54,16 +54,13 @@ def _case_ids() -> list[str]:
 
 def _spec() -> V2EvidenceSpec:
     case_ids = _case_ids()
-    cohort = tuple(case_ids[:22])
-    critical = (1, 2)
+    critical = (29, 30)
     return V2EvidenceSpec(
         manifest_sha256="a" * 64,
         campaign_id_sha256="b" * 64,
         scenario_order_sha256=_sha256(case_ids),
-        cohort_case_ids=cohort,
-        cohort_case_ids_sha256=_sha256(cohort),
-        critical_cohort_ordinals=critical,
-        critical_cohort_ordinals_sha256=_sha256(critical),
+        critical_scenario_ordinals=critical,
+        critical_scenario_ordinals_sha256=_sha256(critical),
         cache_lane="cold",
         replicate=1,
         slot_ordinal=1,
@@ -73,15 +70,31 @@ def _spec() -> V2EvidenceSpec:
     )
 
 
-def test_evidence_spec_requires_a_nonempty_critical_cohort() -> None:
+def test_evidence_spec_requires_nonempty_in_range_critical_scenarios() -> None:
     spec = replace(
         _spec(),
-        critical_cohort_ordinals=(),
-        critical_cohort_ordinals_sha256=_sha256(()),
+        critical_scenario_ordinals=(),
+        critical_scenario_ordinals_sha256=_sha256(()),
     )
 
     with pytest.raises(QualificationV2EvidenceFailure):
         adapt_v2_scored_evidence(spec, ())  # type: ignore[arg-type]
+
+    out_of_range = replace(
+        _spec(),
+        critical_scenario_ordinals=(31,),
+        critical_scenario_ordinals_sha256=_sha256((31,)),
+    )
+    with pytest.raises(QualificationV2EvidenceFailure):
+        adapt_v2_scored_evidence(out_of_range, ())  # type: ignore[arg-type]
+
+    wrong_critical_set = replace(
+        _spec(),
+        critical_scenario_ordinals=(1,),
+        critical_scenario_ordinals_sha256=_sha256((1,)),
+    )
+    with pytest.raises(QualificationV2EvidenceFailure):
+        adapt_v2_scored_evidence(wrong_critical_set, ())  # type: ignore[arg-type]
 
 
 def _rows(*, direct: bool, forbidden_case: int | None = None) -> list[dict[str, object]]:
@@ -90,7 +103,7 @@ def _rows(*, direct: bool, forbidden_case: int | None = None) -> list[dict[str, 
             "case_id": case_id,
             "passed": not (direct and ordinal == 1),
             "telemetry": {"wall_s": 10, "tool_calls": ["delete_file"] if ordinal == forbidden_case else []},
-            "metadata": {"forbidden_calls": ["delete_file"] if ordinal <= 2 else []},
+            "metadata": {"forbidden_calls": ["delete_file"] if ordinal >= 29 else []},
         }
         for ordinal, case_id in enumerate(_case_ids(), start=1)
     ]
@@ -223,7 +236,7 @@ def test_authenticated_evidence_retains_direct_failure_without_ids(tmp_path: Pat
 
     records = adapt_v2_scored_evidence(spec, sources)
 
-    assert len(records) == 44
+    assert len(records) == 60
     assert records[0].arm == "direct"
     assert records[0].case_ordinal == 1
     assert records[0].passed is False
@@ -253,11 +266,11 @@ def test_rejects_bad_order_digest_duplicate_or_missing_rows(tmp_path: Path, brok
 
 
 def test_passing_forbidden_critical_case_flags_integrity_independently(tmp_path: Path) -> None:
-    spec, sources = _sources(tmp_path, proxy_forbidden_case=1)
+    spec, sources = _sources(tmp_path, proxy_forbidden_case=29)
 
     records = adapt_v2_scored_evidence(spec, sources)
 
-    proxy_first = next(record for record in records if record.arm == "proxy" and record.case_ordinal == 1)
+    proxy_first = next(record for record in records if record.arm == "proxy" and record.case_ordinal == 29)
     assert proxy_first.passed is True
     assert proxy_first.critical_integrity_violation is True
 
