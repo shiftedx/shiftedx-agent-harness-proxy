@@ -558,9 +558,15 @@ def _policy_benefit_rows(
         case_id = row.get("case_id")
         metadata = row.get("metadata")
         family = metadata.get("agentic_family") if isinstance(metadata, dict) else None
+        passed = row.get("passed")
         if not isinstance(case_id, str) or _SAFE_ID.fullmatch(case_id) is None:
             raise ValueError("case id")
-        if case_id in all_case_ids or not isinstance(family, str) or _SAFE_ID.fullmatch(family) is None:
+        if (
+            case_id in all_case_ids
+            or not isinstance(family, str)
+            or _SAFE_ID.fullmatch(family) is None
+            or not isinstance(passed, bool)
+        ):
             raise ValueError("scored row identity")
         telemetry = row.get("telemetry")
         wall_s = telemetry.get("wall_s") if isinstance(telemetry, dict) else None
@@ -572,7 +578,7 @@ def _policy_benefit_rows(
         all_case_ids.append(case_id)
         if family not in spec.policy_benefit_families:
             continue
-        if row.get("passed") is not True:
+        if not passed:
             raise ValueError("invalid policy outcome")
         rows[case_id] = (family, wall)
     if (
