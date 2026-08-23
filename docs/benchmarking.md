@@ -85,10 +85,13 @@ uv run python scripts/run_qualification_runtime.py \
   --manifest "$RUN_MANIFEST" --private-campaign-dir "$CAMPAIGN_DIR"
 ```
 
-Run that same command again only after it reports the prior stage complete. It advances one event
-at a time in this fixed order: the sole preflight, then direct/proxy for cold pairs 1–3, then
-direct/proxy for warm-prefix pairs 1–3. An exit status of `2` means the next scored stage requires
-the independently operated MTPLX restart; this includes an intentionally stopped model listener.
+Run that same command again only after it reports the prior stage complete. For v1, it advances one
+event at a time in this fixed order: the sole preflight, then direct/proxy for cold pairs 1–3, then
+direct/proxy for warm-prefix pairs 1–3. The v2 schedule is the sole preflight followed by eight
+direct-then-proxy pairs: cold pairs 1–4, then warm-prefix pairs 1–4, for 17 total events. An exit
+status of `2` means the next scored stage requires the independently operated MTPLX restart; this
+includes an intentionally stopped model listener. For v2 only, exit status `3` means
+`campaign_scored_complete`: scoring finished, but it is not a promotion or deployment approval.
 The supervisor recognizes only a typed connection-refused result from its dedicated loopback
 listener probe as offline, and returns `2` before reserving a slot directory, evidence file, or
 terminal campaign event. A timeout or other socket error is indeterminate and fails closed; a live
@@ -118,6 +121,22 @@ canonical model/order hashes, benchmark revision, runtime-contract/instance hash
 true checks. It contains no endpoint, host path, container name, PID, secret, or credential hash.
 The separate outcome is categorical only and does not rewrite either attestation or benchmark
 ledger.
+
+### Private manifest v2
+
+V2 uses the same private, duplicate-rejecting JSON envelope, but its `campaign` object is a
+separate strict contract. It must declare `"campaign_version": "v2"`, exactly eight ordered slots
+(cold pairs 1–4 followed by warm-prefix pairs 1–4), and
+`"scenario_deadline_seconds": 600`. Every scored treatment retains all 30 authenticated ordered
+scenarios; v2 has no selected cohort. The manifest must also declare
+`"critical_scenario_ordinals": [29, 30]` and the canonical SHA-256 of that exact array in
+`"critical_scenario_ordinals_sha256"`. These are full-order ordinals, not public scenario IDs.
+
+The runtime rejects v2 values that differ from this fixed topology, critical set, or deadline. It
+forwards the private 600-second deadline only to scored children, so it bounds each complete
+scenario rather than preflight. The final v2 scorer exit is `3` (`campaign_scored_complete`), which
+records completed scoring only. It does not emit `PROMOTE`, authorize deployment, or waive the
+remaining operational evidence and owner decision in the [v2 qualification plan](../benchmark-reports/v2-qualification-plan.md).
 
 ### Private manifest v1
 

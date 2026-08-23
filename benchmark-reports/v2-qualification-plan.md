@@ -113,8 +113,10 @@ overload, streaming, fault, cancellation, restart, privacy, resource, and rollba
 An infrastructure invalidation is permitted only when the manifest proves that the treatment never
 executed; disclose it and repeat the entire affected pair under a newly recorded terminal event.
 No scenario, treatment, lane, or failed row may be selectively rerun, dropped, tuned, reclassified,
-or replaced after request 1. A terminal campaign has exactly one decision: `PROMOTE`, `DO NOT
-PROMOTE`, or `BLOCKED`.
+or replaced after request 1. The runtime's `campaign_scored_complete` event (CLI exit `3`) records
+only that fixed-row v2 scoring completed; it is neither `PROMOTE` nor deployment authorization.
+After all required operational evidence is reviewed, a terminal campaign has exactly one final
+decision: `PROMOTE`, `DO NOT PROMOTE`, or `BLOCKED`.
 
 The public report publishes aggregate-only results: counts and denominators by treatment/lane,
 quality and gate status, latency quantiles and ratios, decode, amplification, reconciliation,
