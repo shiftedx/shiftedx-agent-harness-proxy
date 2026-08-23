@@ -13,10 +13,17 @@ reviewers can verify that thresholds were not changed after results were known.
 - Harness profile: `shiftedx-harness-v1`
 - Benchmark: Shiftedx Bench revision
   `335e6694e4aec13e9370af8a993d8c8f14d7ffb5`
-- Candidate model revision:
-  `b5a54ea5d7745b6ddada238f83b66d63c979b9a5`
-- Sampler: temperature `0.0`, top-p `0.95`, top-k `20`
-- Reasoning: thinking enabled, reasoning effort `medium`
+- Served model: `ornith-1.5-35b-a3b-abliterated`
+- Artifact: `ornith-1.5-35b-a3b-abliterated-attention8-bf16recurrence-vision-mtplx`
+- Runtime: MTPLX `2.9.0`, `sustained` profile, native MTP depth `1`; serial scheduler, `agent`
+  batching, SSD session cache enabled, and paged-KV quantization disabled
+- Public artifact identities: `config.json` `60717e3978992f7f967abfe7c100405b667d7bf48f5084affd9f933326d31750`;
+  `tokenizer_config.json` `5186f0defcd7f232382c7f0aebcd2252d073bb921ab240e407b7ae8745d2b29b`;
+  `chat_template.jinja` `182e77dd83bd8e9ca818b240b82e28f243762cd5dda32e6eef327df7b1cd107e`;
+  `mtplx_runtime.json` `0f4619009ce61b168091d891c2a204ba960703f993229390609118b8e84478b3`;
+  `model.safetensors.index.json` `5ea79f00036b670d13ef98ae1a4d597437921cdcf6896d1e95c151ead09b24ba`
+- Sampler profile: `ornith-productization-v1` — temperature `1.0`, top-p `0.95`, top-k `20`,
+  thinking enabled, reasoning effort `medium`, and `max_tokens=8192`
 - Treatments: direct upstream baseline and proxy-assisted, both using the benchmark runner's
   `baseline` control profile
 - Trials: at least three complete matched pairs for every declared lane

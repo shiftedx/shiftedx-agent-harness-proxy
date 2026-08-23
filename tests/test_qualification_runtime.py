@@ -308,6 +308,19 @@ def _manifest(tmp_path: Path) -> Path:
     return path
 
 
+def test_manifest_accepts_ornith_productization_sampler_profile(tmp_path) -> None:
+    manifest = _manifest(tmp_path)
+    document = _manifest_document(manifest)
+    benchmark = document["qualification_runtime"]["benchmark"]
+    assert isinstance(benchmark, dict)
+    benchmark["sampler_profile"] = "ornith-productization-v1"
+    _store_manifest(manifest, document)
+
+    spec = runtime_module._load_runtime_spec(manifest, _FakeRuntimeRunner())
+
+    assert spec.benchmark.sampler_profile == "ornith-productization-v1"
+
+
 def _supervise(
     *,
     manifest: Path,

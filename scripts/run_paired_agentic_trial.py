@@ -99,6 +99,14 @@ _SAMPLER_PROFILES: dict[SamplerProfile, dict[str, Any]] = {
         "reasoning_effort": "medium",
         "max_tokens": 1024,
     },
+    "ornith-productization-v1": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "thinking": {"enabled": True},
+        "reasoning_effort": "medium",
+        "max_tokens": 8192,
+    },
 }
 
 

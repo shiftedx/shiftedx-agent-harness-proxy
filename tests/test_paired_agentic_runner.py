@@ -588,41 +588,59 @@ def test_preflight_post_tool_continuation_disables_additional_tool_calls_for_bot
     }
 
 
-def test_historical_aeon_profile_binds_payload_fingerprint_prime_and_score_gate(monkeypatch):
-    """The known-good AEON sampler is a named, end-to-end qualification contract."""
-
+@pytest.mark.parametrize(
+    ("profile", "expected_sampler", "different_profile"),
+    [
+        (
+            "historical-aeon-v1",
+            {
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": 20,
+                "thinking": {"enabled": True},
+                "reasoning_effort": "medium",
+                "max_tokens": 1024,
+            },
+            "corrected-parity-v1",
+        ),
+        (
+            "ornith-productization-v1",
+            {
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": 20,
+                "thinking": {"enabled": True},
+                "reasoning_effort": "medium",
+                "max_tokens": 8192,
+            },
+            "historical-aeon-v1",
+        ),
+    ],
+)
+def test_named_sampler_profile_binds_payload_fingerprint_prime_and_score_gate(
+    monkeypatch, profile, expected_sampler, different_profile
+):
     runner = load_runner(monkeypatch)
     scenario = runner.scenario_set("expanded")[0]
     order = [scenario.case_id]
 
-    historical = runner.request_payload(
+    payload = runner.request_payload(
         scenario,
         model="model",
         proxy_policy=False,
-        sampler_profile="historical-aeon-v1",
+        sampler_profile=profile,
     )
-    corrected = runner.request_payload(scenario, model="model", proxy_policy=False)
     sampler_keys = ("temperature", "top_p", "top_k", "thinking", "reasoning_effort", "max_tokens")
-    assert {key: historical[key] for key in sampler_keys} == {
-        "temperature": 1.0,
-        "top_p": 0.95,
-        "top_k": 20,
-        "thinking": {"enabled": True},
-        "reasoning_effort": "medium",
-        "max_tokens": 1024,
-    }
-    historical_digest = runner.contract_fingerprints(historical, order, policy_delta={})["downstream"]["digest"]
-    corrected_digest = runner.contract_fingerprints(corrected, order, policy_delta={})["downstream"]["digest"]
-    assert historical_digest != corrected_digest
+    assert {key: payload[key] for key in sampler_keys} == expected_sampler
 
-    prime = runner.cache_prime_payload(scenario, model="model", arm="direct", sampler_profile="historical-aeon-v1")
-    first_scored = runner.PhasePlanner().plan(historical, phase="acquisition")
+    prime = runner.cache_prime_payload(scenario, model="model", arm="direct", sampler_profile=profile)
+    first_scored = runner.PhasePlanner().plan(payload, phase="acquisition")
     assert (
         runner.model_boundary_fingerprint(prime, scenario_order=order).digest
         == runner.model_boundary_fingerprint(first_scored, scenario_order=order).digest
     )
 
-    digests = runner._qualification_contract_digests("model", [scenario], order, "a" * 64, "historical-aeon-v1")
+    digests = runner._qualification_contract_digests("model", [scenario], order, "a" * 64, profile)
     expected = runner.qualification_contract_digest(
         [
             runner.request_payload(
@@ -630,7 +648,7 @@ def test_historical_aeon_profile_binds_payload_fingerprint_prime_and_score_gate(
                 model="model",
                 proxy_policy=False,
                 cache_mode="bypass",
-                sampler_profile="historical-aeon-v1",
+                sampler_profile=profile,
             )
         ],
         order,
@@ -638,12 +656,9 @@ def test_historical_aeon_profile_binds_payload_fingerprint_prime_and_score_gate(
         run_manifest_sha256="a" * 64,
     )
     assert digests["cold"]["direct"] == expected
-    assert (
-        digests["cold"]["direct"]
-        != runner._qualification_contract_digests("model", [scenario], order, "a" * 64, "corrected-parity-v1")["cold"][
-            "direct"
-        ]
-    )
+    assert digests["cold"]["direct"] != runner._qualification_contract_digests(
+        "model", [scenario], order, "a" * 64, different_profile
+    )["cold"]["direct"]
 
 
 def test_contract_fingerprint_reports_accidental_sampler_mismatch(monkeypatch):

@@ -30,9 +30,13 @@ an evaluation adapter, not benchmark or proxy policy derived from expected answe
 
 ## Parity preflight and score gate
 
-The default replacement qualification uses the named `corrected-parity-v1` sampler:
-`temperature=0.0`, `top_p=0.95`, `top_k=20`, thinking enabled, reasoning effort `medium`, and
-`max_tokens=1024`.
+The frozen Ornith productization campaign uses the named `ornith-productization-v1` sampler:
+`temperature=1.0`, `top_p=0.95`, `top_k=20`, thinking enabled, reasoning effort `medium`, and
+`max_tokens=8192`.
+
+`corrected-parity-v1` remains the separate temperature-0 replacement-qualification profile. It uses
+exactly `temperature=0.0`, `top_p=0.95`, `top_k=20`, thinking enabled, reasoning effort `medium`,
+and `max_tokens=1024`.
 
 `historical-aeon-v1` is the separate historical AEON parity profile. It uses exactly
 `temperature=1.0`, `top_p=0.95`, `top_k=20`, thinking enabled, reasoning effort `medium`, and
@@ -166,7 +170,7 @@ uses `"schema_version": "1.0"` and exactly these keys:
       "checkout_path": "/absolute/private/path/shiftedx-bench",
       "interpreter_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
       "agentic_set": "expanded",
-      "sampler_profile": "corrected-parity-v1",
+      "sampler_profile": "ornith-productization-v1",
       "scenario_order_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
       "scenario_count": 12
     },

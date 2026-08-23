@@ -529,7 +529,7 @@ class RuntimeLease:
     model: str
     benchmark_revision: str
     agentic_set: str
-    sampler_profile: Literal["corrected-parity-v1", "historical-aeon-v1"]
+    sampler_profile: Literal["corrected-parity-v1", "historical-aeon-v1", "ornith-productization-v1"]
     scenario_order_sha256: str
     scenario_count: int
     benchmark_source_path: Path
@@ -613,7 +613,7 @@ class _BenchmarkSpec:
     checkout_path: Path
     interpreter_sha256: str
     agentic_set: str
-    sampler_profile: Literal["corrected-parity-v1", "historical-aeon-v1"]
+    sampler_profile: Literal["corrected-parity-v1", "historical-aeon-v1", "ornith-productization-v1"]
     scenario_order_sha256: str
     scenario_count: int
 
@@ -1470,7 +1470,7 @@ def _parse_benchmark(value: Any) -> _BenchmarkSpec:
     if agentic_set not in {"core", "expanded", "repo"}:
         raise QualificationRuntimeFailure("runtime_manifest_invalid")
     sampler_profile = benchmark.get("sampler_profile")
-    if sampler_profile not in {"corrected-parity-v1", "historical-aeon-v1"}:
+    if sampler_profile not in {"corrected-parity-v1", "historical-aeon-v1", "ornith-productization-v1"}:
         raise QualificationRuntimeFailure("runtime_manifest_invalid")
     order_hash = _exact_string(benchmark, "scenario_order_sha256", _SHA256)
     count = _positive_int(benchmark.get("scenario_count"))
