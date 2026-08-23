@@ -18,6 +18,8 @@ from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+from shiftedx_harness_proxy.qualification_timing import TIMING_EVIDENCE_MAX_BYTES
+
 CacheLane = Literal["cold", "warm-prefix"]
 CampaignLane = Literal["preflight", "cold", "warm-prefix"]
 CampaignStage = Literal["preflight", "score-direct", "score-proxy"]
@@ -35,6 +37,7 @@ _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _FAILURE_CATEGORY = re.compile(r"^[a-z0-9_]{1,64}$")
 _STAGES: tuple[CampaignStage, ...] = ("preflight", "score-direct", "score-proxy")
 _V2_CRITICAL_SCENARIO_ORDINALS = [29, 30]
+_METADATA_FILE_MAX_BYTES = 1024 * 1024
 _OUTCOME_NAMES: dict[CampaignStage, str] = {
     "preflight": "preflight-runtime-outcome.json",
     "score-direct": "scored-direct-runtime-outcome.json",
@@ -1171,7 +1174,18 @@ def _atomic_write_no_clobber(path: Path, document: dict[str, Any]) -> bytes:
     return serialized
 
 
-def _read_regular_file(path: Path, *, private: bool) -> bytes:
+def _read_regular_file(
+    path: Path,
+    *,
+    private: bool,
+    max_bytes: int = _METADATA_FILE_MAX_BYTES,
+) -> bytes:
+    if (
+        isinstance(max_bytes, bool)
+        or not isinstance(max_bytes, int)
+        or not 0 < max_bytes <= TIMING_EVIDENCE_MAX_BYTES
+    ):
+        raise OSError("invalid file")
     status = path.lstat()
     if path.is_symlink() or not stat.S_ISREG(status.st_mode) or (private and stat.S_IMODE(status.st_mode) != 0o600):
         raise OSError("invalid file")
@@ -1181,7 +1195,7 @@ def _read_regular_file(path: Path, *, private: bool) -> bytes:
         if (
             not stat.S_ISREG(opened.st_mode)
             or (opened.st_dev, opened.st_ino) != (status.st_dev, status.st_ino)
-            or opened.st_size > 1024 * 1024
+            or opened.st_size > max_bytes
             or (private and stat.S_IMODE(opened.st_mode) != 0o600)
         ):
             raise OSError("invalid file")

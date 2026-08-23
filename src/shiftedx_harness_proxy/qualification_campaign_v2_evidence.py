@@ -19,6 +19,7 @@ from typing import Any, Literal, cast
 from shiftedx_harness_proxy.qualification_campaign import _read_regular_file
 from shiftedx_harness_proxy.qualification_campaign_v2 import V2OutcomeRecord
 from shiftedx_harness_proxy.qualification_contract import RuntimeOutcomeFailure, load_runtime_outcome
+from shiftedx_harness_proxy.qualification_timing import TIMING_EVIDENCE_MAX_BYTES
 
 Arm = Literal["direct", "proxy"]
 
@@ -139,7 +140,11 @@ def _authenticated_rows(
     ):
         raise QualificationV2EvidenceFailure("qualification_v2_evidence_invalid")
     try:
-        ledger = _read_regular_file(source.ledger_path, private=True)
+        ledger = _read_regular_file(
+            source.ledger_path,
+            private=True,
+            max_bytes=TIMING_EVIDENCE_MAX_BYTES,
+        )
         outcome = load_runtime_outcome(
             source.runtime_outcome_path,
             expected_stage=cast(Literal["scored-direct", "scored-proxy"], expected_stage),

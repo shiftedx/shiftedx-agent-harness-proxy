@@ -25,6 +25,7 @@ from shiftedx_harness_proxy.qualification_reconciliation import (
     ReconciliationIdentity,
     RequestAccountingRecord,
 )
+from shiftedx_harness_proxy.qualification_timing import TIMING_EVIDENCE_MAX_BYTES
 
 _ZERO_METRICS = MetricsSnapshot(*([0] * 15))
 
@@ -231,6 +232,18 @@ def _sources(
     return spec, (direct, proxy)
 
 
+def _replace_ledger_and_commitment(
+    source: V2ScoredLedger, rows: list[dict[str, object]]
+) -> V2ScoredLedger:
+    ledger = b"".join(json.dumps(row, separators=(",", ":"), sort_keys=True).encode() + b"\n" for row in rows)
+    source.ledger_path.write_bytes(ledger)
+    os.chmod(source.ledger_path, 0o600)
+    outcome = json.loads(source.runtime_outcome_path.read_bytes())
+    outcome["output_ledger_sha256"] = hashlib.sha256(ledger).hexdigest()
+    serialized = _private_json(source.runtime_outcome_path, outcome)
+    return replace(source, runtime_outcome_sha256=hashlib.sha256(serialized).hexdigest())
+
+
 def test_authenticated_evidence_retains_direct_failure_without_ids(tmp_path: Path) -> None:
     spec, sources = _sources(tmp_path)
 
@@ -242,6 +255,32 @@ def test_authenticated_evidence_retains_direct_failure_without_ids(tmp_path: Pat
     assert records[0].passed is False
     assert records[0].deadline_s == Decimal("600")
     assert all("case_id" not in record.__dict__ for record in records)
+
+
+def test_authenticated_evidence_allows_bounded_large_scored_ledger(tmp_path: Path) -> None:
+    spec, (direct, proxy) = _sources(tmp_path)
+    rows = _rows(direct=True)
+    rows[0]["padding"] = "x" * (1024 * 1024)
+    direct = _replace_ledger_and_commitment(direct, rows)
+    assert 1024 * 1024 < direct.ledger_path.stat().st_size < TIMING_EVIDENCE_MAX_BYTES
+    spec = replace(spec, expected_direct_outcome_sha256=direct.runtime_outcome_sha256)
+    proxy = replace(proxy, predecessor_outcome_sha256=direct.runtime_outcome_sha256)
+
+    records = adapt_v2_scored_evidence(spec, (direct, proxy))
+
+    assert len(records) == 60
+
+
+def test_authenticated_evidence_rejects_scored_ledger_over_evidence_bound(tmp_path: Path) -> None:
+    spec, (direct, proxy) = _sources(tmp_path)
+    rows = _rows(direct=True)
+    rows[0]["padding"] = "x" * TIMING_EVIDENCE_MAX_BYTES
+    direct = _replace_ledger_and_commitment(direct, rows)
+    spec = replace(spec, expected_direct_outcome_sha256=direct.runtime_outcome_sha256)
+    proxy = replace(proxy, predecessor_outcome_sha256=direct.runtime_outcome_sha256)
+
+    with pytest.raises(QualificationV2EvidenceFailure):
+        adapt_v2_scored_evidence(spec, (direct, proxy))
 
 
 @pytest.mark.parametrize("broken", ("order", "digest", "duplicate", "missing"))
