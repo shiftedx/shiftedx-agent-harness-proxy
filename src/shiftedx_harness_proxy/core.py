@@ -176,6 +176,7 @@ class AgentHarness:
     available_tools: set[str] = field(default_factory=set)
     required_json_keys: tuple[str, ...] | None = None
     required_json_types: dict[str, str] = field(default_factory=dict)
+    enforce_failed_execution_claim: bool = False
     require_receipt: bool = True
     roles: ToolRoles = field(default_factory=ToolRoles)
     epoch: int = 0
@@ -334,7 +335,11 @@ class AgentHarness:
             structured = json.loads(content.strip())
         except json.JSONDecodeError:
             structured = None
-        if isinstance(structured, dict) and "failed_executions" in structured:
+        if (
+            self.enforce_failed_execution_claim
+            and isinstance(structured, dict)
+            and "failed_executions" in structured
+        ):
             expected_failures = sum(receipt.status == "failure" for receipt in self.receipts)
             claimed_failures = structured["failed_executions"]
             if (

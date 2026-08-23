@@ -154,10 +154,11 @@ overlapping capability entries, so an ordinary bearer can never silently become 
   `execution_status=blocked_not_executed` and states that the proposal did not reach the client
   executor. Only downstream-visible assistant call IDs paired with client-supplied `role=tool`
   results count as executed. The model is instructed to ground free-form prose in that ledger.
-- When terminal JSON includes `failed_executions`, the proxy deterministically requires its integer
-  value to equal the number of failed client-visible receipts; a mismatch enters the existing
-  bounded terminal-correction path. Free-form prose without that field is not semantically parsed
-  and remains prompt-grounded rather than proxy-enforced.
+- Under the strict, versioned `response_format.json_schema` contract named
+  `shiftedx_recovery_result_v1`, a terminal `failed_executions` integer must equal the number of
+  failed client-visible receipts; a mismatch enters the existing bounded terminal-correction path.
+  The same field under an unrelated schema keeps ordinary schema semantics. Free-form prose is not
+  semantically parsed and remains prompt-grounded rather than proxy-enforced.
 - Successful mutation opens a verification requirement. A successful verifier closes it.
 - Failed verification remains unresolved through investigation. It closes only after changed
   action and a later successful verifier.

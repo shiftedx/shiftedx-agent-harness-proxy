@@ -128,7 +128,7 @@ async def test_failed_repeat_recovers_once_and_final_claim_matches_client_execut
     response_format = {
         "type": "json_schema",
         "json_schema": {
-            "name": "recovery_result",
+            "name": "shiftedx_recovery_result_v1",
             "strict": True,
             "schema": {
                 "type": "object",

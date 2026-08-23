@@ -154,8 +154,9 @@ network is not a substitute for authentication.
 - Reconstructs compact receipts from paired assistant calls and public tool results.
 - Blocks identical calls only while state is unchanged; successful mutation opens a new epoch.
 - Marks an internally blocked duplicate as `blocked_not_executed`; only downstream-visible calls
-  paired with client tool results count as executed. A terminal JSON `failed_executions` field is
-  checked against that ledger; unstructured prose remains prompt-grounded.
+  paired with client tool results count as executed. The strict, versioned
+  `shiftedx_recovery_result_v1` response schema checks its `failed_executions` field against that
+  ledger; unrelated schemas and unstructured prose keep ordinary prompt-grounded semantics.
 - Requires successful verification after mutation and preserves unresolved failures.
 - Withholds an entire parallel batch if one sibling is blocked, preventing false execution state.
 - Applies at most two terminal-format corrections and hard-bounds every internal retry loop.

@@ -43,7 +43,11 @@ def test_blocked_duplicate_is_explicitly_not_a_client_execution() -> None:
 
 
 def test_structured_failed_execution_claim_must_match_client_visible_receipts() -> None:
-    state = AgentHarness("recover", available_tools={"run_tests", "apply_patch"})
+    state = AgentHarness(
+        "recover",
+        available_tools={"run_tests", "apply_patch"},
+        enforce_failed_execution_claim=True,
+    )
     state.record("run_tests", {"target": "original"}, "1 failed")
     state.record("apply_patch", {}, "Patch applied.")
     state.record("run_tests", {"target": "recovered"}, "8 passed")
