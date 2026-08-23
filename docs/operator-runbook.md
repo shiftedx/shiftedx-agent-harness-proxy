@@ -144,6 +144,21 @@ Changing that profile is allowed operationally but is not covered by the reporte
 
 Use only synthetic, non-sensitive content:
 
+Before exposing an exact image to ingress, run its deterministic image smoke from the matching public
+source checkout. Pull the immutable image first; the smoke must not rebuild it:
+
+```bash
+docker pull "$APPROVED_PROXY_IMAGE"
+IMAGE="$APPROVED_PROXY_IMAGE" BUILD_IMAGE=0 ./scripts/docker-smoke.sh
+```
+
+The smoke uses a local fake upstream, not the deployed model. It fails if `phase_split` forwards a
+merged tool/schema request, if its finalization request retains tools or `tool_choice`, or if
+validate-then-replay SSE loses semantic content or emits anything other than one `[DONE]`. It also
+retains the authenticated Models, readiness, bounded-response, hardening, secret-redaction, and
+graceful-shutdown checks. This is deterministic image/protocol evidence, not a model-performance
+claim or a replacement for the synthetic live-upstream smoke below.
+
 ```bash
 curl -fsS http://127.0.0.1:8090/healthz
 curl -fsS http://127.0.0.1:8090/readyz
