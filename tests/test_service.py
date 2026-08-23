@@ -308,7 +308,16 @@ async def test_same_epoch_duplicate_never_reaches_client_and_is_retried_internal
     assert result.body["choices"][0]["message"]["tool_calls"] == []
     assert result.telemetry.blocked_duplicates == 1
     assert result.telemetry.upstream_calls == 2
-    assert "duplicate_call_blocked" in str(upstream.requests[1]["messages"])
+    retry_messages = upstream.requests[1]["messages"]
+    assert retry_messages[-2]["role"] == "assistant"
+    assert retry_messages[-2]["tool_calls"] == [duplicate]
+    assert retry_messages[-1]["role"] == "tool"
+    assert retry_messages[-1]["tool_call_id"] == "dup"
+    blocked = json.loads(retry_messages[-1]["content"])
+    assert blocked["shiftedx_harness"] == "duplicate_call_blocked"
+    assert blocked["execution_status"] == "blocked_not_executed"
+    assert "did not reach the client executor" in blocked["fact"]
+    assert blocked["instruction"]
 
 
 @pytest.mark.asyncio

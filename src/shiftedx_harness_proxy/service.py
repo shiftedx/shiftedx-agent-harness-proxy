@@ -301,7 +301,6 @@ class ChatService:
                         separators=(",", ":"),
                     )
                     working_messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
-                working_messages.append({"role": "user", "content": harness.render()})
                 _snapshot_timing(harness, retry_attempt_count=internal_retries)
                 continue
 
