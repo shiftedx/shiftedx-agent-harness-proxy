@@ -150,6 +150,10 @@ overlapping capability entries, so an ordinary bearer can never silently become 
 - A compact receipt contains sequence, tool, canonical argument signature, status, and epoch; raw
   result text is not retained in policy state.
 - Identical calls are blocked only within an unchanged epoch. Successful mutation increments it.
+- A blocked duplicate's internal synthetic result carries
+  `execution_status=blocked_not_executed` and states that the proposal did not reach the client
+  executor. Only downstream-visible assistant call IDs paired with client-supplied `role=tool`
+  results count as executed; final prose must agree with that ledger.
 - Successful mutation opens a verification requirement. A successful verifier closes it.
 - Failed verification remains unresolved through investigation. It closes only after changed
   action and a later successful verifier.
