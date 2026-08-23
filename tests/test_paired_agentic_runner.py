@@ -549,9 +549,80 @@ def test_phase_planner_skips_acquisition_for_none_with_tools_and_strict_schema(m
     runner = load_runner(monkeypatch)
     scenario = runner.scenario_set("expanded")[0]
     payload = runner.request_payload(scenario, model="model", proxy_policy=False)
+    payload["messages"] += [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "synthetic tool completed"},
+    ]
     payload["tool_choice"] = "none"
 
     assert runner.PhasePlanner().phases_for(payload) == ("finalization",)
+
+
+@pytest.mark.parametrize(
+    "messages",
+    (
+        [],
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}],
+            }
+        ],
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "error: failed"},
+        ],
+    ),
+)
+def test_phase_planner_keeps_unsafe_none_with_tools_in_acquisition(monkeypatch, messages):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    payload = runner.request_payload(scenario, model="model", proxy_policy=False)
+    payload["messages"] += messages
+    payload["tool_choice"] = "none"
+
+    assert runner.PhasePlanner().phases_for(payload) == ("acquisition", "finalization")
+
+
+def test_direct_compatibility_client_dispatches_safe_none_continuation_to_finalization(monkeypatch):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    payload = runner.request_payload(scenario, model="model", proxy_policy=False)
+    payload["messages"] += [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "synthetic tool completed"},
+    ]
+    payload["tool_choice"] = "none"
+
+    class DirectModel:
+        def __init__(self):
+            self.payloads = []
+
+        def complete(self, request, *, stream=False):
+            assert stream is False
+            self.payloads.append(copy.deepcopy(request))
+            return {"content": '{"status":"passed"}', "tool_calls": []}
+
+    upstream = DirectModel()
+    client = runner.CompatibilityClient(upstream, arm="direct", scenario_order=[scenario.case_id], proxy_policy=False)
+    client.complete(payload)
+
+    assert len(upstream.payloads) == 1
+    assert "tools" not in upstream.payloads[0]
+    assert upstream.payloads[0]["response_format"] == payload["response_format"]
 
 
 @pytest.mark.parametrize("arm", ("direct", "proxy"))

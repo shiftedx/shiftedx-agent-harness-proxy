@@ -19,8 +19,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
 
-from .core import HARNESS_SYSTEM_SUFFIX
-from .transcript import response_schema_contract
+from .core import HARNESS_SYSTEM_SUFFIX, ToolRoles
+from .transcript import PolicyAnnotationError, prepare_tools, reconstruct, response_schema_contract
 
 JsonObject = dict[str, Any]
 Phase = Literal["acquisition", "finalization", "terminal"]
@@ -710,13 +710,39 @@ class PhasePlanner:
 
     def phases_for(self, payload: JsonObject) -> tuple[Phase, ...]:
         if payload.get("tools") and payload.get("response_format"):
-            if (
-                payload.get("tool_choice") == "none"
-                and response_schema_contract(payload["response_format"]).strict_primitive_object
-            ):
+            if _safe_none_finalization(payload):
                 return ("finalization",)
             return ("acquisition", "finalization")
         return ("terminal",)
+
+
+def _safe_none_finalization(payload: JsonObject) -> bool:
+    """Accept an explicit terminal continuation only after safe transcript reconstruction."""
+    if payload.get("tool_choice") != "none":
+        return False
+    contract = response_schema_contract(payload.get("response_format"))
+    if not contract.strict_primitive_object:
+        return False
+    try:
+        tools, roles, _ = prepare_tools(payload.get("tools"), ToolRoles())
+        rebuilt = reconstruct(
+            payload.get("messages"),
+            available_tools={str(tool["function"]["name"]) for tool in tools},
+            roles=roles,
+            contract=contract,
+            require_receipt=True,
+        )
+    except (PolicyAnnotationError, TypeError, ValueError):
+        return False
+    harness = rebuilt.harness
+    return (
+        bool(harness.receipts)
+        and harness.receipts[-1].status == "success"
+        and not rebuilt.degraded
+        and not harness.pending_verification
+        and not harness.open_failures
+        and not harness.last_action_blocked
+    )
 
 
 def request_fingerprints(

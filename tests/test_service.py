@@ -418,6 +418,11 @@ async def test_phase_split_none_with_tools_and_strict_schema_starts_in_finalizat
             {"role": "assistant", "tool_calls": [call("old", "run_tests", "{} ")]},
             {"role": "tool", "tool_call_id": "old", "content": "1 failed"},
         ],
+        [
+            {"role": "user", "content": "inspect"},
+            {"role": "assistant", "tool_calls": [call("old", "read_file", '{"path":"a.py"}')]},
+            {"role": "tool", "tool_call_id": "old", "content": "error: failed"},
+        ],
     ),
 )
 async def test_phase_split_none_starts_in_acquisition_when_transcript_is_not_safe_to_finalize(

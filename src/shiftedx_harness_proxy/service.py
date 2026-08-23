@@ -225,6 +225,7 @@ class ChatService:
             use_phase_split
             and forwarded.get("tool_choice") == "none"
             and bool(harness.receipts)
+            and harness.receipts[-1].status == "success"
             and not rebuilt.degraded
             and not harness.pending_verification
             and not harness.open_failures
