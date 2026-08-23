@@ -3661,7 +3661,7 @@ def test_benchmarking_manifest_example_is_duplicate_rejecting_json_with_c1_model
     assert len(campaign["slots"]) == 6
     assert runtime["benchmark"]["sampler_profile"] == "ornith-productization-v1"
     assert "--ssd-session-cache=on" in model["required_launch_flags"]
-    assert runtime["benchmark"]["scenario_count"] > 0
+    assert runtime["benchmark"]["scenario_count"] == 30
     assert "restart it from the exact frozen model" in document
     assert "Preflight always sends" in document
 

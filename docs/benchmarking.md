@@ -173,7 +173,7 @@ uses `"schema_version": "1.0"` and exactly these keys:
       "agentic_set": "expanded",
       "sampler_profile": "ornith-productization-v1",
       "scenario_order_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-      "scenario_count": 22
+      "scenario_count": 30
     },
     "campaign": {
       "campaign_id": "qualification-2026-08-20",
