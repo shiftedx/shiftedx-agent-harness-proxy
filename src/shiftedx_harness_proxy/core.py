@@ -19,8 +19,10 @@ HARNESS_PROFILE = "shiftedx-harness-v1"
 HARNESS_SYSTEM_SUFFIX = (
     "\n\nMaintain receipt-grounded work state. After failure, change the action or arguments. Never "
     "repeat an identical call in an unchanged state epoch. Successful reads do not resolve failed "
-    "checks. Verify after mutation. Trust structured status over incidental words. Return the exact "
-    "requested format without fences."
+    "checks. Verify after mutation. Only downstream-visible assistant tool-call IDs paired with "
+    "client-supplied role=tool results count as executed. A shiftedx_harness blocked result is a "
+    "proxy decision, not a client execution. Trust structured status over incidental words. Return "
+    "the exact requested format without fences."
 )
 DEFAULT_MUTATION_TOOLS = frozenset(
     {"apply_patch", "edit_file", "str_replace_editor", "write_file"}
@@ -278,6 +280,8 @@ class AgentHarness:
         return json.dumps(
             {
                 "shiftedx_harness": "duplicate_call_blocked",
+                "execution_status": "blocked_not_executed",
+                "fact": "This proposed call was blocked by the proxy and did not reach the client executor.",
                 "prior_receipt": prior.receipt_id,
                 "instruction": (
                     "The prior successful receipt is sufficient. Return the required final answer now."
