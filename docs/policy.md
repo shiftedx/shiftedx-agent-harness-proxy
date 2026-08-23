@@ -3,7 +3,9 @@
 ## Trust boundary
 
 The proxy sees only client-supplied messages, public tool schemas, emitted tool calls, paired public
-tool results, a declared response schema, and safe upstream status/timing. It must never receive
+tool results, a declared response schema, safe upstream status/timing, and—only in an experimental
+server-selected capability mode—a bounded private capability document immediately reduced to its
+allowlisted schema version, runtime identity, source revision, and feature contract. It must never receive
 expected benchmark answers, hidden tests, required-call sets, grader results, holdout secrets, or
 private evaluation artifacts. The upstream URL is fixed at process start. The proxy never executes
 a tool or fabricates a successful receipt.
@@ -188,9 +190,11 @@ an ordinary single upstream request.
 `combined_v1` is an experimental, process-fixed mode for an upstream that natively supports tools
 and a strict terminal schema in one Chat Completions request. Before forwarding such a request, the
 proxy performs a bounded authenticated `GET /v1/mtplx/app/capabilities` probe and requires exactly
-the supported `native_tool_or_strict_json_schema:v1` contract. A missing, false, malformed, or
-drifted signal fails closed with `upstream_combined_capability_unavailable`; the capability document
-is not exposed downstream. This mode is not part of the qualified MTPLX contract until a versioned
+the supported `native_tool_or_strict_json_schema:v1` contract together with a versioned MTPLX runtime
+and immutable source revision. A missing, false, malformed, or drifted signal fails closed with
+`upstream_combined_capability_unavailable`; a tools request with a non-strict or locally unsupported
+schema fails before the probe with `unsupported_combined_schema`. The capability document is not
+exposed downstream. This mode is not part of the qualified MTPLX contract until a versioned
 upstream artifact and model-backed preflight prove native tool calls, terminal schema enforcement,
 reasoning/tool transcript compatibility, cache behavior, and standard Chat Completions semantics.
 Qualification therefore continues to require `phase_split`.

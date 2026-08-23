@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
@@ -12,6 +13,9 @@ JsonObject = dict[str, Any]
 ToolResponseCapabilityMode = Literal["passthrough", "phase_split", "combined_v1"]
 CapabilityPhase = Literal["acquisition", "finalization"]
 COMBINED_TOOL_TERMINAL_CONTRACT_ID = "native_tool_or_strict_json_schema:v1"
+COMBINED_CAPABILITY_SCHEMA_VERSION = "1.0"
+_SOURCE_REVISION = re.compile(r"^[0-9a-f]{40}$")
+_RUNTIME_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[+.-][0-9A-Za-z.-]+)?$")
 
 # This is deliberately process-local accounting context, not request payload metadata.
 # BoundedUpstream reads it only after it owns an upstream slot, immediately before
@@ -50,14 +54,25 @@ def requires_combined_capability(
     *,
     has_tools: bool,
     has_response_format: bool,
+    strict_schema_supported: bool,
 ) -> bool:
     """Return whether this request uses the native combined upstream grammar."""
-    return mode == "combined_v1" and has_tools and has_response_format
+    return mode == "combined_v1" and has_tools and has_response_format and strict_schema_supported
 
 
 def combined_tool_terminal_schema_supported(document: Any) -> bool:
     """Accept only the exact, versioned upstream combined-grammar signal."""
-    if not isinstance(document, dict):
+    if not isinstance(document, dict) or document.get("schema_version") != COMBINED_CAPABILITY_SCHEMA_VERSION:
+        return False
+    runtime = document.get("runtime")
+    if (
+        not isinstance(runtime, dict)
+        or runtime.get("name") != "mtplx"
+        or not isinstance(runtime.get("version"), str)
+        or _RUNTIME_VERSION.fullmatch(runtime["version"]) is None
+        or not isinstance(runtime.get("source_revision"), str)
+        or _SOURCE_REVISION.fullmatch(runtime["source_revision"]) is None
+    ):
         return False
     features = document.get("features")
     if not isinstance(features, dict):

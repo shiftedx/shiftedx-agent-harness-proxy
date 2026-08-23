@@ -811,7 +811,11 @@ def _valid_observer(record: ModelBoundaryRecord, expected_sequence: int) -> bool
     ):
         return False
     compatibility = record.fields.get("compatibility")
-    return isinstance(compatibility, Mapping) and compatibility.get("phase") in {"acquisition", "finalization"}
+    return isinstance(compatibility, Mapping) and compatibility.get("phase") in {
+        "acquisition",
+        "finalization",
+        "terminal",
+    }
 
 
 def _valid_request_scalars(record: object) -> bool:
@@ -900,18 +904,21 @@ def _phase_counts_match(
         else:
             selected = observers[cast(int, record.attempt_sequence_start) - 1 : cast(int, record.attempt_sequence_end)]
         counts = {"acquisition": 0, "finalization": 0}
+        terminal_count = 0
         for observer in selected:
             compatibility = observer.fields.get("compatibility")
             phase = compatibility.get("phase") if isinstance(compatibility, Mapping) else None
-            if phase not in counts:
+            if phase == "terminal":
+                terminal_count += 1
+            elif phase not in counts:
                 return False
-            if phase == "acquisition":
+            elif phase == "acquisition":
                 counts["acquisition"] += 1
             else:
                 counts["finalization"] += 1
         if dict(record.phase_counts) != counts:
             return False
-        distinct_phases = sum(value > 0 for value in counts.values())
+        distinct_phases = sum(value > 0 for value in counts.values()) + int(terminal_count > 0)
         if record.retry_attempt_count != record.attempt_count - distinct_phases:
             return False
     return True

@@ -136,14 +136,15 @@ class ChatService:
 
         contract = response_schema_contract(forwarded.get("response_format"))
         if (
-            self.settings.upstream_tool_response_capability_mode == "phase_split"
+            self.settings.upstream_tool_response_capability_mode in {"phase_split", "combined_v1"}
             and tools
             and "response_format" in forwarded
             and not contract.strict_primitive_object
         ):
+            mode = self.settings.upstream_tool_response_capability_mode
             raise ProxyError(
                 400,
-                "unsupported_phase_split_schema",
+                "unsupported_phase_split_schema" if mode == "phase_split" else "unsupported_combined_schema",
                 "The selected upstream capability mode cannot safely enforce this response schema with tools.",
             )
         use_phase_split = requires_phase_split(
@@ -156,6 +157,7 @@ class ChatService:
             self.settings.upstream_tool_response_capability_mode,
             has_tools=bool(tools),
             has_response_format="response_format" in forwarded,
+            strict_schema_supported=contract.strict_primitive_object,
         )
         if use_combined and not await self.upstream.combined_tool_terminal_schema_supported():
             raise ProxyError(

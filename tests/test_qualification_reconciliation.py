@@ -441,6 +441,21 @@ def test_cold_success_reconciles_one_request_operation_phase_and_model_completio
     }
 
 
+def test_terminal_pass_through_reconciles_without_incrementing_phase_metrics(tmp_path: Path) -> None:
+    after = replace(_ZERO_METRICS, downstream_requests=1, upstream_calls=1)
+    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, after))
+
+    result = session.complete(
+        _context(),
+        [_observer(1, phase="terminal")],
+        [_request(1, start=1, end=1, attempts=1, successful=1, acquisition=0)],
+        ModelOperationSummary(requests_completed_delta=1, prime_count=0),
+        tmp_path / "reconciliation.json",
+    )
+
+    assert result.status == "passed"
+
+
 def test_request_phase_mismatch_retains_only_categorical_failed_artifact(tmp_path: Path) -> None:
     after = replace(_ZERO_METRICS, downstream_requests=1, upstream_calls=1, phase_acquisition=1)
     session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, after))

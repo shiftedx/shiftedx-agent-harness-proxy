@@ -770,7 +770,7 @@ def finalize_timing_evidence(
             if not isinstance(raw_attempts, list) or len(raw_attempts) != len(selected):
                 raise TimingFailure("qualification_timing_ledger_invalid")
             raw_phases = capture.get("phase_counts")
-            if not isinstance(raw_phases, Mapping) or raw_phases.get("terminal", 0) != 0:
+            if not isinstance(raw_phases, Mapping):
                 raise TimingFailure("qualification_timing_ledger_invalid")
             phase_counts = {name: _integer(raw_phases.get(name)) for name in ("acquisition", "finalization")}
             final_request = RequestAccountingRecord(
@@ -795,9 +795,8 @@ def finalize_timing_evidence(
             observed_phase_counts = {"acquisition": 0, "finalization": 0}
             for observer in selected:
                 phase = _observer_phase(observer.get("fields"))
-                if phase not in observed_phase_counts:
-                    raise TimingFailure("qualification_timing_ledger_invalid")
-                observed_phase_counts[phase] += 1
+                if phase in observed_phase_counts:
+                    observed_phase_counts[phase] += 1
             if (
                 provisional_request.sequence != sequence
                 or provisional_request.attempt_count != len(selected)

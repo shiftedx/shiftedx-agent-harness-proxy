@@ -4,7 +4,10 @@ from pydantic import SecretStr
 
 from shiftedx_harness_proxy.config import Settings
 from shiftedx_harness_proxy.errors import UpstreamFailure, UpstreamTimeout
-from shiftedx_harness_proxy.provider_capabilities import COMBINED_TOOL_TERMINAL_CONTRACT_ID
+from shiftedx_harness_proxy.provider_capabilities import (
+    COMBINED_CAPABILITY_SCHEMA_VERSION,
+    COMBINED_TOOL_TERMINAL_CONTRACT_ID,
+)
 from shiftedx_harness_proxy.transport import UPSTREAM_KEEPALIVE_EXPIRY_SECONDS, HttpxUpstream
 
 
@@ -56,6 +59,8 @@ async def test_combined_capability_probe_is_bounded_and_does_not_forward_request
         return httpx.Response(
             200,
             json={
+                "schema_version": COMBINED_CAPABILITY_SCHEMA_VERSION,
+                "runtime": {"name": "mtplx", "version": "2.9.0", "source_revision": "a" * 40},
                 "features": {
                     "combined_tool_terminal_schema": {
                         "supported": True,

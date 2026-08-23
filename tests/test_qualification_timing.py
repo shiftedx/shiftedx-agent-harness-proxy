@@ -312,6 +312,72 @@ def test_proxy_finalization_rejects_outcome_join_mismatch_without_final_artifact
     assert not final_timing.exists()
 
 
+def test_proxy_finalization_reconciles_ordinary_terminal_attempt(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.jsonl"
+    provisional = tmp_path / "provisional.jsonl"
+    provisional_accounting = tmp_path / "provisional-accounting.jsonl"
+    final_timing = tmp_path / "final-timing.jsonl"
+    final_request = tmp_path / "final-request.jsonl"
+    observer = _observer(phase="terminal")
+    capture = _capture(attempts=[_capture_attempt(phase="terminal")])
+    raw.write_bytes(canonical_json(capture) + b"\n")
+    raw.chmod(0o600)
+    provisional.write_text(
+        json.dumps(
+            {
+                "pair_ordinal": 1,
+                "arm": "proxy",
+                "cache_lane": "cold",
+                "client_wall_ns": capture["downstream_wall_ns"],
+                "outcome": "succeeded",
+                "observer_sequence_start": 1,
+                "observer_sequence_end": 1,
+                "observer_record_count": 1,
+                "direct_attempt_wall_ns": [],
+                "downstream_request_sha256": "d" * 64,
+            },
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    provisional.chmod(0o600)
+    write_request_accounting_ledger(
+        provisional_accounting,
+        (
+            RequestAccountingRecord(
+                sequence=1,
+                outcome="succeeded",
+                local_projection=False,
+                attempt_sequence_start=1,
+                attempt_sequence_end=1,
+                attempt_count=1,
+                successful_attempt_count=1,
+                phase_counts={"acquisition": 0, "finalization": 0},
+                retry_attempt_count=0,
+                blocked_duplicate_count=0,
+                blocked_stall_count=0,
+            ),
+        ),
+    )
+
+    rows = finalize_timing_evidence(
+        arm="proxy",
+        cache_lane="cold",
+        provisional_client_path=provisional,
+        provisional_request_path=provisional_accounting,
+        final_request_path=final_request,
+        raw_capture_path=raw,
+        timing_path=final_timing,
+        observer_records=[observer],
+    )
+
+    assert rows[0]["phase_counts"] == {"acquisition": 0, "finalization": 0, "terminal": 1}
+    assert rows[0]["intervention_class"] == "pass_through"
+    assert final_request.exists()
+    assert final_timing.exists()
+
+
 @pytest.mark.parametrize(
     "mutator",
     [

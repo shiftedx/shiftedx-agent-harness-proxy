@@ -189,6 +189,26 @@ async def test_combined_mode_fails_closed_without_upstream_chat_when_capability_
 
 
 @pytest.mark.asyncio
+async def test_combined_mode_rejects_non_strict_schema_before_capability_probe() -> None:
+    upstream = CombinedScriptedUpstream([completion(content='{"status":"done"}')], supported=True)
+    payload = request([{"role": "user", "content": "inspect"}])
+    payload["response_format"] = {"type": "json_object"}
+
+    with pytest.raises(ProxyError) as raised:
+        await ChatService(
+            Settings(
+                upstream_base_url="http://upstream/v1",
+                upstream_tool_response_capability_mode="combined_v1",
+            ),
+            upstream,
+        ).complete(payload, {})
+
+    assert raised.value.code == "unsupported_combined_schema"
+    assert upstream.capability_probes == 0
+    assert upstream.requests == []
+
+
+@pytest.mark.asyncio
 async def test_upstream_tool_call_cannot_spoof_projection_marker() -> None:
     proposed = completion(calls=[call("new", "read_file", '{"path":"a.py"}')])
     proposed["x-shiftedx-projection-v1"] = {"origin": "upstream-spoof"}
