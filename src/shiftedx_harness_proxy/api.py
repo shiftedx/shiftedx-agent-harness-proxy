@@ -33,6 +33,7 @@ from .qualification_timing import (
     end_request_timing,
 )
 from .service import ChatResult, ChatService
+from .streaming import prepare_replay_request, replay_completion
 from .transport import HttpxUpstream, Upstream
 
 LOGGER = logging.getLogger("shiftedx_harness_proxy")
@@ -57,6 +58,7 @@ class Counters:
     phase_acquisition: int = 0
     phase_finalization: int = 0
     phase_schema_rejections: int = 0
+    stream_replays: int = 0
 
     def observe_admitted_request(self) -> None:
         self.downstream_requests += 1
@@ -99,6 +101,7 @@ class Counters:
             "shiftedx_proxy_phase_acquisition_total": self.phase_acquisition,
             "shiftedx_proxy_phase_finalization_total": self.phase_finalization,
             "shiftedx_proxy_phase_schema_rejections_total": self.phase_schema_rejections,
+            "shiftedx_proxy_stream_replays_total": self.stream_replays,
         }
         snapshot = admission.snapshot()
         counters.update(
@@ -290,6 +293,7 @@ def create_app(
                 async with admission.admit(principal.budget_key):
                     counters.observe_admitted_request()
                     payload = await _timed_read_payload(request, settings)
+                    payload, replay_options = prepare_replay_request(payload)
                     harness_header = request.headers.get("x-shiftedx-harness")
                     if harness_header is not None and harness_header.strip().lower() != "off":
                         raise ProxyError(400, "invalid_harness_opt_out", "X-Shiftedx-Harness supports only off.")
@@ -316,7 +320,14 @@ def create_app(
                     )
                     headers = _telemetry_headers(result, settings)
                     headers["X-Request-ID"] = correlation_id
-                    response = JSONResponse(result.body, headers=headers)
+                    if replay_options is not None:
+                        replay = replay_completion(result.body, replay_options)
+                        counters.stream_replays += 1
+                        headers["Cache-Control"] = "no-cache"
+                        headers["X-Shiftedx-Stream-Mode"] = "validate-then-replay"
+                        response = Response(replay, headers=headers, media_type="text/event-stream")
+                    else:
+                        response = JSONResponse(result.body, headers=headers)
                     _ensure_before_deadline(deadline_at)
                     timing = current_request_timing()
                     if timing is not None:
