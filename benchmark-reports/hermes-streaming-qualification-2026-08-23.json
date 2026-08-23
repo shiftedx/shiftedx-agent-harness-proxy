@@ -1,0 +1,16 @@
+{
+  "downstream_request_count": 3,
+  "downstream_stream_options_include_usage": true,
+  "downstream_stream_request_count": 2,
+  "downstream_stream_requested": true,
+  "hermes_exit_code": 0,
+  "hermes_version": "Hermes Agent v0.20.4 (2026.8.18) \u00b7 upstream 8794e5a2",
+  "passed": true,
+  "schema_version": "1.0",
+  "stream_replay_count": 2,
+  "terminal_answer_observed": true,
+  "tool_result_matches_call": true,
+  "tool_result_observed": true,
+  "upstream_request_count": 3,
+  "upstream_stream_controls_removed": true
+}
