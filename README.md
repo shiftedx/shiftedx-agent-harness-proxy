@@ -40,8 +40,7 @@ SERVED_MODEL=your-openai-model-id
   --draft-temperature 1 --draft-top-p .95 --draft-top-k 20 --no-stats-footer
 
 UPSTREAM_BASE_URL=http://host.docker.internal:8000/v1 \
-UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE=phase_split \
-INTERVENTION_FAST_PATH_MODE=disabled docker compose up --build -d
+UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE=phase_split docker compose up --build -d
 ```
 
 Keep an opaque Chat Completions `user` value stable per conversation for MTPLX session affinity.
@@ -187,7 +186,6 @@ projection, parallel calls, and degraded transcript behavior.
 | `PROXY_API_KEY` | unset | Independent client-facing bearer token |
 | `TRUSTED_POLICY_EXTENSION_API_KEYS` | unset | Distinct comma-separated opaque bearer capabilities allowed to disable receipt requirements or override protected tool roles |
 | `ALLOW_HARNESS_OPT_OUT` | `false` | Allows only trusted policy-extension principals to send `X-Shiftedx-Harness: off` |
-| `INTERVENTION_FAST_PATH_MODE` | `disabled` | `shadow` requires an explicitly injected observer; no durable qualification sink is wired; `enabled` fails closed pending signed promotion authority |
 | `UPSTREAM_CACHE_CAPABILITY_MODE` | `disabled` | Generic cache capability profile; `disabled` and `unknown` reject client namespace controls |
 | `UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE` | `passthrough` | `phase_split` is the qualified MTPLX fallback; experimental `combined_v1` requires the exact upstream capability contract and remains outside qualification |
 | `UPSTREAM_CACHE_NAMESPACE_FIELDS` | unset | Comma-separated, nonblank additional top-level client cache namespace field names to reject |

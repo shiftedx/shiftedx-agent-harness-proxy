@@ -213,24 +213,6 @@ upstream artifact and model-backed preflight prove native tool calls, terminal s
 reasoning/tool transcript compatibility, cache behavior, and standard Chat Completions semantics.
 Qualification therefore continues to require `phase_split`.
 
-### Intervention fast-path shadow mode
-
-`INTERVENTION_FAST_PATH_MODE=disabled` is the default. `shadow` is a process-fixed observation mode:
-after validation and transcript reconstruction it admits only an empty-tool, no-receipt-extension,
-no-schema, no-tool-choice, non-degraded request with no policy state or phase capability work. It
-still sends the ordinary full harness payload. A private injected observer may retain only the two
-payload hashes, equivalence boolean, and reason category after proving that the candidate differs
-solely by the versioned harness suffix and rendered state. No request content, client header, or body
-field can select the mode. The ordinary production `create_app` entry point rejects `shadow` unless
-the caller explicitly injects an observer. That interface alone does not prove the observer is
-private, durable, or no-clobber; the live qualification sink is not yet wired to provide those
-properties, so attempting shadow qualification is a categorical configuration failure. `enabled`
-is rejected at startup until an immutable signed promotion authority and
-model-backed parity corpus are available. Shadow records bind the fixed eligibility contract
-`server_harness_passthrough_no_policy_work:v1` and mutation contract
-`shiftedx_harness_v1:system_suffix_and_state_prompt:v1` so later evidence cannot merge changed
-semantics.
-
 `/metrics` exposes only aggregate counters:
 `shiftedx_proxy_phase_acquisition_total`, `shiftedx_proxy_phase_finalization_total`, and
 `shiftedx_proxy_phase_schema_rejections_total`, and `shiftedx_proxy_stream_replays_total`. They have

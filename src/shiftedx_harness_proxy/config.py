@@ -15,7 +15,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .cache_policy import CacheCapabilityMode, cache_namespace_field_names
 from .core import HARNESS_PROFILE, ToolRoles
-from .fast_path import FastPathMode
 from .provider_capabilities import ToolResponseCapabilityMode
 
 _HTTP_BEARER_TOKEN = re.compile(r"[A-Za-z0-9\-._~+/]+={0,}")
@@ -65,7 +64,6 @@ class Settings(BaseSettings):
     telemetry_enabled: bool = False
     metrics_enabled: bool = True
     allow_harness_opt_out: bool = False
-    intervention_fast_path_mode: FastPathMode = "disabled"
     log_level: str = "INFO"
     cors_allow_origins: str | None = None
     require_receipt_when_tools_present: bool = True
@@ -130,10 +128,6 @@ class Settings(BaseSettings):
         ):
             raise ValueError(
                 "TRUSTED_POLICY_EXTENSION_API_KEYS must not include the ordinary PROXY_API_KEY"
-            )
-        if self.intervention_fast_path_mode == "enabled":
-            raise ValueError(
-                "INTERVENTION_FAST_PATH_MODE=enabled requires an immutable signed promotion authority"
             )
         return self
 
