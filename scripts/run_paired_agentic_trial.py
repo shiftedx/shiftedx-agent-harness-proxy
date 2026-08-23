@@ -691,6 +691,8 @@ class CompatibilityClient:
                 return self._complete_proxy(payload, phases)
             if phases == ("terminal",):
                 return self._complete_direct("terminal", payload)
+            if phases == ("finalization",):
+                return self._complete_direct("finalization", self.planner.plan(payload, phase="finalization"))
             response = self._complete_direct("acquisition", self.planner.plan(payload, phase="acquisition"))
             if response.get("tool_calls"):
                 return response

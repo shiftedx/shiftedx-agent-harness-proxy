@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from .core import HARNESS_SYSTEM_SUFFIX
+from .transcript import response_schema_contract
 
 JsonObject = dict[str, Any]
 Phase = Literal["acquisition", "finalization", "terminal"]
@@ -709,6 +710,11 @@ class PhasePlanner:
 
     def phases_for(self, payload: JsonObject) -> tuple[Phase, ...]:
         if payload.get("tools") and payload.get("response_format"):
+            if (
+                payload.get("tool_choice") == "none"
+                and response_schema_contract(payload["response_format"]).strict_primitive_object
+            ):
+                return ("finalization",)
             return ("acquisition", "finalization")
         return ("terminal",)
 

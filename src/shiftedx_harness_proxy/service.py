@@ -221,6 +221,16 @@ class ChatService:
         upstream_calls = 0
         internal_retries = 0
         phase: CapabilityPhase | None = "acquisition" if use_phase_split else None
+        if (
+            use_phase_split
+            and forwarded.get("tool_choice") == "none"
+            and bool(harness.receipts)
+            and not rebuilt.degraded
+            and not harness.pending_verification
+            and not harness.open_failures
+            and not harness.last_action_blocked
+        ):
+            phase = "finalization"
 
         while upstream_calls < self.settings.max_upstream_calls:
             if use_phase_split and harness.force_finalize:

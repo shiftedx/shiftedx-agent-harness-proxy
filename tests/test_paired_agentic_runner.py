@@ -545,6 +545,15 @@ def test_phase_planner_splits_tools_and_terminal_schema(monkeypatch):
     assert payload["max_tokens"] == 1024
 
 
+def test_phase_planner_skips_acquisition_for_none_with_tools_and_strict_schema(monkeypatch):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    payload = runner.request_payload(scenario, model="model", proxy_policy=False)
+    payload["tool_choice"] = "none"
+
+    assert runner.PhasePlanner().phases_for(payload) == ("finalization",)
+
+
 @pytest.mark.parametrize("arm", ("direct", "proxy"))
 def test_preflight_post_tool_continuation_disables_additional_tool_calls_for_both_arms(monkeypatch, arm):
     runner = load_runner(monkeypatch)
@@ -2069,11 +2078,7 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
                 observed_payloads = (
                     (planner.plan(payload, phase="acquisition"),)
                     if payload.get("tools") and (should_call_tool or not finalization_requested)
-                    else (
-                        planner.plan(payload, phase="acquisition"),
-                        planner.plan(payload, phase="acquisition"),
-                        planner.plan(payload, phase="finalization"),
-                    )
+                    else (planner.plan(payload, phase="finalization"),)
                     if payload.get("tools")
                     else (payload,)
                 )
@@ -2101,7 +2106,7 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
             if self.is_proxy:
                 response[runner.PROXY_RESPONSE_ACCOUNTING] = {
                     "upstream_calls": len(observed_payloads),
-                    "corrections": int(finalization_requested),
+                    "corrections": 0,
                     "blocked_duplicates": 0,
                     "blocked_stalls": 0,
                 }
@@ -2140,9 +2145,8 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
 
     assert '"status":"passed"' in args.output.read_text()
     direct_attempts = read_model_boundary_observer_records(args.direct_model_attempt_ledger)
-    assert [record.sequence for record in direct_attempts] == [1, 2, 3, 4]
+    assert [record.sequence for record in direct_attempts] == [1, 2, 3]
     assert [record.fields["compatibility"]["phase"] for record in direct_attempts] == [
-        "acquisition",
         "acquisition",
         "finalization",
         "finalization",
@@ -2151,8 +2155,6 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
     assert all(record.cache.request_session_bank_bypass for record in direct_attempts if record.cache)
     proxy_attempts = read_model_boundary_observer_records(observer)
     assert [record.fields["compatibility"]["phase"] for record in proxy_attempts] == [
-        "acquisition",
-        "acquisition",
         "acquisition",
         "finalization",
         "finalization",
@@ -2165,15 +2167,15 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
         "direct": 1,
         "proxy": 1,
     }
-    assert tool_records["proxy"]["proxy_phase_counts"] == {"acquisition": 3, "finalization": 1}
-    assert tool_records["proxy"]["proxy_correction_count"] == 1
+    assert tool_records["proxy"]["proxy_phase_counts"] == {"acquisition": 1, "finalization": 1}
+    assert tool_records["proxy"]["proxy_correction_count"] == 0
     proxy_requests = read_request_accounting_ledger(args.proxy_request_ledger)
     assert [record.phase_counts for record in proxy_requests] == [
         {"acquisition": 1, "finalization": 0},
-        {"acquisition": 2, "finalization": 1},
+        {"acquisition": 0, "finalization": 1},
         {"acquisition": 0, "finalization": 1},
     ]
-    assert [record.correction_count for record in proxy_requests] == [0, 1, 0]
+    assert [record.correction_count for record in proxy_requests] == [0, 0, 0]
 
 
 def test_stale_proxy_observer_ledger_is_rejected_without_overwriting_it(monkeypatch, tmp_path):

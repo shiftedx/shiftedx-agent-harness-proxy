@@ -374,7 +374,7 @@ async def test_phase_split_builds_a_fresh_outbound_payload_for_each_attempt() ->
 
 
 @pytest.mark.asyncio
-async def test_phase_split_releases_a_valid_receipt_backed_acquisition_terminal_without_finalization() -> None:
+async def test_phase_split_none_with_tools_and_strict_schema_starts_in_finalization() -> None:
     upstream = ScriptedUpstream([completion(content='{"status":"done"}')])
     payload = request(
         [
@@ -384,6 +384,7 @@ async def test_phase_split_releases_a_valid_receipt_backed_acquisition_terminal_
         ]
     )
     payload["response_format"] = strict_schema()
+    payload["tool_choice"] = "none"
 
     result = await ChatService(
         Settings(upstream_base_url="http://upstream/v1", upstream_tool_response_capability_mode="phase_split"),
@@ -393,7 +394,48 @@ async def test_phase_split_releases_a_valid_receipt_backed_acquisition_terminal_
     assert result.body["choices"][0]["message"]["content"] == '{"status":"done"}'
     assert result.telemetry.upstream_calls == 1
     assert len(upstream.requests) == 1
-    assert "tools" in upstream.requests[0]
+    assert upstream.requests[0]["response_format"] == payload["response_format"]
+    assert "tools" not in upstream.requests[0]
+    assert "tool_choice" not in upstream.requests[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "messages",
+    (
+        [{"role": "user", "content": "inspect"}],
+        [
+            {"role": "user", "content": "inspect"},
+            {"role": "assistant", "tool_calls": [call("old", "read_file", '{"path":"a.py"}')]},
+        ],
+        [
+            {"role": "user", "content": "inspect"},
+            {"role": "assistant", "tool_calls": [call("old", "apply_patch", "{} ")]},
+            {"role": "tool", "tool_call_id": "old", "content": "Patch applied."},
+        ],
+        [
+            {"role": "user", "content": "inspect"},
+            {"role": "assistant", "tool_calls": [call("old", "run_tests", "{} ")]},
+            {"role": "tool", "tool_call_id": "old", "content": "1 failed"},
+        ],
+    ),
+)
+async def test_phase_split_none_starts_in_acquisition_when_transcript_is_not_safe_to_finalize(
+    messages: list[dict[str, Any]],
+) -> None:
+    allowed = call("new", "read_file", '{"path":"b.py"}')
+    upstream = ScriptedUpstream([completion(calls=[allowed])])
+    payload = request(messages)
+    payload["response_format"] = strict_schema()
+    payload["tool_choice"] = "none"
+
+    result = await ChatService(
+        Settings(upstream_base_url="http://upstream/v1", upstream_tool_response_capability_mode="phase_split"),
+        upstream,
+    ).complete(payload, {})
+
+    assert result.body["choices"][0]["message"]["tool_calls"] == [allowed]
+    assert upstream.requests[0]["tools"] == payload["tools"]
     assert "response_format" not in upstream.requests[0]
 
 
