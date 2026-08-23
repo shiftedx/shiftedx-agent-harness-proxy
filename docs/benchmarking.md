@@ -327,6 +327,12 @@ not excluded from the ratio. The private campaign outcome records only the cohor
 aggregate p95/ratio fields—never case IDs or prompts—and its status cannot be `passed` until this
 gate passes.
 
+Before cohort selection, the terminal check verifies each scored ledger against the SHA-256 recorded
+in that slot's immutable runtime outcome, then requires all `scenario_count` rows to have unique
+case IDs in the manifest's hashed order and valid family, outcome, and timing fields. Thus a later
+ledger rewrite, duplicate, or non-cohort relabel cannot hide a failed policy-benefit case or improve the
+ratio.
+
 `cache_lane` is measured proof, not a `cache_proof_sha256` self-assertion. Preflight always sends
 `--cache-mode bypass`, including a later `warm-prefix` campaign: every successful preflight attempt
 must report bypass, no RAM or SSD hit, zero cached tokens, a full new prefill, and no postcommit

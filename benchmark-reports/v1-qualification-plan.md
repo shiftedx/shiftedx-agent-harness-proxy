@@ -112,6 +112,12 @@ A missing, malformed, failed, zero-sample, or
 mismatched row is a terminal failed gate, never a reason to remove it from the calculation. The
 published campaign outcome contains hash/count and aggregate timing only.
 
+Before filtering that fixed cohort, the terminal campaign verifies every scored ledger against its
+immutable runtime-outcome ledger digest and verifies the full 30-case ordered ledger against the
+manifest's scenario-order hash. Every row must have a unique case ID and valid family, outcome, and
+runner timing, so a duplicate or relabelled row cannot hide a failed policy-benefit case to improve
+the ratio.
+
 ## Cache lanes
 
 Cold and warm-prefix results are separate datasets.
