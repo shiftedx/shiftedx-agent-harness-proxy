@@ -376,6 +376,7 @@ def load_runtime_outcome(
     slot_ordinal: int | None = None,
     cache_lane: Literal["preflight", "cold", "warm-prefix"] | None = None,
     pair_index: int | None = None,
+    campaign_version: Literal["v1", "v2"] = "v1",
 ) -> RuntimeOutcome:
     """Load a passed outcome bound to the exact private attestation and output bytes."""
 
@@ -454,6 +455,7 @@ def load_runtime_outcome(
             slot_ordinal=slot_ordinal,
             cache_lane=cache_lane,
             pair_index=pair_index,
+            campaign_version=campaign_version,
         )
         or not _valid_outcome_reconciliation(
             document,
@@ -466,6 +468,7 @@ def load_runtime_outcome(
             slot_ordinal=slot_ordinal,
             cache_lane=cache_lane,
             pair_index=pair_index,
+            campaign_version=campaign_version,
         )
     ):
         raise RuntimeOutcomeFailure("runtime_outcome_invalid")
@@ -493,6 +496,7 @@ def _valid_outcome_campaign_identity(
     slot_ordinal: int | None,
     cache_lane: Literal["preflight", "cold", "warm-prefix"] | None,
     pair_index: int | None,
+    campaign_version: Literal["v1", "v2"],
 ) -> bool:
     actual = (
         document.get("campaign_id_sha256"),
@@ -514,11 +518,17 @@ def _valid_outcome_campaign_identity(
     if expected_stage == "preflight":
         if (actual[1], actual[2], actual[3]) != (0, "preflight", 0):
             return False
-    elif actual[2] == "cold":
+    elif campaign_version == "v1" and actual[2] == "cold":
         if not (actual[1] in {1, 2, 3} and actual[3] == actual[1]):
             return False
-    elif actual[2] == "warm-prefix":
+    elif campaign_version == "v1" and actual[2] == "warm-prefix":
         if not (actual[1] in {4, 5, 6} and actual[3] == actual[1] - 3):
+            return False
+    elif campaign_version == "v2" and actual[2] == "cold":
+        if not (actual[1] in {1, 2, 3, 4} and actual[3] == actual[1]):
+            return False
+    elif campaign_version == "v2" and actual[2] == "warm-prefix":
+        if not (actual[1] in {5, 6, 7, 8} and actual[3] == actual[1] - 4):
             return False
     else:
         return False
@@ -539,6 +549,7 @@ def _valid_outcome_reconciliation(
     slot_ordinal: int | None,
     cache_lane: Literal["preflight", "cold", "warm-prefix"] | None,
     pair_index: int | None,
+    campaign_version: Literal["v1", "v2"],
 ) -> bool:
     recorded = document.get("proxy_reconciliation_sha256")
     if expected_stage != "scored-proxy":
@@ -550,7 +561,7 @@ def _valid_outcome_reconciliation(
     try:
         from .qualification_reconciliation import load_passed_proxy_reconciliation
 
-        reconciliation = load_passed_proxy_reconciliation(reconciliation_path)
+        reconciliation = load_passed_proxy_reconciliation(reconciliation_path, campaign_version=campaign_version)
     except Exception:
         return False
     context = reconciliation.context

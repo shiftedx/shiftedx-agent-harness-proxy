@@ -6,10 +6,12 @@ import hashlib
 import importlib.util
 import io
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
+import time
 import types
 from dataclasses import replace
 from email.message import Message
@@ -2179,6 +2181,236 @@ def test_scored_direct_run_writes_actual_attempt_ledger_atomically(monkeypatch, 
     assert [row["pair_ordinal"] for row in provisional_rows] == [1, 2]
     assert all(row["outcome"] == "succeeded" for row in provisional_rows)
     assert [len(row["direct_attempt_wall_ns"]) for row in provisional_rows] == [1, 1]
+
+
+def _scored_direct_argv(
+    *,
+    output,
+    preflight,
+    source_commit,
+    image_digest,
+    runtime_attestation,
+    preflight_outcome,
+    attempts,
+    provisional,
+    v2_private_scenario_deadline_seconds: str | None = None,
+):
+    argv = [
+        "run_paired_agentic_trial.py",
+        "--base-url",
+        "http://model.invalid/v1",
+        "--model",
+        "model",
+        "--output",
+        str(output),
+        "--variant",
+        "direct",
+        "--preflight-ledger",
+        str(preflight),
+        "--candidate-source-commit",
+        source_commit,
+        "--candidate-image-digest",
+        image_digest,
+        "--run-manifest-sha256",
+        _RUN_MANIFEST_SHA256,
+        "--runtime-attestation",
+        str(runtime_attestation),
+        "--preflight-runtime-outcome",
+        str(preflight_outcome),
+        "--direct-model-attempt-ledger",
+        str(attempts),
+        "--direct-provisional-request-ledger",
+        str(provisional),
+    ]
+    if v2_private_scenario_deadline_seconds is not None:
+        argv.extend(
+            [
+                "--v2-private-scenario-deadline-seconds",
+                v2_private_scenario_deadline_seconds,
+            ]
+        )
+    return argv
+
+
+def _scored_direct_prerequisites(runner, tmp_path):
+    source_commit = _source_commit()
+    image_digest = "sha256:" + "0" * 64
+    preflight = tmp_path / "preflight.jsonl"
+    runtime_attestation = _write_passing_preflight(runner, preflight, source_commit, image_digest)
+    preflight_outcome, _direct_outcome = _write_passing_scored_prerequisites(
+        tmp_path,
+        preflight,
+        runtime_attestation,
+    )
+    return source_commit, image_digest, preflight, runtime_attestation, preflight_outcome
+
+
+def test_v2_private_scenario_deadline_retains_expiry_and_continues_later_case(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    source_commit, image_digest, preflight, runtime_attestation, preflight_outcome = _scored_direct_prerequisites(
+        runner, tmp_path
+    )
+    output = tmp_path / "scored.jsonl"
+    attempts = tmp_path / "attempts.jsonl"
+    provisional = tmp_path / "provisional.jsonl"
+    started_cases: list[str] = []
+    clients = []
+
+    class DirectClient:
+        def __init__(self, *_args, **_kwargs):
+            self.calls = 0
+            clients.append(self)
+
+        def complete(self, _payload, *, stream=False):
+            self.calls += 1
+            raise AssertionError("scenario deadline must reject this timeout-less upstream before a call")
+
+    def run_cases(*, client, model, output_path, case_id, **_kwargs):
+        started_cases.append(case_id)
+        if case_id == "case-1":
+            scenario = next(item for item in runner.scenario_set("expanded") if item.case_id == case_id)
+            client.complete(runner.request_payload(scenario, model=model, proxy_policy=False))
+        with output_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"case_id": case_id, "passed": True}) + "\n")
+        return [{"case_id": case_id}]
+
+    runner.ProjectionAwareOpenAIClient = DirectClient
+    runner.run_agentic_cases = run_cases
+    monkeypatch.setattr(
+        runner.asyncio,
+        "to_thread",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("background worker is forbidden")),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        _scored_direct_argv(
+            output=output,
+            preflight=preflight,
+            source_commit=source_commit,
+            image_digest=image_digest,
+            runtime_attestation=runtime_attestation,
+            preflight_outcome=preflight_outcome,
+            attempts=attempts,
+            provisional=provisional,
+            v2_private_scenario_deadline_seconds="0.01",
+        ),
+    )
+
+    runner.main()
+
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert [row["case_id"] for row in rows] == ["case-1", "case-2"]
+    assert rows[0]["passed"] is False
+    assert rows[0]["response"] == {"client_error": {"type": "TimeoutError", "http_status": None}}
+    assert math.isfinite(rows[0]["telemetry"]["wall_s"])
+    assert rows[0]["telemetry"]["wall_s"] > 0
+    assert rows[1]["passed"] is True
+    assert started_cases == ["case-1", "case-2"]
+    assert len(clients) == 1
+    assert clients[0].calls == 0
+    serialized = output.read_text(encoding="utf-8")
+    assert "private prompt marker" not in serialized
+    assert "case-1" not in rows[0]["error"]
+
+
+def test_v2_private_scenario_deadline_caps_and_restores_each_upstream_turn(monkeypatch):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+
+    class Upstream:
+        def __init__(self):
+            self.timeout_s = 600.0
+            self.timeouts: list[float] = []
+
+        def complete(self, _payload, *, stream=False):
+            assert stream is False
+            self.timeouts.append(self.timeout_s)
+            return _cache_response()
+
+    upstream = Upstream()
+    client = runner.CompatibilityClient(
+        upstream,
+        arm="direct",
+        scenario_order=[scenario.case_id],
+        proxy_policy=False,
+        scenario_deadline_monotonic=time.monotonic() + 1.0,
+    )
+
+    client.complete(runner.request_payload(scenario, model="model", proxy_policy=False))
+
+    assert len(upstream.timeouts) == 2
+    assert all(0 < timeout < 1.0 for timeout in upstream.timeouts)
+    assert upstream.timeout_s == 600.0
+
+
+def test_absent_v2_private_scenario_deadline_preserves_sync_runner_path(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    source_commit, image_digest, preflight, runtime_attestation, preflight_outcome = _scored_direct_prerequisites(
+        runner, tmp_path
+    )
+    output = tmp_path / "scored.jsonl"
+    attempts = tmp_path / "attempts.jsonl"
+    provisional = tmp_path / "provisional.jsonl"
+
+    class DirectClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    def run_cases(*, output_path, case_id, **_kwargs):
+        with output_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"case_id": case_id, "passed": True}) + "\n")
+        return [{"case_id": case_id}]
+
+    runner.ProjectionAwareOpenAIClient = DirectClient
+    runner.run_agentic_cases = run_cases
+    monkeypatch.setattr(
+        runner.asyncio,
+        "to_thread",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected")),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        _scored_direct_argv(
+            output=output,
+            preflight=preflight,
+            source_commit=source_commit,
+            image_digest=image_digest,
+            runtime_attestation=runtime_attestation,
+            preflight_outcome=preflight_outcome,
+            attempts=attempts,
+            provisional=provisional,
+        ),
+    )
+
+    runner.main()
+
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert [row["passed"] for row in rows] == [True, True]
+
+
+@pytest.mark.parametrize("invalid", ("0", "-1", "nan", "inf", "not-a-number"))
+def test_v2_private_scenario_deadline_rejects_nonpositive_or_nonfinite_values(monkeypatch, tmp_path, invalid):
+    runner = load_runner(monkeypatch)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_paired_agentic_trial.py",
+            "--model",
+            "model",
+            "--output",
+            str(tmp_path / "unused.jsonl"),
+            "--variant",
+            "direct",
+            "--v2-private-scenario-deadline-seconds",
+            invalid,
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        runner.main()
 
 
 def _cache_response(*, content="", tool_calls=None, bypass=False):

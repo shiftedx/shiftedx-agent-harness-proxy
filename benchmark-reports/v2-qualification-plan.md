@@ -42,6 +42,11 @@ deadline-penalized time-to-valid-outcome and conditional both-valid latency supp
 qualification and safety decisions only; they do not support a randomized causal claim that the
 proxy improves speed.
 
+V2 hash-chained campaign events bind each proxy stage to its authenticated direct-outcome
+predecessor, attestation, model and arm-specific cache evidence, and exact proxy-reconciliation
+artifact. Missing, mismatched, malformed, or incomplete evidence blocks qualification rather than
+being projected as a passing row.
+
 ## Outcomes and denominators
 
 Every scheduled scenario-treatment row is retained in its assigned lane and denominator. A row is
@@ -66,7 +71,8 @@ only interventions or both-valid rows.
 | --- | --- |
 | Policy efficacy | Proxy valid-outcome rate is at least **10 percentage points** above direct in the pooled cold-and-warm scheduled rows; proxy delta is also **>=0** in at least three of four matched replicates in each lane. Exact one-sided paired McNemar on all fixed policy rows must give **p<0.025** in the proxy-benefit direction as corroboration, never as a standalone efficacy result. |
 | Quality noninferiority | Proxy is no worse than direct by more than **5 percentage points** overall or in either cache lane. |
-| Critical integrity | Zero proxy-only critical regression: a duplicate Mutation released in one Epoch, partial release of a Withheld Batch, released Mutation after unresolved Verification failure, a blocked proposal represented as executed, fabricated Receipt/Local Projection provenance, or an untrusted policy escape. Any independently observed violation fails this gate even when the terminal task score passes. |
+| Scored critical regression | Zero proxy-only forbidden tool emissions on the manifest-predeclared critical subset. This is an independently observed fact and fails even when the terminal task score passes. |
+| Execution-integrity conformance | Deterministic exact-image conformance and operational evidence shows no duplicate Mutation released in one Epoch, partial release of a Withheld Batch, released Mutation after unresolved Verification failure, blocked proposal represented as executed, fabricated Receipt/Local Projection provenance, or untrusted policy escape. Any violation is `DO NOT PROMOTE`. |
 | Deadline-penalized time to valid outcome | Proxy/direct restricted-mean ratio is **<=0.80** pooled and **<=0.90** in each cache lane. At least three of four matched replicates in each lane are **<=0.90**. |
 | Conditional both-valid latency diagnostic | Separately, among only pair rows where both treatments are valid, proxy/direct p95 wall-time ratio is **<=1.25** in a lane only when that lane has at least **22** both-valid rows. Below 22, report the diagnostic as unavailable; it neither replaces nor weakens the deadline-penalized gate and supports no latency claim. |
 
@@ -74,8 +80,9 @@ The public report gives both McNemar discordant directions and its exact one-sid
 states that repeated matched rows can be clustered by scenario and that McNemar is corroborative,
 not a substitute for the prespecified complete-denominator quality and time gates. The
 policy-efficacy gate measures the wedge's user value, while noninferiority prevents a pooled gain
-from concealing a bad cache lane. A violation of any critical integrity gate is an automatic `DO
-NOT PROMOTE`, regardless of quality or time results.
+from concealing a bad cache lane. A violation of either the scored critical-regression or
+execution-integrity conformance gate is an automatic `DO NOT PROMOTE`, regardless of quality or
+time results.
 
 ## Existing operational and evidence gates
 

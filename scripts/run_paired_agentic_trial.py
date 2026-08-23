@@ -8,6 +8,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -108,6 +109,17 @@ _SAMPLER_PROFILES: dict[SamplerProfile, dict[str, Any]] = {
         "max_tokens": 8192,
     },
 }
+
+
+def _v2_private_scenario_deadline_seconds(value: str) -> float:
+    """Parse a private v2 whole-scenario deadline without accepting NaN or infinity."""
+    try:
+        deadline_s = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("v2 private scenario deadline must be finite and positive") from error
+    if not math.isfinite(deadline_s) or deadline_s <= 0:
+        raise argparse.ArgumentTypeError("v2 private scenario deadline must be finite and positive")
+    return deadline_s
 
 
 class _RejectAllRedirects(urllib.request.HTTPRedirectHandler):
@@ -669,6 +681,7 @@ class CompatibilityClient:
         require_cache_evidence: bool = False,
         request_accounting: ProxyRequestAccounting | None = None,
         provisional_timing: ProvisionalClientTimingLedger | None = None,
+        scenario_deadline_monotonic: float | None = None,
     ) -> None:
         self.upstream = upstream
         self.arm = arm
@@ -678,6 +691,7 @@ class CompatibilityClient:
         self.require_cache_evidence = require_cache_evidence
         self.request_accounting = request_accounting
         self.provisional_timing = provisional_timing
+        self.scenario_deadline_monotonic = scenario_deadline_monotonic
         self.planner = PhasePlanner()
         self.calls: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
         self.downstream_payloads: list[dict[str, Any]] = []
@@ -746,7 +760,7 @@ class CompatibilityClient:
         sequence = len(self._direct_attempt_records) + 1
         started_ns = time.perf_counter_ns()
         try:
-            response = self.upstream.complete(payload, stream=False)
+            response = self._complete_upstream(payload)
         except BaseException:
             self._direct_attempt_records.append(
                 model_boundary_record(
@@ -780,7 +794,7 @@ class CompatibilityClient:
             self.observer.begin_turn()
         try:
             call_started = True
-            response = self.upstream.complete(payload, stream=False)
+            response = self._complete_upstream(payload)
             if not isinstance(response, dict):
                 records = self._consume_proxy_observations(payload, require_records=True)
                 raise PreflightFailure("preflight_response_malformed")
@@ -821,6 +835,35 @@ class CompatibilityClient:
                 else:
                     self.request_accounting.record_failure(records, error)
             raise
+
+    def _complete_upstream(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Make one upstream request within the scenario budget and restore its normal timeout."""
+        remaining_s = self._remaining_scenario_budget()
+        original_timeout = getattr(self.upstream, "timeout_s", None)
+        timeout_capped = False
+        if remaining_s is not None:
+            if (
+                not isinstance(original_timeout, int | float)
+                or isinstance(original_timeout, bool)
+                or not math.isfinite(original_timeout)
+                or original_timeout <= 0
+            ):
+                raise TimeoutError("scenario deadline exceeded")
+            self.upstream.timeout_s = min(float(original_timeout), remaining_s)
+            timeout_capped = True
+        try:
+            return self.upstream.complete(payload, stream=False)
+        finally:
+            if timeout_capped:
+                self.upstream.timeout_s = original_timeout
+
+    def _remaining_scenario_budget(self) -> float | None:
+        if self.scenario_deadline_monotonic is None:
+            return None
+        remaining_s = self.scenario_deadline_monotonic - time.monotonic()
+        if not math.isfinite(remaining_s) or remaining_s <= 0:
+            raise TimeoutError("scenario deadline exceeded")
+        return remaining_s
 
     def _consume_proxy_observations(
         self, payload: dict[str, Any], *, require_records: bool
@@ -1172,6 +1215,15 @@ def main() -> None:
     parser.add_argument("--case-id", default=None)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
+        "--v2-private-scenario-deadline-seconds",
+        type=_v2_private_scenario_deadline_seconds,
+        default=None,
+        help=(
+            "Private v2-only whole-scenario deadline in seconds. It is not a per-request timeout "
+            "and is absent from v1 runs."
+        ),
+    )
+    parser.add_argument(
         "--proxy-policy",
         action="store_true",
         help="Send the proxy-only case receipt policy; never use this against a model server directly.",
@@ -1372,6 +1424,11 @@ def main() -> None:
             if args.cache_mode == "bypass":
                 overrides["metadata"] = {"cache_mode": "bypass"}
             started = time.perf_counter()
+            scenario_deadline_monotonic = (
+                time.monotonic() + args.v2_private_scenario_deadline_seconds
+                if args.v2_private_scenario_deadline_seconds is not None
+                else None
+            )
             planned_client: CompatibilityClient | None = None
             try:
                 planned_client = CompatibilityClient(
@@ -1383,18 +1440,25 @@ def main() -> None:
                     require_cache_evidence=True,
                     request_accounting=proxy_request_accounting,
                     provisional_timing=provisional_timing,
+                    scenario_deadline_monotonic=scenario_deadline_monotonic,
                 )
-                rows = run_agentic_cases(
-                    client=planned_client,
-                    model=args.model,
-                    output_path=args.output,
-                    request_overrides=overrides,
-                    variant_label=args.variant,
-                    run_id=run_id,
-                    control_profile="baseline",
-                    agentic_set=args.agentic_set,
-                    case_id=scenario.case_id,
-                )
+                run_kwargs = {
+                    "client": planned_client,
+                    "model": args.model,
+                    "output_path": args.output,
+                    "request_overrides": overrides,
+                    "variant_label": args.variant,
+                    "run_id": run_id,
+                    "control_profile": "baseline",
+                    "agentic_set": args.agentic_set,
+                    "case_id": scenario.case_id,
+                }
+                rows = run_agentic_cases(**run_kwargs)
+                if (
+                    scenario_deadline_monotonic is not None
+                    and time.monotonic() > scenario_deadline_monotonic
+                ):
+                    raise TimeoutError("scenario deadline exceeded")
                 if observer is not None:
                     observer.require_drained()
                 annotate_scored_rows(
