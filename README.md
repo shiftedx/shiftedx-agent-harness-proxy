@@ -239,7 +239,7 @@ uv run mypy src
 ./scripts/docker-smoke.sh
 ```
 
-The current release-candidate branch has 847 tests. CI also runs the near-body-limit admission soak,
+CI runs the full test suite and the near-body-limit admission soak,
 dependency audit, multi-architecture OCI build, hardened production-profile smoke, exact-image
 vulnerability/secret/misconfiguration scan, SBOM generation, release-manifest capture, and SLSA
 provenance attestation. The complete evidence boundary is summarized in
