@@ -94,6 +94,8 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SOURCE_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _IMAGE_REFERENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]*$")
+_WORKFLOW_URL = re.compile(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[1-9][0-9]*$")
+_APPROVED_PREDECESSOR = "approved-predecessor"
 _FAILURE_CATEGORY = re.compile(r"^[a-z0-9_]+$")
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _V2_CRITICAL_SCENARIO_ORDINALS = [29, 30]
@@ -124,7 +126,9 @@ _SECTION_KEYS = frozenset(
     {
         "schema_version",
         "source_commit",
+        "candidate_checkout_path",
         "image",
+        "rollback",
         "model",
         "benchmark",
         "observer",
@@ -141,6 +145,7 @@ _CHECK_KEYS = (
     "observer",
     "ready",
     "secret_roles_distinct",
+    "rollback_binding",
 )
 _LABEL_PREFIX = "io.shiftedx.qualification"
 _CONTAINER_LISTEN_HOST = "0.0.0.0"  # noqa: S104 - proxy is published only on a loopback host binding
@@ -527,6 +532,7 @@ class RuntimeLease:
     stage: RuntimeStage
     run_manifest_sha256: str
     source_commit: str
+    candidate_checkout_path: Path
     image_digest: str
     model: str
     benchmark_revision: str
@@ -585,6 +591,15 @@ class _ImageSpec:
     digest: str
     uid: int
     gid: int
+
+
+@dataclass(frozen=True)
+class _RollbackSpec:
+    reference: str
+    digest: str
+    source_commit: str
+    workflow_url: str
+    approval_evidence_url: str
 
 
 @dataclass(frozen=True)
@@ -686,7 +701,9 @@ class _StageBinding:
 class _RuntimeSpec:
     manifest_sha256: str
     source_commit: str
+    candidate_checkout_path: Path
     image: _ImageSpec
+    rollback: _RollbackSpec
     model: _ModelSpec
     benchmark: _BenchmarkSpec
     observer: _ObserverSpec
@@ -1359,9 +1376,14 @@ def _load_runtime_spec(manifest: Path, runner: RuntimeCommandRunner) -> _Runtime
         raise QualificationRuntimeFailure("runtime_manifest_invalid")
     manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
     source_commit = _exact_string(section, "source_commit", _SOURCE_COMMIT)
+    candidate_checkout_path = _absolute_path(section.get("candidate_checkout_path"))
     if section.get("schema_version") != "1.0":
         raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    _validate_candidate_checkout(runner, candidate_checkout_path, source_commit)
     image = _parse_image(section.get("image"))
+    rollback = _parse_rollback(section.get("rollback"))
+    if rollback.digest == image.digest:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
     model = _parse_model(section.get("model"))
     benchmark = _parse_benchmark(section.get("benchmark"))
     _validate_benchmark_checkout(runner, benchmark)
@@ -1372,24 +1394,69 @@ def _load_runtime_spec(manifest: Path, runner: RuntimeCommandRunner) -> _Runtime
     if campaign.version == "v2" and benchmark.scenario_count != 30:
         raise QualificationRuntimeFailure("runtime_manifest_invalid")
     _validate_settings(proxy.settings, observer.container_url, proxy.container_port, model.upstream_authenticated)
-    return _RuntimeSpec(manifest_sha256, source_commit, image, model, benchmark, observer, proxy, credentials, campaign)
+    return _RuntimeSpec(
+        manifest_sha256,
+        source_commit,
+        candidate_checkout_path,
+        image,
+        rollback,
+        model,
+        benchmark,
+        observer,
+        proxy,
+        credentials,
+        campaign,
+    )
 
 
 def _parse_image(value: Any) -> _ImageSpec:
     image = _exact_object(value, {"reference", "digest", "uid", "gid"})
-    reference = _required_text(image.get("reference"))
-    digest = _exact_string(image, "digest", _DIGEST)
+    reference, digest = _digest_qualified_reference(image)
+    uid = _positive_int(image.get("uid"))
+    gid = _positive_int(image.get("gid"))
+    if uid != 10001 or gid != 10001:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    return _ImageSpec(reference, digest, uid, gid)
+
+
+def _parse_rollback(value: Any) -> _RollbackSpec:
+    rollback = _exact_object(
+        value,
+        {
+            "reference",
+            "digest",
+            "source_commit",
+            "workflow_url",
+            "approval_designation",
+            "approval_evidence_url",
+        },
+    )
+    reference, digest = _digest_qualified_reference(rollback)
+    workflow_url = _required_text(rollback.get("workflow_url"))
+    if _WORKFLOW_URL.fullmatch(workflow_url) is None:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    approval_evidence_url = _safe_absolute_url(rollback.get("approval_evidence_url"), frozenset({"https"}))
+    if rollback.get("approval_designation") != _APPROVED_PREDECESSOR:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    return _RollbackSpec(
+        reference,
+        digest,
+        _exact_string(rollback, "source_commit", _SOURCE_COMMIT),
+        workflow_url,
+        approval_evidence_url,
+    )
+
+
+def _digest_qualified_reference(value: dict[str, Any]) -> tuple[str, str]:
+    reference = _required_text(value.get("reference"))
+    digest = _exact_string(value, "digest", _DIGEST)
     if (
         _IMAGE_REFERENCE.fullmatch(reference) is None
         or reference.count("@") != 1
         or not reference.endswith("@" + digest)
     ):
         raise QualificationRuntimeFailure("runtime_manifest_invalid")
-    uid = _positive_int(image.get("uid"))
-    gid = _positive_int(image.get("gid"))
-    if uid != 10001 or gid != 10001:
-        raise QualificationRuntimeFailure("runtime_manifest_invalid")
-    return _ImageSpec(reference, digest, uid, gid)
+    return reference, digest
 
 
 def _parse_model(value: Any) -> _ModelSpec:
@@ -1417,7 +1484,7 @@ def _parse_model(value: Any) -> _ModelSpec:
         },
     )
     public_id = _required_text(model.get("public_id"))
-    upstream_url = _safe_absolute_http_url(_required_text(model.get("upstream_url")))
+    upstream_url = _safe_absolute_url(model.get("upstream_url"), frozenset({"http", "https"}))
     upstream = urlsplit(upstream_url)
     if upstream.scheme != "http" or upstream.hostname is None or upstream.port is None:
         raise QualificationRuntimeFailure("runtime_manifest_invalid")
@@ -1628,6 +1695,37 @@ def _parse_campaign(value: Any) -> _CampaignSpec:
     )
 
 
+def _validate_candidate_checkout(
+    runner: RuntimeCommandRunner, candidate_checkout_path: Path, source_commit: str
+) -> None:
+    """Bind qualification to one clean candidate source checkout before any runtime action."""
+
+    try:
+        checkout_status = candidate_checkout_path.lstat()
+    except OSError as error:
+        raise QualificationRuntimeFailure("runtime_candidate_checkout_invalid") from error
+    if candidate_checkout_path.is_symlink() or not stat.S_ISDIR(checkout_status.st_mode):
+        raise QualificationRuntimeFailure("runtime_candidate_checkout_invalid")
+    top_level = runner.run(("git", "-C", str(candidate_checkout_path), "rev-parse", "--show-toplevel"))
+    head = runner.run(("git", "-C", str(candidate_checkout_path), "rev-parse", "HEAD"))
+    clean = runner.run(
+        ("git", "-C", str(candidate_checkout_path), "status", "--porcelain=v1", "--untracked-files=all")
+    )
+    try:
+        exact_root = Path(top_level.stdout.strip()).resolve(strict=True) == candidate_checkout_path.resolve(strict=True)
+    except OSError:
+        exact_root = False
+    if (
+        top_level.returncode != 0
+        or not exact_root
+        or head.returncode != 0
+        or head.stdout.strip() != source_commit
+        or clean.returncode != 0
+        or clean.stdout.strip()
+    ):
+        raise QualificationRuntimeFailure("runtime_candidate_checkout_invalid")
+
+
 def _validate_benchmark_checkout(runner: RuntimeCommandRunner, benchmark: _BenchmarkSpec) -> None:
     """Bind the child to one clean, pinned benchmark source tree and interpreter."""
 
@@ -1724,7 +1822,7 @@ def _parse_observer(value: Any) -> _ObserverSpec:
     observer = _exact_object(value, {"host", "port", "container_url"})
     host = _loopback_host(_required_text(observer.get("host")))
     port = _port(observer.get("port"))
-    container_url = _safe_absolute_http_url(_required_text(observer.get("container_url")))
+    container_url = _safe_absolute_url(observer.get("container_url"), frozenset({"http", "https"}))
     parsed = urlsplit(container_url)
     if parsed.port != port:
         raise QualificationRuntimeFailure("runtime_manifest_invalid")
@@ -2563,6 +2661,7 @@ def _proxy_lease(
         stage=stage,
         run_manifest_sha256=spec.manifest_sha256,
         source_commit=spec.source_commit,
+        candidate_checkout_path=spec.candidate_checkout_path,
         image_digest=spec.image.digest,
         model=spec.model.public_id,
         benchmark_revision=spec.benchmark.revision,
@@ -2618,6 +2717,7 @@ def _direct_lease(
         stage=stage,
         run_manifest_sha256=spec.manifest_sha256,
         source_commit=spec.source_commit,
+        candidate_checkout_path=spec.candidate_checkout_path,
         image_digest=spec.image.digest,
         model=spec.model.public_id,
         benchmark_revision=spec.benchmark.revision,
@@ -3052,6 +3152,7 @@ def _write_attestation(
         "stage": _attestation_stage(stage),
         "source_commit": spec.source_commit,
         "image_digest": spec.image.digest,
+        "rollback": _rollback_attestation_record(spec.rollback),
         "run_manifest_sha256": spec.manifest_sha256,
         "model_id_sha256": _canonical_sha256(spec.model.public_id),
         "benchmark_revision": spec.benchmark.revision,
@@ -3065,6 +3166,17 @@ def _write_attestation(
         "checks": {key: True for key in _CHECK_KEYS},
     }
     _atomic_write_no_clobber(path, record)
+
+
+def _rollback_attestation_record(rollback: _RollbackSpec) -> dict[str, str]:
+    return {
+        "reference": rollback.reference,
+        "digest": rollback.digest,
+        "source_commit": rollback.source_commit,
+        "workflow_url": rollback.workflow_url,
+        "approval_designation": _APPROVED_PREDECESSOR,
+        "approval_evidence_url": rollback.approval_evidence_url,
+    }
 
 
 def _write_outcome(
@@ -3249,6 +3361,7 @@ def _validate_existing_preflight_attestation(private_run_dir: Path, spec: _Runti
         "stage",
         "source_commit",
         "image_digest",
+        "rollback",
         "run_manifest_sha256",
         "model_id_sha256",
         "benchmark_revision",
@@ -3269,6 +3382,7 @@ def _validate_existing_preflight_attestation(private_run_dir: Path, spec: _Runti
         or value.get("stage") != "preflight"
         or value.get("source_commit") != spec.source_commit
         or value.get("image_digest") != spec.image.digest
+        or value.get("rollback") != _rollback_attestation_record(spec.rollback)
         or value.get("run_manifest_sha256") != spec.manifest_sha256
         or value.get("model_id_sha256") != _canonical_sha256(spec.model.public_id)
         or value.get("benchmark_revision") != spec.benchmark.revision
@@ -3539,6 +3653,7 @@ def _runtime_contract_sha256(spec: _RuntimeSpec, model_identity_sha256: str) -> 
         {
             "source_commit": spec.source_commit,
             "image_digest": spec.image.digest,
+            "rollback": _rollback_attestation_record(spec.rollback),
             "run_manifest_sha256": spec.manifest_sha256,
             "model_id_sha256": _canonical_sha256(spec.model.public_id),
             # This is intentionally lane/stage independent: the preflight
@@ -3790,10 +3905,11 @@ def _absolute_path(value: Any) -> Path:
     return path
 
 
-def _safe_absolute_http_url(value: str) -> str:
-    parsed = urlsplit(value)
+def _safe_absolute_url(value: Any, allowed_schemes: frozenset[str]) -> str:
+    url = _required_text(value)
+    parsed = urlsplit(url)
     if (
-        parsed.scheme not in {"http", "https"}
+        parsed.scheme not in allowed_schemes
         or not parsed.hostname
         or parsed.username is not None
         or parsed.password is not None
@@ -3805,7 +3921,7 @@ def _safe_absolute_http_url(value: str) -> str:
         _ = parsed.port
     except ValueError as error:
         raise QualificationRuntimeFailure("runtime_manifest_invalid") from error
-    return value.rstrip("/")
+    return url.rstrip("/")
 
 
 def _loopback_host(value: str) -> str:

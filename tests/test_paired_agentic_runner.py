@@ -249,35 +249,50 @@ def load_runner(monkeypatch):
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    monkeypatch.setattr(contract_module, "require_candidate_provenance", lambda *_args: None)
+    monkeypatch.setattr(module, "require_candidate_provenance", lambda *_args: None)
     return module
 
 
-def test_candidate_provenance_uses_frozen_git_with_a_scrubbed_environment(monkeypatch) -> None:
+def test_candidate_provenance_uses_frozen_git_with_a_scrubbed_environment(monkeypatch, tmp_path) -> None:
     """Qualification provenance must not inherit Git or proxy configuration from the shell."""
 
     calls: list[tuple[list[str], dict[str, object]]] = []
 
+    checkout = tmp_path / "candidate-checkout"
+    checkout.mkdir()
+
     def fake_run(argv, **kwargs):
         calls.append((list(argv), kwargs))
-        return SimpleNamespace(stdout="a" * 40 + "\n")
+        if argv[-1] == "--show-toplevel":
+            return SimpleNamespace(stdout=str(checkout) + "\n")
+        return SimpleNamespace(stdout="" if argv[3] == "status" else "a" * 40 + "\n")
 
     monkeypatch.setenv("DOCKER_HOST", "private-daemon-marker")
     monkeypatch.setenv("HTTPS_PROXY", "http://private-proxy.invalid")
     monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
     monkeypatch.setattr(contract_module.subprocess, "run", fake_run)
 
-    contract_module.require_candidate_provenance("a" * 40, "sha256:" + "b" * 64)
+    contract_module.require_candidate_provenance("a" * 40, "sha256:" + "b" * 64, checkout)
 
     assert calls == [
         (
-            ["/usr/bin/git", "rev-parse", "HEAD"],
+            ["/usr/bin/git", "-C", str(checkout), "rev-parse", "--show-toplevel"],
             {
                 "capture_output": True,
                 "text": True,
                 "check": True,
                 "env": {},
             },
-        )
+        ),
+        (
+            ["/usr/bin/git", "-C", str(checkout), "rev-parse", "HEAD"],
+            {"capture_output": True, "text": True, "check": True, "env": {}},
+        ),
+        (
+            ["/usr/bin/git", "-C", str(checkout), "status", "--porcelain=v1", "--untracked-files=all"],
+            {"capture_output": True, "text": True, "check": True, "env": {}},
+        ),
     ]
 
 
@@ -322,6 +337,8 @@ def test_client_failure_is_recorded_without_response_body_and_run_continues(monk
             str(preflight),
             "--candidate-source-commit",
             source_commit,
+            "--candidate-checkout-path",
+            str(Path(__file__).parents[1]),
             "--candidate-image-digest",
             image_digest,
             "--run-manifest-sha256",
@@ -388,6 +405,8 @@ def test_scored_mode_rejects_missing_runtime_attestation_before_client_or_output
             str(preflight),
             "--candidate-source-commit",
             source_commit,
+            "--candidate-checkout-path",
+            str(Path(__file__).parents[1]),
             "--candidate-image-digest",
             image_digest,
             "--run-manifest-sha256",
@@ -430,6 +449,8 @@ def test_scored_mode_requires_preflight_runtime_outcome_before_client_or_output(
             str(preflight),
             "--candidate-source-commit",
             source_commit,
+            "--candidate-checkout-path",
+            str(Path(__file__).parents[1]),
             "--candidate-image-digest",
             image_digest,
             "--run-manifest-sha256",
@@ -489,6 +510,8 @@ def test_scored_proxy_mode_requires_direct_runtime_outcome_before_client_or_outp
             str(preflight),
             "--candidate-source-commit",
             source_commit,
+            "--candidate-checkout-path",
+            str(Path(__file__).parents[1]),
             "--candidate-image-digest",
             image_digest,
             "--run-manifest-sha256",
@@ -2294,6 +2317,8 @@ def test_scored_direct_run_writes_actual_attempt_ledger_atomically(monkeypatch, 
             str(preflight),
             "--candidate-source-commit",
             source_commit,
+            "--candidate-checkout-path",
+            str(Path(__file__).parents[1]),
             "--candidate-image-digest",
             image_digest,
             "--run-manifest-sha256",
@@ -2348,6 +2373,8 @@ def _scored_direct_argv(
         str(preflight),
         "--candidate-source-commit",
         source_commit,
+        "--candidate-checkout-path",
+        str(Path(__file__).parents[1]),
         "--candidate-image-digest",
         image_digest,
         "--run-manifest-sha256",
@@ -2693,6 +2720,7 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
         proxy_metrics_url="http://metrics.invalid",
         proxy_observer_ledger=observer,
         candidate_source_commit=source_commit,
+        candidate_checkout_path=Path(__file__).parents[1],
         candidate_image_digest=image_digest,
         model="model",
         run_manifest_sha256=_RUN_MANIFEST_SHA256,
@@ -2762,6 +2790,7 @@ def test_stale_proxy_observer_ledger_is_rejected_without_overwriting_it(monkeypa
         proxy_metrics_url="http://metrics.invalid",
         proxy_observer_ledger=observer,
         candidate_source_commit=source_commit,
+        candidate_checkout_path=Path(__file__).parents[1],
         candidate_image_digest=image_digest,
         model="model",
         run_manifest_sha256=_RUN_MANIFEST_SHA256,
@@ -3052,6 +3081,7 @@ def test_direct_scoring_requires_the_exact_preflight_runtime_attestation(monkeyp
         preflight_ledger=ledger,
         candidate_source_commit=source_commit,
         candidate_image_digest=image_digest,
+        candidate_checkout_path=Path(__file__).parents[1],
         contract_digest=summary["qualification_contract_digests"]["warm-prefix"]["direct"],
         cache_lane="warm-prefix",
         arm="direct",
@@ -3235,6 +3265,7 @@ def test_proxy_scoring_resolves_direct_evidence_from_the_direct_outcome_slot(mon
         "preflight_ledger": ledger,
         "candidate_source_commit": source_commit,
         "candidate_image_digest": image_digest,
+        "candidate_checkout_path": Path(__file__).parents[1],
         "contract_digest": summary["qualification_contract_digests"]["warm-prefix"]["proxy"],
         "cache_lane": "warm-prefix",
         "arm": "proxy",
@@ -3537,6 +3568,8 @@ def test_scored_proxy_cli_requires_a_new_observer_ledger(monkeypatch, tmp_path):
             str(preflight),
             "--candidate-source-commit",
             source_commit,
+            "--candidate-checkout-path",
+            str(Path(__file__).parents[1]),
             "--candidate-image-digest",
             image_digest,
             "--run-manifest-sha256",
@@ -3592,6 +3625,8 @@ def test_scored_proxy_cli_requires_a_fresh_request_accounting_ledger_before_clie
             str(preflight),
             "--candidate-source-commit",
             source_commit,
+            "--candidate-checkout-path",
+            str(Path(__file__).parents[1]),
             "--candidate-image-digest",
             image_digest,
             "--run-manifest-sha256",
@@ -3697,6 +3732,8 @@ def test_scored_proxy_rows_use_actual_observer_fingerprints_and_failures_keep_sa
             str(preflight),
             "--candidate-source-commit",
             source_commit,
+            "--candidate-checkout-path",
+            str(Path(__file__).parents[1]),
             "--candidate-image-digest",
             image_digest,
             "--run-manifest-sha256",
@@ -3807,6 +3844,8 @@ def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_re
             str(preflight),
             "--candidate-source-commit",
             source_commit,
+            "--candidate-checkout-path",
+            str(Path(__file__).parents[1]),
             "--candidate-image-digest",
             image_digest,
             "--run-manifest-sha256",
@@ -4156,6 +4195,7 @@ def _preflight_args(tmp_path):
         proxy_observer_ledger=tmp_path / "observer.jsonl",
         proxy_request_ledger=tmp_path / "proxy-requests.jsonl",
         candidate_source_commit=source_commit,
+        candidate_checkout_path=Path(__file__).parents[1],
         candidate_image_digest=image_digest,
         model="model",
         run_manifest_sha256=_RUN_MANIFEST_SHA256,
@@ -4187,6 +4227,14 @@ def _write_runtime_attestation(
         "stage": stage,
         "source_commit": source_commit,
         "image_digest": image_digest,
+        "rollback": {
+            "reference": "registry.example/shiftedx@sha256:" + "1" * 64,
+            "digest": "sha256:" + "1" * 64,
+            "source_commit": "2" * 40,
+            "workflow_url": "https://github.com/shiftedx/shiftedx-agent-harness-proxy/actions/runs/1",
+            "approval_designation": "approved-predecessor",
+            "approval_evidence_url": "https://api.github.com/repos/shiftedx/shiftedx-agent-harness-proxy/issues/comments/1",
+        },
         "run_manifest_sha256": _RUN_MANIFEST_SHA256,
         "model_id_sha256": hashlib.sha256(canonical_model.encode()).hexdigest(),
         "benchmark_revision": BENCHMARK_REVISION,
@@ -4205,6 +4253,7 @@ def _write_runtime_attestation(
             "observer": True,
             "ready": True,
             "secret_roles_distinct": True,
+            "rollback_binding": True,
         },
     }
     path.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")), encoding="utf-8")

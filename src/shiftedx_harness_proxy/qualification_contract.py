@@ -29,8 +29,14 @@ COMPATIBILITY_MODE = "phase_split"
 COMPATIBILITY_VERSION = "shiftedx-phase-plan-v1"
 BENCHMARK_REVISION = "335e6694e4aec13e9370af8a993d8c8f14d7ffb5"
 _IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+_IMAGE_REFERENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]*$")
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 _SOURCE_COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_WORKFLOW_URL = re.compile(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[1-9][0-9]*$")
+_APPROVAL_EVIDENCE_URL = re.compile(
+    r"^https://api\.github\.com/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/comments/[1-9][0-9]*$"
+)
+_APPROVED_PREDECESSOR = "approved-predecessor"
 _FAILURE_CATEGORY = re.compile(r"^[a-z0-9_]+$")
 _SAFE_POLICY_LITERALS = frozenset({"auto", "none", "required", "low", "medium", "high"})
 _FROZEN_GIT_EXECUTABLE = Path("/usr/bin/git")
@@ -161,6 +167,7 @@ class RuntimeAttestation:
     stage: Literal["preflight", "scored_proxy"]
     source_commit: str
     image_digest: str
+    rollback: RollbackAttestation
     run_manifest_sha256: str
     model_id_sha256: str
     benchmark_revision: str
@@ -171,6 +178,18 @@ class RuntimeAttestation:
     runtime_instance_sha256: str
     checks: dict[str, bool]
     file_sha256: str
+
+
+@dataclass(frozen=True)
+class RollbackAttestation:
+    """Validated rollback identity embedded in a runtime attestation."""
+
+    reference: str
+    digest: str
+    source_commit: str
+    workflow_url: str
+    approval_designation: Literal["approved-predecessor"]
+    approval_evidence_url: str
 
 
 @dataclass(frozen=True)
@@ -600,6 +619,51 @@ def _read_private_regular_file(path: Path) -> bytes:
         os.close(descriptor)
 
 
+def _load_rollback_attestation(value: Any, candidate_digest: str) -> RollbackAttestation:
+    """Validate the exact, independently deployable rollback identity."""
+    rollback_keys = {
+        "reference",
+        "digest",
+        "source_commit",
+        "workflow_url",
+        "approval_designation",
+        "approval_evidence_url",
+    }
+    if not isinstance(value, dict) or set(value) != rollback_keys:
+        raise ValueError("invalid rollback attestation")
+    reference = value.get("reference")
+    digest = value.get("digest")
+    source_commit = value.get("source_commit")
+    workflow_url = value.get("workflow_url")
+    approval_designation = value.get("approval_designation")
+    approval_evidence_url = value.get("approval_evidence_url")
+    if (
+        not isinstance(reference, str)
+        or _IMAGE_REFERENCE.fullmatch(reference) is None
+        or not isinstance(digest, str)
+        or _IMAGE_DIGEST.fullmatch(digest) is None
+        or reference.count("@") != 1
+        or not reference.endswith("@" + digest)
+        or digest == candidate_digest
+        or not isinstance(source_commit, str)
+        or _SOURCE_COMMIT.fullmatch(source_commit) is None
+        or not isinstance(workflow_url, str)
+        or _WORKFLOW_URL.fullmatch(workflow_url) is None
+        or approval_designation != _APPROVED_PREDECESSOR
+        or not isinstance(approval_evidence_url, str)
+        or _APPROVAL_EVIDENCE_URL.fullmatch(approval_evidence_url) is None
+    ):
+        raise ValueError("invalid rollback attestation")
+    return RollbackAttestation(
+        reference=reference,
+        digest=digest,
+        source_commit=source_commit,
+        workflow_url=workflow_url,
+        approval_designation="approved-predecessor",
+        approval_evidence_url=approval_evidence_url,
+    )
+
+
 def load_runtime_attestation(
     path: Path,
     *,
@@ -625,6 +689,7 @@ def load_runtime_attestation(
         "stage",
         "source_commit",
         "image_digest",
+        "rollback",
         "run_manifest_sha256",
         "model_id_sha256",
         "benchmark_revision",
@@ -642,12 +707,14 @@ def load_runtime_attestation(
         "observer",
         "ready",
         "secret_roles_distinct",
+        "rollback_binding",
     }
     checks = document.get("checks") if isinstance(document, dict) else None
     order_identity = document.get("scenario_order") if isinstance(document, dict) else None
     runtime_contract_sha256 = document.get("runtime_contract_sha256") if isinstance(document, dict) else None
     model_identity_sha256 = document.get("model_identity_sha256") if isinstance(document, dict) else None
     runtime_instance_sha256 = document.get("runtime_instance_sha256") if isinstance(document, dict) else None
+    rollback = document.get("rollback") if isinstance(document, dict) else None
     if (
         not isinstance(document, dict)
         or set(document) != root_keys
@@ -680,10 +747,15 @@ def load_runtime_attestation(
         or any(value is not True for value in checks.values())
     ):
         raise RuntimeAttestationFailure("runtime_attestation_invalid")
+    try:
+        rollback_identity = _load_rollback_attestation(rollback, image_digest)
+    except ValueError as error:
+        raise RuntimeAttestationFailure("runtime_attestation_invalid") from error
     return RuntimeAttestation(
         stage=expected_stage,
         source_commit=source_commit,
         image_digest=image_digest,
+        rollback=rollback_identity,
         run_manifest_sha256=run_manifest_sha256,
         model_id_sha256=expected_model_sha256,
         benchmark_revision=BENCHMARK_REVISION,
@@ -1538,6 +1610,7 @@ def require_scoring_gate(
     preflight_ledger: Path,
     candidate_source_commit: str,
     candidate_image_digest: str,
+    candidate_checkout_path: Path | None = None,
     contract_digest: str,
     arm: Literal["direct", "proxy"],
     cache_lane: Literal["cold", "warm-prefix"],
@@ -1663,7 +1736,9 @@ def require_scoring_gate(
             )
         except RuntimeOutcomeFailure as error:
             raise SystemExit("scored proxy requires a passed matching direct runtime outcome") from error
-    require_candidate_provenance(candidate_source_commit, candidate_image_digest)
+    if candidate_checkout_path is None:
+        raise SystemExit("scored mode requires --candidate-checkout-path")
+    require_candidate_provenance(candidate_source_commit, candidate_image_digest, candidate_checkout_path)
 
 
 def _model_evidence_path(preflight_ledger: Path, stage: Literal["preflight", "score-direct", "score-proxy"]) -> Path:
@@ -1709,27 +1784,63 @@ def _identity_digest(model_id_sha256: str, run_manifest_sha256: str) -> str:
     )
 
 
-def require_candidate_provenance(candidate_source_commit: str, candidate_image_digest: str) -> None:
-    """Require the local merged source and immutable image declared for the window."""
+def require_candidate_provenance(
+    candidate_source_commit: str, candidate_image_digest: str, candidate_checkout_path: Path
+) -> None:
+    """Require the exact clean candidate checkout and immutable image declared for the window."""
     if not _IMAGE_DIGEST.fullmatch(candidate_image_digest):
         raise SystemExit("--candidate-image-digest must be an immutable sha256 digest")
+    if not candidate_checkout_path.is_absolute():
+        raise SystemExit("--candidate-checkout-path must be an absolute path")
     try:
+        checkout_status = candidate_checkout_path.lstat()
         executable_status = _FROZEN_GIT_EXECUTABLE.stat()
     except OSError as error:
         raise SystemExit(
-            "the frozen /usr/bin/git executable is required to verify --candidate-source-commit"
+            "a clean candidate checkout and frozen /usr/bin/git are required to verify --candidate-source-commit"
         ) from error
+    if candidate_checkout_path.is_symlink() or not stat.S_ISDIR(checkout_status.st_mode):
+        raise SystemExit("--candidate-checkout-path must be an existing non-symlink directory")
     if not stat.S_ISREG(executable_status.st_mode) or not os.access(_FROZEN_GIT_EXECUTABLE, os.X_OK):
         raise SystemExit("git is required to verify --candidate-source-commit")
-    current_commit = subprocess.run(  # noqa: S603 - fixed, validated host executable and Git arguments
-        [str(_FROZEN_GIT_EXECUTABLE), "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=True,
-        env={},
-    ).stdout.strip()
+    try:
+        top_level = subprocess.run(  # noqa: S603 - fixed, validated host executable and Git arguments
+            [str(_FROZEN_GIT_EXECUTABLE), "-C", str(candidate_checkout_path), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=True,
+            env={},
+        ).stdout.strip()
+        current_commit = subprocess.run(  # noqa: S603 - fixed, validated host executable and Git arguments
+            [str(_FROZEN_GIT_EXECUTABLE), "-C", str(candidate_checkout_path), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+            env={},
+        ).stdout.strip()
+        porcelain = subprocess.run(  # noqa: S603 - fixed, validated host executable and Git arguments
+            [
+                str(_FROZEN_GIT_EXECUTABLE),
+                "-C",
+                str(candidate_checkout_path),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            env={},
+        ).stdout.strip()
+        exact_root = Path(top_level).resolve(strict=True) == candidate_checkout_path.resolve(strict=True)
+    except (OSError, subprocess.CalledProcessError):
+        raise SystemExit("--candidate-checkout-path must be a Git repository root") from None
+    if not exact_root:
+        raise SystemExit("--candidate-checkout-path must be the Git repository root")
     if candidate_source_commit != current_commit:
-        raise SystemExit("--candidate-source-commit must exactly match the checked-out merged source")
+        raise SystemExit("--candidate-source-commit must exactly match the candidate checkout HEAD")
+    if porcelain:
+        raise SystemExit("--candidate-checkout-path must be clean including untracked files")
 
 
 def terminal_schema_valid(response: JsonObject, response_format: JsonObject | None) -> bool:
