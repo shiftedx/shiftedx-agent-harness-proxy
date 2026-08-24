@@ -240,16 +240,26 @@ def _manifest(tmp_path: Path) -> Path:
         path.chmod(0o600)
         credential_paths[field] = str(path)
     benchmark = _benchmark_checkout(tmp_path)
+    candidate_checkout = _candidate_checkout(tmp_path)
     scenario_order = ["case-1", "case-2"]
     document = {
         "qualification_runtime": {
             "schema_version": "1.0",
             "source_commit": "a" * 40,
+            "candidate_checkout_path": str(candidate_checkout),
             "image": {
                 "reference": "registry.invalid/shiftedx/proxy@sha256:" + "b" * 64,
                 "digest": "sha256:" + "b" * 64,
                 "uid": 10001,
                 "gid": 10001,
+            },
+            "rollback": {
+                "reference": "registry.invalid/shiftedx/proxy@sha256:" + "c" * 64,
+                "digest": "sha256:" + "c" * 64,
+                "source_commit": "d" * 40,
+                "workflow_url": "https://github.com/shiftedx/shiftedx-agent-harness-proxy/actions/runs/1",
+                "approval_designation": "approved-predecessor",
+                "approval_evidence_url": "https://api.github.com/repos/shiftedx/shiftedx-agent-harness-proxy/issues/comments/1",
             },
             "model": _model_manifest_fields(tmp_path),
             "benchmark": {
@@ -366,6 +376,101 @@ def test_manifest_accepts_ornith_productization_sampler_profile(tmp_path) -> Non
     spec = runtime_module._load_runtime_spec(manifest, _FakeRuntimeRunner())
 
     assert spec.benchmark.sampler_profile == "ornith-productization-v1"
+
+
+def test_manifest_binds_an_approved_digest_qualified_rollback_predecessor(tmp_path) -> None:
+    spec = runtime_module._load_runtime_spec(_manifest(tmp_path), _FakeRuntimeRunner())
+
+    assert spec.candidate_checkout_path == tmp_path / "candidate-checkout"
+    assert spec.rollback.reference.endswith("@" + spec.rollback.digest)
+    assert spec.rollback.digest == "sha256:" + "c" * 64
+    assert spec.rollback.source_commit == "d" * 40
+    assert spec.rollback.workflow_url.endswith("/actions/runs/1")
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda runtime: runtime.pop("rollback"),
+        lambda runtime: runtime["rollback"].__setitem__("unexpected", True),
+        lambda runtime: runtime["rollback"].__setitem__("digest", "sha256:" + "e" * 64),
+        lambda runtime: runtime["rollback"].update(
+            reference=runtime["image"]["reference"], digest=runtime["image"]["digest"]
+        ),
+        lambda runtime: runtime["rollback"].__setitem__("workflow_url", "http://github.com/a/b/actions/runs/1"),
+        lambda runtime: runtime["rollback"].__setitem__("approval_designation", "candidate"),
+    ],
+)
+def test_invalid_rollback_binding_is_rejected_before_runtime_resources(mutate, tmp_path) -> None:
+    manifest = _manifest(tmp_path)
+    document = _manifest_document(manifest)
+    runtime = document["qualification_runtime"]
+    assert isinstance(runtime, dict)
+    mutate(runtime)
+    _store_manifest(manifest, document)
+    runner = _FakeRuntimeRunner()
+
+    outcome = _supervise(
+        manifest=manifest,
+        stage="preflight",
+        private_run_dir=_private_run(tmp_path),
+        action=lambda _lease: pytest.fail("invalid rollback binding must not invoke action"),
+        command_runner=runner,
+    )
+
+    assert outcome.failure_category == "runtime_manifest_invalid"
+    assert _docker_commands(runner) == []
+
+
+def test_direct_stage_rejects_a_tampered_preflight_rollback_attestation(tmp_path) -> None:
+    manifest = _manifest(tmp_path)
+    private_run_dir = _private_run(tmp_path)
+    preflight = _supervise(
+        manifest=manifest,
+        stage="preflight",
+        private_run_dir=private_run_dir,
+        action=_write_complete_ledger,
+        command_runner=_FakeRuntimeRunner(),
+    )
+    assert preflight.status == "passed"
+    attestation_path = private_run_dir / "preflight-runtime-attestation.json"
+    attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
+    attestation["rollback"]["source_commit"] = "e" * 40
+    attestation_path.write_text(json.dumps(attestation), encoding="utf-8")
+    attestation_path.chmod(0o600)
+    runner = _FakeRuntimeRunner()
+
+    direct = _supervise(
+        manifest=manifest,
+        stage="score-direct",
+        private_run_dir=private_run_dir,
+        action=lambda _lease: pytest.fail("tampered rollback attestation must block direct traffic"),
+        command_runner=runner,
+    )
+
+    assert direct.failure_category == "runtime_preflight_attestation_invalid"
+    assert _docker_commands(runner) == []
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda rollback: rollback.pop("approval_evidence_url"),
+        lambda rollback: rollback.__setitem__("unexpected", True),
+        lambda rollback: rollback.__setitem__("digest", "sha256:" + "e" * 64),
+        lambda rollback: rollback.__setitem__("source_commit", "e" * 39),
+        lambda rollback: rollback.__setitem__("workflow_url", "http://github.com/a/b/actions/runs/1"),
+        lambda rollback: rollback.__setitem__("approval_designation", "candidate"),
+        lambda rollback: rollback.__setitem__("approval_evidence_url", "http://github.com/a/b/issues/1"),
+        lambda rollback: rollback.__setitem__("approval_evidence_url", "https://example.com/approval"),
+    ],
+)
+def test_rollback_attestation_uses_the_manifest_schema(mutate, tmp_path) -> None:
+    spec = runtime_module._load_runtime_spec(_manifest(tmp_path), _FakeRuntimeRunner())
+    rollback = runtime_module._rollback_attestation_record(spec.rollback)
+    mutate(rollback)
+
+    assert not runtime_module._matches_rollback_attestation(rollback, spec.rollback)
 
 
 def test_timing_capture_initializer_locks_mode_before_transferring_ownership(tmp_path) -> None:
@@ -603,6 +708,12 @@ def _benchmark_checkout(tmp_path: Path) -> dict[str, str]:
     }
 
 
+def _candidate_checkout(tmp_path: Path) -> Path:
+    checkout = tmp_path / "candidate-checkout"
+    checkout.mkdir()
+    return checkout
+
+
 def _tracked_benchmark_pyproject(*, version: str = "0.5.1") -> str:
     return "\n".join(
         (
@@ -807,6 +918,21 @@ class _FakeRuntimeRunner:
                 )
             if argv[-1] == "lstart=":
                 return SimpleNamespace(returncode=0, stdout="12345\n", stderr="")
+        if argv[:4] == ("git", "-C", argv[2], "rev-parse") and Path(argv[2]).name == "candidate-checkout":
+            if argv[-1] == "--show-toplevel":
+                root = str(Path(argv[2]).parent) if self.failure == "candidate_nonroot" else argv[2]
+                return SimpleNamespace(returncode=0, stdout=root + "\n", stderr="")
+            return SimpleNamespace(
+                returncode=0,
+                stdout=("e" * 40 if self.failure == "candidate_head" else "a" * 40) + "\n",
+                stderr="",
+            )
+        if argv[:4] == ("git", "-C", argv[2], "status") and Path(argv[2]).name == "candidate-checkout":
+            return SimpleNamespace(
+                returncode=0,
+                stdout="?? candidate-untracked\n" if self.failure == "candidate_dirty" else "",
+                stderr="",
+            )
         if argv[:4] == ("git", "-C", argv[2], "rev-parse"):
             if argv[-1] == "HEAD":
                 target = "e" * 40 if self.failure == "benchmark_head" else "335e6694e4aec13e9370af8a993d8c8f14d7ffb5"
@@ -1046,6 +1172,8 @@ class _SourceCheckoutRunner(_FakeRuntimeRunner):
     def run(
         self, argv: tuple[str, ...], *, env: dict[str, str] | None = None, timeout: float | None = None
     ) -> SimpleNamespace:
+        if argv[0] == "git" and Path(argv[2]).name == "candidate-checkout":
+            return super().run(argv, env=env, timeout=timeout)
         if argv[0] == "git" or argv[0] == sys.executable:
             self.calls.append(("run", argv, env))
             completed = subprocess.run(  # noqa: S603 - fixed test seam vectors
@@ -1171,7 +1299,9 @@ def test_preflight_supervisor_writes_safe_attestation_before_action_and_cleans(m
         "observer": True,
         "ready": True,
         "secret_roles_distinct": True,
+        "rollback_binding": True,
     }
+    assert attestation["rollback"] == _manifest_document(manifest)["qualification_runtime"]["rollback"]
     serialized = (private_run_dir / "preflight-runtime-attestation.json").read_text() + (
         private_run_dir / "preflight-runtime-outcome.json"
     ).read_text()
@@ -2485,6 +2615,46 @@ def test_benchmark_identity_drift_is_rejected_before_runtime_resources(failure, 
     assert _docker_commands(runner) == []
 
 
+@pytest.mark.parametrize("failure", ["candidate_head", "candidate_dirty", "candidate_nonroot"])
+def test_candidate_checkout_identity_drift_is_rejected_before_runtime_resources(failure, tmp_path) -> None:
+    runner = _FakeRuntimeRunner(failure=failure)
+
+    outcome = _supervise(
+        manifest=_manifest(tmp_path),
+        stage="preflight",
+        private_run_dir=_private_run(tmp_path),
+        action=lambda _lease: pytest.fail("invalid candidate checkout must not invoke action"),
+        command_runner=runner,
+    )
+
+    assert outcome.failure_category == "runtime_candidate_checkout_invalid"
+    assert _docker_commands(runner) == []
+
+
+def test_candidate_checkout_symlink_is_rejected_before_runtime_resources(tmp_path) -> None:
+    manifest = _manifest(tmp_path)
+    document = _manifest_document(manifest)
+    runtime = document["qualification_runtime"]
+    assert isinstance(runtime, dict)
+    checkout = Path(runtime["candidate_checkout_path"])
+    target = tmp_path / "candidate-target"
+    target.mkdir()
+    checkout.rmdir()
+    checkout.symlink_to(target, target_is_directory=True)
+    runner = _FakeRuntimeRunner()
+
+    outcome = _supervise(
+        manifest=manifest,
+        stage="preflight",
+        private_run_dir=_private_run(tmp_path),
+        action=lambda _lease: pytest.fail("symlinked candidate checkout must not invoke action"),
+        command_runner=runner,
+    )
+
+    assert outcome.failure_category == "runtime_candidate_checkout_invalid"
+    assert _docker_commands(runner) == []
+
+
 def test_tracked_source_checkout_without_installed_metadata_passes_in_isolation(tmp_path) -> None:
     manifest, checkout = _authoritative_benchmark_manifest(tmp_path)
     assert not list((checkout / "src").glob("*.dist-info"))
@@ -2688,6 +2858,7 @@ def test_v2_scored_leases_carry_the_manifest_deadline_but_preflight_does_not(tmp
     spec = SimpleNamespace(
         manifest_sha256="a" * 64,
         source_commit="b" * 40,
+        candidate_checkout_path=tmp_path,
         image=SimpleNamespace(digest="sha256:" + "c" * 64),
         model=SimpleNamespace(public_id="model", upstream_url="http://127.0.0.1:19999/v1"),
         benchmark=SimpleNamespace(
@@ -3642,6 +3813,7 @@ def _lease(stage: str) -> RuntimeLease:
         stage=stage,
         run_manifest_sha256="a" * 64,
         source_commit="b" * 40,
+        candidate_checkout_path=Path("/private/candidate-checkout"),
         image_digest="sha256:" + "c" * 64,
         model="approved-model",
         benchmark_revision="335e6694e4aec13e9370af8a993d8c8f14d7ffb5",
@@ -3714,6 +3886,7 @@ def test_thin_cli_derives_fixed_child_argv_without_secret_values(stage) -> None:
     assert argv[0] == os.sys.executable
     assert "run_paired_agentic_trial.py" in argv[1]
     assert "--candidate-source-commit" in argv
+    assert argv[argv.index("--candidate-checkout-path") + 1] == "/private/candidate-checkout"
     assert "--candidate-image-digest" in argv
     assert "--run-manifest-sha256" in argv
     assert "--campaign-version" not in argv
@@ -3783,6 +3956,7 @@ def test_thin_cli_never_adds_v2_contract_to_preflight_or_priming() -> None:
 
     assert "--campaign-version" not in preflight_argv
     assert "--v2-private-scenario-deadline-seconds" not in preflight_argv
+    assert prime_argv[prime_argv.index("--candidate-checkout-path") + 1] == "/private/candidate-checkout"
     assert "--campaign-version" not in prime_argv
     assert "--v2-private-scenario-deadline-seconds" not in prime_argv
 

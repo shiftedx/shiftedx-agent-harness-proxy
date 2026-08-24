@@ -1354,6 +1354,7 @@ def main() -> None:
         help="Passed paired-preflight ledger matching the exact source and image candidate.",
     )
     parser.add_argument("--candidate-source-commit")
+    parser.add_argument("--candidate-checkout-path", type=Path)
     parser.add_argument("--candidate-image-digest")
     parser.add_argument(
         "--run-manifest-sha256",
@@ -1458,13 +1459,15 @@ def main() -> None:
     if (
         args.preflight_ledger is None
         or args.candidate_source_commit is None
+        or args.candidate_checkout_path is None
         or args.candidate_image_digest is None
         or args.run_manifest_sha256 is None
         or args.runtime_attestation is None
         or args.preflight_runtime_outcome is None
     ):
         raise SystemExit(
-            "scored mode requires --preflight-ledger, --candidate-source-commit, --candidate-image-digest, "
+            "scored mode requires --preflight-ledger, --candidate-source-commit, --candidate-checkout-path, "
+            "--candidate-image-digest, "
             "--run-manifest-sha256, --runtime-attestation, and --preflight-runtime-outcome"
         )
     if args.proxy_policy and args.direct_runtime_outcome is None:
@@ -1494,6 +1497,7 @@ def main() -> None:
         preflight_ledger=args.preflight_ledger,
         candidate_source_commit=args.candidate_source_commit,
         candidate_image_digest=args.candidate_image_digest,
+        candidate_checkout_path=args.candidate_checkout_path,
         contract_digest=qualification_contract_digest(
             [
                 request_payload(
@@ -1717,16 +1721,24 @@ def _run_paired_preflight(args: argparse.Namespace, selected: list[Any]) -> None
             "--paired-preflight requires --direct-base-url, --proxy-base-url, --proxy-metrics-url, and "
             "--proxy-observer-ledger"
         )
-    if not args.candidate_source_commit or not args.candidate_image_digest or not args.run_manifest_sha256:
+    if (
+        not args.candidate_source_commit
+        or args.candidate_checkout_path is None
+        or not args.candidate_image_digest
+        or not args.run_manifest_sha256
+    ):
         raise SystemExit(
-            "--paired-preflight requires exact --candidate-source-commit, --candidate-image-digest, and "
+            "--paired-preflight requires exact --candidate-source-commit, --candidate-checkout-path, "
+            "--candidate-image-digest, and "
             "--run-manifest-sha256"
         )
     try:
         validate_run_manifest_sha256(args.run_manifest_sha256)
     except PreflightFailure as error:
         raise SystemExit("--run-manifest-sha256 must be an immutable SHA-256") from error
-    require_candidate_provenance(args.candidate_source_commit, args.candidate_image_digest)
+    require_candidate_provenance(
+        args.candidate_source_commit, args.candidate_image_digest, args.candidate_checkout_path
+    )
     if args.output.exists():
         raise SystemExit("refusing to overwrite an existing preflight ledger; select a new output path")
     tool_scenario = next((item for item in selected if item.tools), None)

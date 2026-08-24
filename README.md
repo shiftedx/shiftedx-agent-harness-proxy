@@ -3,27 +3,31 @@
 [![CI](https://github.com/shiftedx/shiftedx-agent-harness-proxy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/shiftedx/shiftedx-agent-harness-proxy/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Status: approved for controlled deployment of the exact AEON-tested artifact; not a stable or
-public release.** The proxy improved pass rate from `55.0%` to `87.8%`, but full-agentic p95 was
-`170.5%` of direct when cold and `145.6%` when warm-prefix, failing the `125%` ceiling. See
-[release status](RELEASE_STATUS.md), [evidence](benchmark-reports/aeon-historical-parity-result-2026-08-20.md),
-and the [operator runbook](docs/operator-runbook.md).
+**Status: qualified for controlled production deployment of one exact artifact; not yet generally
+available.** The r14 campaign improved valid agent outcomes from `160/240` (`66.7%`) direct to
+`220/240` (`91.7%`) proxy-assisted, while deadline-penalized mean time to a valid outcome fell
+from `203.488 s` to `54.605 s` (`73.2%` lower; `3.73×` faster). This is not a raw-inference or
+token-latency claim. The exact evaluated source is `b5cdd1e5d5444d3064179baea0dc30cccfecb0ee` and
+the OCI index digest is `sha256:cee2d12b263358414ff4519d11220d319684a431d4894215b04baedf0807afed`;
+there is no durable public registry reference yet. See [release status](RELEASE_STATUS.md), the
+[public r14 result](benchmark-reports/v2-qualification-result-2026-08-24.json), and the
+[operator runbook](docs/operator-runbook.md).
 
 A small, stateless policy proxy for OpenAI-compatible Chat Completions. It blocks repeated or
 stalled tool calls, requires verification after mutations, and corrects malformed terminal JSON
 within fixed retry limits. It never executes tools or changes model weights.
 
-## Stock MTPLX performance
+## Qualified agent-outcome performance
 
-No MTPLX fork is required. Latest supported: stock MTPLX `2.9.0`. The retained M4 Max
-64 GiB benchmark used `2.7.1`; its numbers are not yet a `2.9.0` performance claim:
+The r14 result uses stock MTPLX `2.9.0` with the frozen temperature-`0` agent contract. Its
+primary value gate is valid agent outcomes and deadline-penalized time to a valid outcome:
 
 | Claim | Retained data |
 |---|---:|
-| Quality | Proxy `158/180` vs direct `99/180`; proxy won `6/6` pairs |
-| Decode retained | `101.4%` of direct cold; `100.7%` warm-prefix |
-| RAM-prefix reuse | Identical proxy request: `0/3609` then `3609/3609` cached tokens |
-| Remaining latency gap | Agentic p95 `170.5%` cold; `145.6%` warm (`125%` gate not passed) |
+| Valid outcomes | Proxy `220/240` vs direct `160/240` (`+25.0` percentage points) |
+| Time to valid outcome | Proxy/direct deadline-penalized mean ratio `0.268` |
+| Decode retained | `101.1%` of direct cold; `100.4%` warm-prefix |
+| Conditional both-valid diagnostic | Independently reviewed retained-row p50: `4.290 s` direct to `5.077 s` proxy (`+18.3%`); this is not the promotion gate |
 
 ```bash
 python3 -m venv .venv-mtplx
@@ -45,8 +49,8 @@ UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE=phase_split docker compose up --build -d
 
 Keep an opaque Chat Completions `user` value stable per conversation for MTPLX session affinity.
 SSD cache is off above; MTPLX RAM-prefix reuse remains active. Do not select experimental
-`combined_v1`. Evidence: [AEON qualification](benchmark-reports/aeon-historical-parity-result-2026-08-20.md)
-and [latency probes](benchmark-reports/latency-optimization-progress-2026-08-20.md).
+`combined_v1`. The comparison used a fixed direct-then-proxy sequence, not randomized treatment
+order, so it supports no causal claim. Evidence: [public r14 result](benchmark-reports/v2-qualification-result-2026-08-24.json).
 
 ## Local development
 
@@ -246,10 +250,9 @@ vulnerability/secret/misconfiguration scan, SBOM generation, release-manifest ca
 provenance attestation. The complete evidence boundary is summarized in
 [Release status](RELEASE_STATUS.md); benchmark methodology and frozen promotion gates are documented
 in [benchmarking](docs/benchmarking.md), the
-[v1 qualification plan](benchmark-reports/v1-qualification-plan.md), and the
-[qualification result](benchmark-reports/v1-qualification-result-2026-08-20.md). The separate
-[AEON historical-parity result](benchmark-reports/aeon-historical-parity-result-2026-08-20.md)
-records the later positive quality evidence and controlled-deployment limits.
+[v2 qualification plan](benchmark-reports/v2-qualification-plan.md), and the
+[public r14 result](benchmark-reports/v2-qualification-result-2026-08-24.json).
 
-This is an unreleased `0.1.0` candidate. Authorized operators may deploy the exact evaluated image
-under the documented exception; no package or container image is a stable public release.
+This is a qualified exact-image deployment, not a generally available package or image. Authorized
+operators must preload or mirror the evaluated digest into an approved private registry; a source
+build, a local tag, or a later commit is not the qualified artifact.

@@ -22,6 +22,11 @@ approved rollback image, and the complete ordered scenario set. It also binds ea
 **deadline**: a manifest-bound end-to-end SLO selected for that scenario before request 1 and
 identical for its direct and proxy treatments. A deadline begins when the harness submits the
 request and includes admission, model work, policy work, tool turns, retries, and final response.
+The required `rollback` object binds the predecessor's digest-qualified `reference`, matching
+`digest`, `source_commit`, GitHub Actions `workflow_url`, exact
+`approval_designation: "approved-predecessor"`, and `approval_evidence_url`. The runtime rejects
+any missing, extra, malformed, or mismatched rollback field before it starts Docker or benchmark
+traffic, and writes the same object into the immutable preflight attestation.
 
 Both arms use the same stock harness release, complete visible transcript, tool executor, model
 server contract, scenario order, and cache-lane procedure. The proxy is the only treatment.

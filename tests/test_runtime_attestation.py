@@ -318,6 +318,7 @@ def test_runtime_attestation_loads_exact_verified_identity(tmp_path) -> None:
         "stage": "preflight",
         "source_commit": "a" * 40,
         "image_digest": "sha256:" + "b" * 64,
+        "rollback": _valid_rollback_attestation_document(),
         "run_manifest_sha256": "c" * 64,
         "model_id_sha256": "18fb9fa0b971b807a1312d3702d18747a3b1b39a129df8c5d1a8f68d512bd1fd",
         "benchmark_revision": BENCHMARK_REVISION,
@@ -336,6 +337,7 @@ def test_runtime_attestation_loads_exact_verified_identity(tmp_path) -> None:
             "observer": True,
             "ready": True,
             "secret_roles_distinct": True,
+            "rollback_binding": True,
         },
     }
     serialized = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
@@ -357,6 +359,7 @@ def test_runtime_attestation_loads_exact_verified_identity(tmp_path) -> None:
     assert attestation.runtime_contract_sha256 == "d" * 64
     assert attestation.model_identity_sha256 == "f" * 64
     assert attestation.runtime_instance_sha256 == "e" * 64
+    assert attestation.rollback.digest == "sha256:" + "1" * 64
 
 
 def test_runtime_outcome_loads_exact_private_evidence_identity(tmp_path) -> None:
@@ -745,6 +748,7 @@ def test_runtime_outcome_rejects_untrusted_or_tampered_private_evidence(tmp_path
         ("model_identity_sha256", "F" * 64),
         ("runtime_contract_sha256", "D" * 64),
         ("runtime_instance_sha256", "e" * 63),
+        ("rollback", {"digest": "sha256:" + "1" * 64}),
         ("checks", {"exact_image": True}),
         ("private_prompt", "must never survive validation"),
     ],
@@ -758,6 +762,7 @@ def test_runtime_attestation_rejects_any_non_allowlisted_or_mismatched_field(tmp
         "stage": "preflight",
         "source_commit": "a" * 40,
         "image_digest": "sha256:" + "b" * 64,
+        "rollback": _valid_rollback_attestation_document(),
         "run_manifest_sha256": "c" * 64,
         "model_id_sha256": "18fb9fa0b971b807a1312d3702d18747a3b1b39a129df8c5d1a8f68d512bd1fd",
         "benchmark_revision": BENCHMARK_REVISION,
@@ -776,6 +781,7 @@ def test_runtime_attestation_rejects_any_non_allowlisted_or_mismatched_field(tmp
             "observer": True,
             "ready": True,
             "secret_roles_distinct": True,
+            "rollback_binding": True,
         },
     }
     document[field] = replacement
@@ -803,6 +809,7 @@ def _valid_attestation_document() -> dict[str, object]:
         "stage": "preflight",
         "source_commit": "a" * 40,
         "image_digest": "sha256:" + "b" * 64,
+        "rollback": _valid_rollback_attestation_document(),
         "run_manifest_sha256": "c" * 64,
         "model_id_sha256": "18fb9fa0b971b807a1312d3702d18747a3b1b39a129df8c5d1a8f68d512bd1fd",
         "benchmark_revision": BENCHMARK_REVISION,
@@ -821,8 +828,54 @@ def _valid_attestation_document() -> dict[str, object]:
             "observer": True,
             "ready": True,
             "secret_roles_distinct": True,
+            "rollback_binding": True,
         },
     }
+
+
+def _valid_rollback_attestation_document() -> dict[str, str]:
+    digest = "sha256:" + "1" * 64
+    return {
+        "reference": "registry.example/shiftedx@" + digest,
+        "digest": digest,
+        "source_commit": "2" * 40,
+        "workflow_url": "https://github.com/shiftedx/shiftedx-agent-harness-proxy/actions/runs/1",
+        "approval_designation": "approved-predecessor",
+        "approval_evidence_url": "https://api.github.com/repos/shiftedx/shiftedx-agent-harness-proxy/issues/comments/1",
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("reference", "registry.example/shiftedx:latest"),
+        ("reference", "registry.example/shiftedx@sha256:" + "3" * 64),
+        ("digest", "sha256:" + "b" * 64),
+        ("source_commit", "not-a-commit"),
+        ("workflow_url", "https://github.com/shiftedx/shiftedx-agent-harness-proxy/actions/workflows/ci.yml"),
+        ("approval_designation", "candidate"),
+        ("approval_evidence_url", "https://github.com/shiftedx/shiftedx-agent-harness-proxy/issues/19"),
+    ],
+)
+def test_runtime_attestation_rejects_invalid_rollback_binding(tmp_path, field, replacement) -> None:
+    path = tmp_path / "runtime-attestation.json"
+    document = _valid_attestation_document()
+    rollback = document["rollback"]
+    assert isinstance(rollback, dict)
+    rollback[field] = replacement
+    path.write_text(json.dumps(document), encoding="utf-8")
+    path.chmod(0o600)
+
+    with pytest.raises(RuntimeAttestationFailure, match="^runtime_attestation_invalid$"):
+        load_runtime_attestation(
+            path,
+            expected_stage="preflight",
+            source_commit="a" * 40,
+            image_digest="sha256:" + "b" * 64,
+            run_manifest_sha256="c" * 64,
+            model="model",
+            scenario_order=["case-1", "case-2"],
+        )
 
 
 def _write_model_evidence(

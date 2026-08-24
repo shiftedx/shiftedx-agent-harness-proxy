@@ -1,13 +1,13 @@
-# v1 operator runbook
+# r14 qualified operator runbook
 
-This runbook covers the authenticated, non-streaming v1 Chat Completions release candidate. The
+This runbook covers the authenticated r14-qualified Chat Completions image. The
 Harness Proxy is policy middleware: it does not provide TLS, execute tools, select arbitrary
 upstreams, or sandbox the Downstream Client's tool runner.
 
-The exact AEON-tested artifact is authorized for controlled deployment under the latency exception
-in [Release status](../RELEASE_STATUS.md). It is not a stable/public release or production-certified.
-That exact artifact is non-streaming. A later source checkout that accepts `stream=true` is not a
-substitute; validate-then-replay SSE requires its own immutable image and compatibility evidence.
+The exact r14 artifact is qualified for controlled production deployment under
+[Release status](../RELEASE_STATUS.md). It is not generally available: no durable public image
+reference exists. `stream=true` is qualified validate-then-replay compatibility streaming, not a
+progressive/token-time or TTFT improvement. A later source checkout is not a substitute.
 
 ## Supported topology
 
@@ -39,12 +39,12 @@ Record and retain:
 For production qualification or promotion, deploy an exact approved image. Do not rebuild from a
 floating branch or use an unverified local tag.
 
-The controlled-deployment candidate is source
-`75424328ce0dc0bcef6171b42e390c5ba8559471`, signed ARM64 OCI root
-`sha256:c673ec73ffded8d28200f6157b696fb451735a3416a55407e686587150fe4230`.
-That digest identifies the retained CI artifact; it is not a registry URL. Verify and preload the
-artifact or mirror it to an approved internal registry, then use that registry's immutable digest
-reference. A source build does not reproduce the evaluated bytes.
+The qualified candidate is source `b5cdd1e5d5444d3064179baea0dc30cccfecb0ee`, OCI index
+`sha256:cee2d12b263358414ff4519d11220d319684a431d4894215b04baedf0807afed`. Its approved rollback
+predecessor is `sha256:c673ec73ffded8d28200f6157b696fb451735a3416a55407e686587150fe4230`.
+These are retained artifact identities, not registry URLs. Verify and preload them or mirror them
+to an approved internal registry, preserving the digests; a source build does not reproduce the
+evaluated bytes.
 
 ## Secrets
 
@@ -135,7 +135,7 @@ list. Save the exact rendered configuration digest with the deployment record.
 
 ## Hermes provider
 
-For a separately qualified immutable streaming image, save this as `$HERMES_HOME/config.yaml`,
+For the qualified exact image, save this as `$HERMES_HOME/config.yaml`,
 replace the endpoint and model ID, and keep the bearer token out of the file:
 
 ```yaml
@@ -160,10 +160,9 @@ environment variable and sends it as the provider bearer. Do not put the credent
 `hermes chat --provider shiftedx-proxy --model served-model-id`. Hermes uses the stock Chat
 Completions API; when it requests streaming, the proxy performs validate-then-replay: it buffers
 and validates the complete upstream completion before emitting OpenAI-compatible SSE events. This
-is compatibility streaming, not a token-time/TTFT improvement. Do not use this configuration to
-claim that the historical non-streaming candidate is qualified for streaming.
+is compatibility streaming, not a token-time/TTFT improvement.
 
-The quality result also binds the client-side `historical-aeon-v1` sampler: temperature `1.0`,
+The quality result binds the client-side r14 sampler: temperature `0.0`,
 top-p `0.95`, top-k `20`, thinking enabled at medium effort, and a 1024-token response limit.
 Changing that profile is allowed operationally but is not covered by the reported quality evidence.
 
@@ -251,8 +250,8 @@ window and the existing ingress/container collector for end-to-end latency and r
 
 Start with one backend or no more than 5% of traffic for 15 minutes. Expand only if every row stays
 within its threshold; otherwise remove the canary from ingress and use the rollback procedure. The
-historical AEON result still fails the end-to-end p95 gate, so these rules do not authorize its
-promotion without fresh exact-image evidence.
+r14 result passed its conditional both-valid p95 diagnostic, but its primary claim remains improved
+valid outcomes and deadline-penalized time to valid outcome, not lower raw inference latency.
 
 ## Public error and retry behavior
 
@@ -303,15 +302,16 @@ rebuild it during an incident.
    smoke.
 7. Restore ingress only after the prior version is ready and record elapsed rollback time.
 
-The v1 promotion gate is a complete rollback within 60 seconds once the prior image is locally
+The r14 gate is a complete rollback within 60 seconds once the prior image is locally
 available. If rollback fails, keep traffic removed, preserve evidence, and record `DO NOT PROMOTE`;
 do not delete or rewrite remote tags or artifacts to conceal the failed candidate.
 
 ## Evidence and disclosure
 
-Follow the [v1 qualification plan](../benchmark-reports/v1-qualification-plan.md) for model-backed
-promotion. Raw transcripts and model output belong only under ignored private storage. Public
-reports use sanitized per-case/aggregate ledgers and allowlist-only Local Projection accounting.
+Follow the [v2 qualification plan](../benchmark-reports/v2-qualification-plan.md) and
+[public r14 result](../benchmark-reports/v2-qualification-result-2026-08-24.json) for model-backed
+deployment. Raw transcripts and model output belong only under ignored private storage. Public
+reports use sanitized aggregate ledgers and allowlist-only Local Projection accounting.
 
 Security incidents go through a private GitHub Security Advisory as described in
 [SECURITY.md](../SECURITY.md). Operational questions may use public issues only when reproductions

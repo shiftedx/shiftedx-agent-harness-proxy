@@ -1,0 +1,156 @@
+name: publish retained release candidate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  attestations: write
+  contents: write
+  id-token: write
+  packages: write
+
+jobs:
+  publish-retained-oci:
+    runs-on: ubuntu-latest
+    env:
+      ARTIFACT_NAME: shiftedx-proxy-release-candidate
+      CI_RUN_ID: "32677963227"
+      EXPECTED_ARCHIVE_SHA256: 7f588da3fa604718193202d70afdbcbe82df6e6809d50b3a162a12c0a5471015
+      EXPECTED_DIGEST: sha256:cee2d12b263358414ff4519d11220d319684a431d4894215b04baedf0807afed
+      EXPECTED_SOURCE_COMMIT: b5cdd1e5d5444d3064179baea0dc30cccfecb0ee
+      IMAGE: ghcr.io/shiftedx/shiftedx-agent-harness-proxy
+      TAG: v0.1.0-rc.1
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Refuse an unexpected repository or existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "shiftedx/shiftedx-agent-harness-proxy"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release already exists; immutable prerelease publication refuses to overwrite it" >&2
+            exit 1
+          fi
+          existing_tag="$(git ls-remote --refs origin "refs/tags/$TAG" | awk '{print $1}')"
+          if test -n "$existing_tag" && test "$existing_tag" != "$EXPECTED_SOURCE_COMMIT"; then
+            echo "existing tag does not name the retained source commit" >&2
+            exit 1
+          fi
+
+      - name: Download retained CI artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir retained
+          gh run download "$CI_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$ARTIFACT_NAME" --dir retained
+
+      - name: Verify retained archive and release manifest
+        id: retained
+        run: |
+          set -euo pipefail
+          locate_one() {
+            local name="$1"
+            local count
+            count="$(find retained -type f -name "$name" -print | wc -l | tr -d ' ')"
+            test "$count" = 1
+            find retained -type f -name "$name" -print -quit
+          }
+          archive="$(locate_one shiftedx-proxy.oci.tar)"
+          manifest="$(locate_one release-manifest.json)"
+          metadata="$(locate_one multiarch-build-metadata.json)"
+          sbom="$(locate_one shiftedx-proxy-smoke-image.sbom.cdx.json)"
+          printf '%s  %s\n' "$EXPECTED_ARCHIVE_SHA256" "$archive" | sha256sum --check --status
+          jq -e \
+            --arg source "$EXPECTED_SOURCE_COMMIT" \
+            --arg digest "$EXPECTED_DIGEST" \
+            '.schema_version == 1
+             and .source_commit == $source
+             and .release_candidate.digest == $digest
+             and .release_candidate.platforms == ["linux/amd64", "linux/arm64"]
+             and .release_candidate.sbom == "embedded Buildx SBOM attestations in the OCI archive"' \
+            "$manifest" >/dev/null
+          test "$(jq -r '.containerimage.digest' "$metadata")" = "$EXPECTED_DIGEST"
+          printf '%s\n' "archive=$archive" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "manifest=$manifest" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "metadata=$metadata" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "sbom=$sbom" >> "$GITHUB_OUTPUT"
+
+      - name: Install skopeo
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes skopeo
+
+      - name: Verify embedded OCI attestations before copying
+        env:
+          ARCHIVE: ${{ steps.retained.outputs.archive }}
+        run: |
+          set -euo pipefail
+          skopeo inspect --raw "oci-archive:$ARCHIVE" > retained/source-index.json
+          test "$(sha256sum retained/source-index.json | awk '{print "sha256:" $1}')" = "$EXPECTED_DIGEST"
+          jq -e '
+            .mediaType == "application/vnd.oci.image.index.v1+json"
+            and ([.manifests[] | select(.platform.architecture == "amd64" and .platform.os == "linux")] | length == 1)
+            and ([.manifests[] | select(.platform.architecture == "arm64" and .platform.os == "linux")] | length == 1)
+            and ([.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest")] | length >= 2)
+          ' retained/source-index.json >/dev/null
+
+      - name: Copy the exact OCI index to GHCR
+        env:
+          ARCHIVE: ${{ steps.retained.outputs.archive }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | skopeo login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          skopeo copy --all --preserve-digests \
+            "oci-archive:$ARCHIVE" \
+            "docker://$IMAGE:$TAG"
+
+      - name: Verify the pushed digest and embedded OCI attestations
+        run: |
+          set -euo pipefail
+          skopeo inspect --raw "docker://$IMAGE@$EXPECTED_DIGEST" > retained/ghcr-index.json
+          test "$(sha256sum retained/ghcr-index.json | awk '{print "sha256:" $1}')" = "$EXPECTED_DIGEST"
+          test "$(skopeo inspect --format '{{.Digest}}' "docker://$IMAGE:$TAG")" = "$EXPECTED_DIGEST"
+          jq -e '
+            .mediaType == "application/vnd.oci.image.index.v1+json"
+            and ([.manifests[] | select(.platform.architecture == "amd64" and .platform.os == "linux")] | length == 1)
+            and ([.manifests[] | select(.platform.architecture == "arm64" and .platform.os == "linux")] | length == 1)
+            and ([.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest")] | length >= 2)
+          ' retained/ghcr-index.json >/dev/null
+
+      - name: Attest the pushed GHCR digest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.1
+        with:
+          subject-name: ghcr.io/shiftedx/shiftedx-agent-harness-proxy
+          subject-digest: sha256:cee2d12b263358414ff4519d11220d319684a431d4894215b04baedf0807afed
+          push-to-registry: true
+
+      - name: Create immutable prerelease and retained evidence assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE: ${{ steps.retained.outputs.archive }}
+          MANIFEST: ${{ steps.retained.outputs.manifest }}
+          METADATA: ${{ steps.retained.outputs.metadata }}
+          SBOM: ${{ steps.retained.outputs.sbom }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$EXPECTED_SOURCE_COMMIT"
+          test "$(git rev-parse FETCH_HEAD)" = "$EXPECTED_SOURCE_COMMIT"
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$EXPECTED_SOURCE_COMMIT" \
+            --prerelease \
+            --title "v0.1.0-rc.1" \
+            --notes "Exact retained OCI archive from CI run $CI_RUN_ID. This prerelease was copied without rebuilding; its GHCR index digest is $EXPECTED_DIGEST." \
+            "$ARCHIVE#shiftedx-proxy.oci.tar" \
+            "$MANIFEST#release-manifest.json" \
+            "$METADATA#multiarch-build-metadata.json" \
+            "$SBOM#shiftedx-proxy-smoke-image.sbom.cdx.json"
