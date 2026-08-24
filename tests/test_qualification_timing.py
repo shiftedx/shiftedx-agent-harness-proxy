@@ -40,6 +40,7 @@ def _observer(sequence: int = 1, *, phase: str = "acquisition", status: int | No
         "digest": hashlib.sha256(f"observer-{sequence}".encode()).hexdigest(),
         "fields": {"compatibility": {"phase": phase}},
         "response": {"status_code": status, "cache": None},
+        "correlation_id_sha256": "c" * 64,
     }
 
 
@@ -141,6 +142,7 @@ def _capture(*, attempts: list[dict[str, object]] | None = None, **overrides: ob
         "schema_version": "2.1",
         "record_type": "qualification_timing_capture",
         "sequence": 1,
+        "correlation_id_sha256": "c" * 64,
         "outcome": "succeeded",
         "downstream_wall_ns": components + sum(int(attempt["wall_ns"]) for attempt in selected),
         "admission_wait_ns": 1,
@@ -270,6 +272,7 @@ def test_proxy_finalization_rejects_outcome_join_mismatch_without_final_artifact
                 "observer_record_count": 1,
                 "direct_attempt_wall_ns": [],
                 "downstream_request_sha256": "d" * 64,
+                "correlation_id_sha256": "c" * 64,
             },
             separators=(",", ":"),
         )
@@ -335,6 +338,7 @@ def test_proxy_finalization_reconciles_ordinary_terminal_attempt(tmp_path: Path)
                 "observer_record_count": 1,
                 "direct_attempt_wall_ns": [],
                 "downstream_request_sha256": "d" * 64,
+                "correlation_id_sha256": "c" * 64,
             },
             separators=(",", ":"),
         )
@@ -393,6 +397,17 @@ def test_timing_ledger_rejects_missing_duplicate_reordered_malformed_and_partial
     mutator(row)
     with pytest.raises(TimingFailure):
         write_timing_ledger(tmp_path / "timing.jsonl", [row])
+
+
+def test_raw_timing_capture_requires_a_correlation_hash(tmp_path: Path) -> None:
+    capture = _capture()
+    capture.pop("correlation_id_sha256")
+    path = tmp_path / "capture.jsonl"
+    path.write_bytes(canonical_json(capture) + b"\n")
+    path.chmod(0o600)
+
+    with pytest.raises(TimingFailure, match="^qualification_timing_ledger_invalid$"):
+        read_timing_capture_ledger(path)
 
 
 def test_timing_ledger_rejects_unexplained_nanosecond_delta(tmp_path: Path) -> None:

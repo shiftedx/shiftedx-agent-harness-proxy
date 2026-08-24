@@ -17,7 +17,6 @@ from .cache_policy import (
 from .config import Settings, configured_roles
 from .core import HARNESS_SYSTEM_SUFFIX, AgentHarness, bare_json_issue, normalize_bare_json
 from .errors import ProxyError, UpstreamFailure
-from .fast_path import FastPathObserver, classify_fast_path, compare_fast_path_shadow
 from .projection_accounting import LOCAL_PROJECTION_EXTENSION, local_projection_accounting
 from .provider_capabilities import (
     CapabilityPhase,
@@ -39,6 +38,7 @@ from .transport import Upstream
 
 JsonObject = dict[str, Any]
 REQUIRE_RECEIPT_EXTENSION = "x-shiftedx-require-receipt"
+TOOL_DENY_EXTENSION = "x-shiftedx-denied-tools"
 
 
 @dataclass(frozen=True)
@@ -66,14 +66,12 @@ class ChatService:
         self,
         settings: Settings,
         upstream: Upstream,
-        *,
-        fast_path_observer: FastPathObserver | None = None,
     ) -> None:
         self.settings = settings
         self.upstream = upstream
         self.base_roles = configured_roles(settings)
         self.cache_namespace_fields = settings.cache_namespace_fields()
-        self.fast_path_observer = fast_path_observer
+        self.denied_tools = settings.denied_tool_names()
 
     async def complete(
         self,
@@ -84,9 +82,16 @@ class ChatService:
         policy_extensions_allowed: bool = False,
         trusted_policy_extension_used: bool = False,
         server_cache_namespace: ServerCacheNamespace | None = None,
+        intervention_counts: list[int] | None = None,
     ) -> ChatResult:
         started = time.perf_counter()
         _validate_chat_payload(payload, harness_enabled=harness_enabled)
+        if not harness_enabled and self.denied_tools:
+            raise ProxyError(
+                403,
+                "harness_opt_out_denied_by_tool_policy",
+                "Harness opt-out is unavailable for this request.",
+            )
         try:
             reject_client_cache_namespaces(
                 payload,
@@ -102,6 +107,12 @@ class ChatService:
             ) from exc
         if payload.get("stream") is True:
             raise ProxyError(400, "streaming_not_supported", "stream=true is not supported by this proxy version.")
+        if TOOL_DENY_EXTENSION in payload:
+            raise ProxyError(
+                400,
+                "tool_deny_override_denied",
+                "Tool deny policy is configured only by the server.",
+            )
 
         forwarded = copy.deepcopy(payload)
         has_receipt_override = REQUIRE_RECEIPT_EXTENSION in forwarded
@@ -197,15 +208,15 @@ class ChatService:
         except ValueError as exc:
             raise ProxyError(400, "invalid_messages", str(exc)) from exc
         harness = rebuilt.harness
-        _snapshot_timing(harness, retry_attempt_count=0)
+        _snapshot_timing(harness, intervention_counts=intervention_counts)
 
         projection = _project_latest_if_current(forwarded["messages"], rebuilt)
         if projection is not None:
             _snapshot_timing(
                 harness,
-                retry_attempt_count=0,
                 local_projection=True,
                 avoided_immediate_upstream_calls=1,
+                intervention_counts=intervention_counts,
             )
             body = _projected_response(str(forwarded.get("model", "")), projection)
             return ChatResult(
@@ -221,27 +232,21 @@ class ChatService:
                 ),
             )
 
-        fast_path_decision = classify_fast_path(
-            mode=self.settings.intervention_fast_path_mode,
-            harness_enabled=harness_enabled,
-            has_receipt_extension=has_receipt_override,
-            normalized_tools=tools,
-            has_response_format="response_format" in forwarded,
-            has_tool_choice="tool_choice" in forwarded,
-            has_parallel_tool_calls="parallel_tool_calls" in forwarded,
-            rebuilt=rebuilt,
-            local_projection_available=projection is not None,
-            uses_phase_split=use_phase_split,
-            uses_combined_capability=use_combined,
-        )
         working_messages = _inject_harness(copy.deepcopy(forwarded["messages"]), harness, rebuilt)
-        if fast_path_decision.eligible and self.fast_path_observer is not None:
-            candidate_payload = outbound_payload(forwarded, copy.deepcopy(forwarded["messages"]), phase=None)
-            normal_payload = outbound_payload(forwarded, working_messages, phase=None)
-            self.fast_path_observer.record(compare_fast_path_shadow(candidate_payload, normal_payload, rebuilt))
         upstream_calls = 0
         internal_retries = 0
         phase: CapabilityPhase | None = "acquisition" if use_phase_split else None
+        if (
+            use_phase_split
+            and forwarded.get("tool_choice") == "none"
+            and bool(harness.receipts)
+            and harness.receipts[-1].status == "success"
+            and not rebuilt.degraded
+            and not harness.pending_verification
+            and not harness.open_failures
+            and not harness.last_action_blocked
+        ):
+            phase = "finalization"
 
         while upstream_calls < self.settings.max_upstream_calls:
             if use_phase_split and harness.force_finalize:
@@ -270,10 +275,10 @@ class ChatService:
                             ),
                         }
                     )
-                    _snapshot_timing(harness, retry_attempt_count=internal_retries)
+                    _snapshot_timing(harness, intervention_counts=intervention_counts)
                     continue
-                rejected = _rejected_results(calls, harness)
-                _snapshot_timing(harness, retry_attempt_count=internal_retries)
+                rejected = _rejected_results(calls, harness, self.denied_tools)
+                _snapshot_timing(harness, intervention_counts=intervention_counts)
                 if not rejected:
                     return ChatResult(
                         _without_reserved_projection_marker(response),
@@ -301,8 +306,7 @@ class ChatService:
                         separators=(",", ":"),
                     )
                     working_messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
-                working_messages.append({"role": "user", "content": harness.render()})
-                _snapshot_timing(harness, retry_attempt_count=internal_retries)
+                _snapshot_timing(harness, intervention_counts=intervention_counts)
                 continue
 
             content = message.get("content")
@@ -340,7 +344,7 @@ class ChatService:
             internal_retries += 1
             working_messages.append({"role": "assistant", "content": content})
             working_messages.append({"role": "user", "content": harness.correction(issue)})
-            _snapshot_timing(harness, retry_attempt_count=internal_retries)
+            _snapshot_timing(harness, intervention_counts=intervention_counts)
 
         raise ProxyError(
             502,
@@ -377,7 +381,6 @@ class ChatService:
                 if retries >= self.settings.max_internal_retries:
                     break
                 retries += 1
-                _snapshot_phase_split_timing(retries)
                 continue
             if phase == "acquisition":
                 phase = "finalization"
@@ -387,7 +390,6 @@ class ChatService:
             if retries >= self.settings.max_internal_retries:
                 break
             retries += 1
-            _snapshot_phase_split_timing(retries)
         raise ProxyError(
             502,
             "harness_retry_exhausted",
@@ -405,38 +407,27 @@ def _tool_name(tool: JsonObject) -> str:
 def _snapshot_timing(
     harness: AgentHarness,
     *,
-    retry_attempt_count: int,
     local_projection: bool = False,
     avoided_immediate_upstream_calls: int = 0,
+    intervention_counts: list[int] | None = None,
 ) -> None:
     """Preserve policy mutations even when a later upstream turn fails."""
 
+    if intervention_counts is not None:
+        intervention_counts[:] = [
+            harness.terminal_corrections,
+            harness.blocked_duplicates,
+            harness.blocked_stalls,
+        ]
     timing = current_request_timing()
     if timing is not None:
         timing.record_interventions(
             correction_count=harness.terminal_corrections,
             blocked_duplicate_count=harness.blocked_duplicates,
             blocked_stall_count=harness.blocked_stalls,
-            retry_attempt_count=retry_attempt_count,
             local_projection=local_projection,
             avoided_immediate_upstream_calls=avoided_immediate_upstream_calls,
         )
-
-
-def _snapshot_phase_split_timing(retry_attempt_count: int) -> None:
-    """Retain phase-split retry state even though harness policy is off."""
-
-    timing = current_request_timing()
-    if timing is not None:
-        timing.record_interventions(
-            correction_count=0,
-            blocked_duplicate_count=0,
-            blocked_stall_count=0,
-            retry_attempt_count=retry_attempt_count,
-            local_projection=False,
-            avoided_immediate_upstream_calls=0,
-        )
-
 
 def _off_result(
     response: JsonObject, started: float, upstream_calls: int, policy_extension_used: bool
@@ -616,7 +607,7 @@ def _inject_harness(messages: list[Any], harness: AgentHarness, rebuilt: Reconst
 
 def _response_message(response: JsonObject) -> JsonObject:
     choices = response.get("choices")
-    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
         raise UpstreamFailure("upstream_malformed_completion")
     message = choices[0].get("message")
     if not isinstance(message, dict):
@@ -640,7 +631,9 @@ def _call_arguments(call: JsonObject) -> tuple[str, dict[str, Any]]:
     return str(function["name"]), arguments
 
 
-def _rejected_results(calls: list[Any], harness: AgentHarness) -> dict[int, str]:
+def _rejected_results(
+    calls: list[Any], harness: AgentHarness, denied_tools: frozenset[str]
+) -> dict[int, str]:
     rejected: dict[int, str] = {}
     every_rejection_can_finalize = True
     for index, raw_call in enumerate(calls):
@@ -655,6 +648,19 @@ def _rejected_results(calls: list[Any], harness: AgentHarness) -> dict[int, str]
             harness.last_action_blocked = True
             every_rejection_can_finalize = False
             rejected[index] = '{"shiftedx_harness":"invalid_tool_arguments"}'
+            continue
+        if name in denied_tools:
+            harness.last_action_blocked = True
+            every_rejection_can_finalize = False
+            rejected[index] = json.dumps(
+                {
+                    "shiftedx_harness": "tool_denied_by_server",
+                    "execution_status": "blocked_not_executed",
+                    "fact": "This proposed call was blocked by the proxy and did not reach the client executor.",
+                    "instruction": "Choose a permitted tool or return a safe final answer.",
+                },
+                separators=(",", ":"),
+            )
             continue
         stalled = harness.stalled_result(name)
         prior = harness.duplicate(name, arguments) if stalled is None else None

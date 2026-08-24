@@ -65,12 +65,17 @@ is idle.
 upstream operation at a time. The monotonic `TOTAL_REQUEST_DEADLINE_SECONDS` begins before admission
 queueing and covers queueing, reading up to `MAX_REQUEST_BYTES`, validation, reconstruction, every
 retry/upstream operation, disconnect cleanup, and response construction. The deadline never resets
-for retries. A downstream disconnect cancels in-flight policy/upstream work and releases both gates.
+for retries. For validate-then-replay SSE, it also covers downstream replay delivery. A downstream
+disconnect cancels in-flight policy/upstream work and releases both gates.
 
 Overload has no queue-detail disclosure: admission/concurrency/rate rejection returns `429` with
 `admission_overloaded`, `principal_concurrency_limited`, or `principal_rate_limited`, respectively,
 and only the configured bounded numeric `Retry-After`. Deadline expiry returns
-`504 request_deadline_exceeded`. Upstream-operation queue timeout returns
+`504 request_deadline_exceeded` before response headers are sent. After validate-then-replay SSE
+headers are sent, expiry releases admission before attempting a clean truncated SSE EOF without a
+`[DONE]` event. That bounded best-effort send may fall back to a connection close without a complete
+EOF if downstream capacity cannot accept it; HTTP cannot replace an already-started response with a
+504. Upstream-operation queue timeout returns
 `503 upstream_concurrency_limited` with the same bounded hint. Metrics are aggregate prompt-free counters for admission/rate
 rejection, deadline expiry, and cancellation; active/queued downstream work and active upstream work
 are gauges without principal labels.
@@ -135,6 +140,14 @@ one of the four allowed strings; invalid inputs return `400 conflicting_role_ann
 `400 invalid_role_annotation`. A server configuration that assigns the same name to multiple roles
 is invalid.
 
+`DENIED_TOOLS` is a separate comma-separated, server-only deny set. A matching proposed call is
+withheld before client execution and receives a bounded correction result with
+`execution_status=blocked_not_executed`; the result does not reveal the tool name. If one call in a
+parallel batch is denied, the complete batch is withheld. Request-side
+`x-shiftedx-denied-tools` overrides are rejected with `400 tool_deny_override_denied` and are never
+forwarded upstream. While this server policy is nonempty, harness opt-out is rejected with
+`403 harness_opt_out_denied_by_tool_policy`; a trusted principal cannot bypass the deny set.
+
 An operator can explicitly authorize a separate authenticated policy-extension principal with
 `TRUSTED_POLICY_EXTENSION_API_KEYS`, a comma-separated list of opaque bearer capabilities. A request
 authenticated with one of those capabilities may change a protected role or use the trusted receipt
@@ -150,6 +163,15 @@ overlapping capability entries, so an ordinary bearer can never silently become 
 - A compact receipt contains sequence, tool, canonical argument signature, status, and epoch; raw
   result text is not retained in policy state.
 - Identical calls are blocked only within an unchanged epoch. Successful mutation increments it.
+- A blocked duplicate's internal synthetic result carries
+  `execution_status=blocked_not_executed` and states that the proposal did not reach the client
+  executor. Only downstream-visible assistant call IDs paired with client-supplied `role=tool`
+  results count as executed. The model is instructed to ground free-form prose in that ledger.
+- Under the strict, versioned `response_format.json_schema` contract named
+  `shiftedx_recovery_result_v1`, a terminal `failed_executions` integer must equal the number of
+  failed client-visible receipts; a mismatch enters the existing bounded terminal-correction path.
+  The same field under an unrelated schema keeps ordinary schema semantics. Free-form prose is not
+  semantically parsed and remains prompt-grounded rather than proxy-enforced.
 - Successful mutation opens a verification requirement. A successful verifier closes it.
 - Failed verification remains unresolved through investigation. It closes only after changed
   action and a later successful verifier.
@@ -203,24 +225,6 @@ exposed downstream. This mode is not part of the qualified MTPLX contract until 
 upstream artifact and model-backed preflight prove native tool calls, terminal schema enforcement,
 reasoning/tool transcript compatibility, cache behavior, and standard Chat Completions semantics.
 Qualification therefore continues to require `phase_split`.
-
-### Intervention fast-path shadow mode
-
-`INTERVENTION_FAST_PATH_MODE=disabled` is the default. `shadow` is a process-fixed observation mode:
-after validation and transcript reconstruction it admits only an empty-tool, no-receipt-extension,
-no-schema, no-tool-choice, non-degraded request with no policy state or phase capability work. It
-still sends the ordinary full harness payload. A private injected observer may retain only the two
-payload hashes, equivalence boolean, and reason category after proving that the candidate differs
-solely by the versioned harness suffix and rendered state. No request content, client header, or body
-field can select the mode. The ordinary production `create_app` entry point rejects `shadow` unless
-the caller explicitly injects an observer. That interface alone does not prove the observer is
-private, durable, or no-clobber; the live qualification sink is not yet wired to provide those
-properties, so attempting shadow qualification is a categorical configuration failure. `enabled`
-is rejected at startup until an immutable signed promotion authority and
-model-backed parity corpus are available. Shadow records bind the fixed eligibility contract
-`server_harness_passthrough_no_policy_work:v1` and mutation contract
-`shiftedx_harness_v1:system_suffix_and_state_prompt:v1` so later evidence cannot merge changed
-semantics.
 
 `/metrics` exposes only aggregate counters:
 `shiftedx_proxy_phase_acquisition_total`, `shiftedx_proxy_phase_finalization_total`, and
@@ -284,8 +288,8 @@ Harness opt-out is also a policy-control extension. `X-Shiftedx-Harness: off` is
 the server explicitly enables `ALLOW_HARNESS_OPT_OUT=true` and the request authenticates with a
 trusted policy-extension capability. An ordinary principal receives
 `403 harness_opt_out_denied` even when the server enables opt-out; when the server disables it, the
-existing `403 harness_opt_out_disabled` response applies. The proxy-only header is never forwarded
-upstream.
+existing `403 harness_opt_out_disabled` response applies. A nonempty server `DENIED_TOOLS` policy
+also rejects opt-out. The proxy-only header is never forwarded upstream.
 
 ## Stateless transcript reconstruction
 

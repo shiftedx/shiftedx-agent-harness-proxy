@@ -136,6 +136,7 @@ _CAPTURE_KEYS = frozenset(
         "schema_version",
         "record_type",
         "sequence",
+        "correlation_id_sha256",
         "outcome",
         "downstream_wall_ns",
         "admission_wait_ns",
@@ -323,7 +324,7 @@ class _CapturedAttempt:
 
 @dataclass
 class RequestTiming:
-    """One request-local capture; it never persists request content or identity."""
+    """One request-local capture; it persists only a correlation hash."""
 
     started_ns: int = field(default_factory=time.perf_counter_ns)
     admission_wait_ns: int = 0
@@ -334,10 +335,10 @@ class RequestTiming:
     correction_count: int = 0
     blocked_duplicate_count: int = 0
     blocked_stall_count: int = 0
-    retry_attempt_count: int = 0
     phase_counts: dict[str, int] = field(default_factory=lambda: {name: 0 for name in _PHASES})
     local_projection: bool = False
     avoided_immediate_upstream_calls: int = 0
+    correlation_id_sha256: str | None = None
     outcome: Literal["succeeded", "failed", "cancelled", "deadline"] | None = None
     response_finalize_started_ns: int | None = None
 
@@ -372,7 +373,6 @@ class RequestTiming:
         correction_count: int,
         blocked_duplicate_count: int,
         blocked_stall_count: int,
-        retry_attempt_count: int,
         local_projection: bool,
         avoided_immediate_upstream_calls: int,
     ) -> None:
@@ -382,7 +382,6 @@ class RequestTiming:
                 correction_count,
                 blocked_duplicate_count,
                 blocked_stall_count,
-                retry_attempt_count,
                 avoided_immediate_upstream_calls,
             )
         ) or not isinstance(local_projection, bool):
@@ -390,7 +389,6 @@ class RequestTiming:
         self.correction_count = correction_count
         self.blocked_duplicate_count = blocked_duplicate_count
         self.blocked_stall_count = blocked_stall_count
-        self.retry_attempt_count = retry_attempt_count
         self.local_projection = local_projection
         self.avoided_immediate_upstream_calls = avoided_immediate_upstream_calls
 
@@ -425,6 +423,7 @@ class RequestTiming:
             "schema_version": "2.1",
             "record_type": "qualification_timing_capture",
             "sequence": 0,
+            "correlation_id_sha256": self.correlation_id_sha256,
             "outcome": selected_outcome,
             "downstream_wall_ns": wall,
             "admission_wait_ns": self.admission_wait_ns,
@@ -438,7 +437,7 @@ class RequestTiming:
             "correction_count": self.correction_count,
             "blocked_duplicate_count": self.blocked_duplicate_count,
             "blocked_stall_count": self.blocked_stall_count,
-            "retry_attempt_count": self.retry_attempt_count,
+            "retry_attempt_count": len(attempts) - sum(count > 0 for count in self.phase_counts.values()),
             "phase_counts": dict(sorted(self.phase_counts.items())),
         }
 
@@ -451,8 +450,14 @@ _CURRENT_ATTEMPT: contextvars.ContextVar[_CapturedAttempt | None] = contextvars.
 )
 
 
-def begin_request_timing() -> tuple[RequestTiming, contextvars.Token[RequestTiming | None]]:
-    value = RequestTiming()
+def begin_request_timing(
+    correlation_id: str | None = None,
+) -> tuple[RequestTiming, contextvars.Token[RequestTiming | None]]:
+    value = RequestTiming(
+        correlation_id_sha256=(
+            None if correlation_id is None else hashlib.sha256(correlation_id.encode("utf-8")).hexdigest()
+        )
+    )
     return value, _CURRENT_REQUEST.set(value)
 
 
@@ -581,6 +586,7 @@ def read_provisional_client_timing_ledger(path: Path) -> tuple[dict[str, object]
             "observer_record_count",
             "direct_attempt_wall_ns",
             "downstream_request_sha256",
+            "correlation_id_sha256",
         }
     )
     try:
@@ -598,6 +604,11 @@ def read_provisional_client_timing_ledger(path: Path) -> tuple[dict[str, object]
             if row.get("outcome") not in _OUTCOMES or not _nonnegative(row.get("client_wall_ns")):
                 raise ValueError
             if not _sha256(row.get("downstream_request_sha256")):
+                raise ValueError
+            correlation_id_sha256 = row.get("correlation_id_sha256")
+            if (row["arm"] == "proxy" and not _sha256(correlation_id_sha256)) or (
+                row["arm"] == "direct" and correlation_id_sha256 is not None
+            ):
                 raise ValueError
             count, start, end = (
                 row.get("observer_record_count"),
@@ -764,7 +775,11 @@ def finalize_timing_evidence(
             # outcome that becomes the final request record.
             if client["outcome"] != capture["outcome"] or provisional_request.outcome != capture["outcome"]:
                 raise TimingFailure("qualification_timing_ledger_invalid")
+            if client.get("correlation_id_sha256") != capture.get("correlation_id_sha256"):
+                raise TimingFailure("qualification_timing_ledger_invalid")
             selected = _provisional_observer_slice(client, observers, next_observer)
+            if any(item.get("correlation_id_sha256") != capture["correlation_id_sha256"] for item in selected):
+                raise TimingFailure("qualification_timing_ledger_invalid")
             next_observer += len(selected)
             raw_attempts = capture.get("attempts")
             if not isinstance(raw_attempts, list) or len(raw_attempts) != len(selected):
@@ -869,6 +884,7 @@ def finalize_timing_evidence(
                 "schema_version": "2.1",
                 "record_type": "qualification_timing_capture",
                 "sequence": sequence,
+                "correlation_id_sha256": "0" * 64,
                 "outcome": client["outcome"],
                 "downstream_wall_ns": client_wall,
                 "admission_wait_ns": 0,
@@ -1524,6 +1540,7 @@ def _validate_capture_row(row: Mapping[str, object]) -> None:
         or row.get("schema_version") != "2.1"
         or row.get("record_type") != "qualification_timing_capture"
         or not _nonnegative(row.get("sequence"))
+        or not _sha256(row.get("correlation_id_sha256"))
         or row.get("outcome") not in _OUTCOMES
     ):
         raise TimingFailure("qualification_timing_ledger_invalid")

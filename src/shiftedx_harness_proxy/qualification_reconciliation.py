@@ -22,6 +22,7 @@ from typing import Literal, Protocol, cast
 from .qualification_contract import ModelBoundaryRecord
 
 CacheLane = Literal["cold", "warm-prefix"]
+CampaignVersion = Literal["v1", "v2"]
 RequestOutcome = Literal["succeeded", "failed", "cancelled", "deadline"]
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _FAILURE_CATEGORY = re.compile(r"^[a-z0-9_]+$")
@@ -308,18 +309,21 @@ def request_accounting_record_payload(record: RequestAccountingRecord) -> dict[s
 
 
 def load_passed_proxy_reconciliation(
-    path: Path, *, context: ReconciliationContext | None = None
+    path: Path,
+    *,
+    context: ReconciliationContext | None = None,
+    campaign_version: CampaignVersion = "v1",
 ) -> PassedProxyReconciliation:
     """Load exactly one passed reconciliation artifact bound to its full final context."""
 
     try:
         if context is not None:
-            _validate_context(context)
+            _validate_context(context, campaign_version=campaign_version)
         serialized = _read_private_regular_file(path)
         document = json.loads(serialized, object_pairs_hook=_unique_object)
     except (ReconciliationFailure, OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         raise ReconciliationFailure("reconciliation_artifact_invalid") from None
-    actual_context = _artifact_context(document)
+    actual_context = _artifact_context(document, campaign_version=campaign_version)
     if actual_context is None or not _valid_passed_artifact(document, actual_context):
         raise ReconciliationFailure("reconciliation_artifact_invalid")
     if context is not None and actual_context != context:
@@ -331,22 +335,33 @@ class ProxyReconciliationSession:
     """One begin/complete reconciliation transaction for a dedicated proxy."""
 
     def __init__(
-        self, identity: ReconciliationIdentity, metrics_reader: MetricsReader, before: MetricsSnapshot
+        self,
+        identity: ReconciliationIdentity,
+        metrics_reader: MetricsReader,
+        before: MetricsSnapshot,
+        campaign_version: CampaignVersion = "v1",
     ) -> None:
         self._identity = identity
         self._metrics_reader = metrics_reader
         self._before = before
+        self._campaign_version = campaign_version
         self._completed = False
 
     @classmethod
-    def begin(cls, identity: ReconciliationIdentity, metrics_reader: MetricsReader) -> ProxyReconciliationSession:
+    def begin(
+        cls,
+        identity: ReconciliationIdentity,
+        metrics_reader: MetricsReader,
+        *,
+        campaign_version: CampaignVersion = "v1",
+    ) -> ProxyReconciliationSession:
         """Validate immutable identity and require a fresh zero-counter proxy."""
 
-        _validate_identity(identity)
+        _validate_identity(identity, campaign_version=campaign_version)
         before = _snapshot(metrics_reader)
         if any(before.to_dict().values()):
             raise ReconciliationFailure("reconciliation_metrics_not_zero")
-        return cls(identity, metrics_reader, before)
+        return cls(identity, metrics_reader, before, campaign_version)
 
     def complete(
         self,
@@ -361,7 +376,7 @@ class ProxyReconciliationSession:
         if self._completed:
             raise ReconciliationFailure("reconciliation_complete_once")
         self._completed = True
-        _validate_context(context)
+        _validate_context(context, campaign_version=self._campaign_version)
         if not _context_matches_identity(context, self._identity):
             raise ReconciliationFailure("reconciliation_context_invalid")
         before_values = self._before.to_dict()
@@ -434,7 +449,13 @@ class ProxyReconciliationSession:
         return ReconciliationResult(artifact_path, hashlib.sha256(serialized).hexdigest(), "passed")
 
 
-def _validate_identity(identity: ReconciliationIdentity) -> None:
+def _validate_identity(identity: ReconciliationIdentity, *, campaign_version: CampaignVersion = "v1") -> None:
+    if campaign_version == "v1":
+        slot_limit, pair_limit = 6, 3
+    elif campaign_version == "v2":
+        slot_limit, pair_limit = 8, 4
+    else:
+        raise ReconciliationFailure("reconciliation_context_invalid")
     if (
         type(identity) is not ReconciliationIdentity
         or any(
@@ -446,15 +467,28 @@ def _validate_identity(identity: ReconciliationIdentity) -> None:
             )
         )
         or not _positive_int(identity.slot_ordinal)
-        or identity.slot_ordinal > 6
+        or identity.slot_ordinal > slot_limit
         or identity.cache_lane not in {"cold", "warm-prefix"}
         or not _positive_int(identity.pair_index)
-        or identity.pair_index > 3
+        or identity.pair_index > pair_limit
+    ):
+        raise ReconciliationFailure("reconciliation_context_invalid")
+    if campaign_version == "v2" and not (
+        (
+            1 <= identity.slot_ordinal <= 4
+            and identity.cache_lane == "cold"
+            and identity.pair_index == identity.slot_ordinal
+        )
+        or (
+            5 <= identity.slot_ordinal <= 8
+            and identity.cache_lane == "warm-prefix"
+            and identity.pair_index == identity.slot_ordinal - 4
+        )
     ):
         raise ReconciliationFailure("reconciliation_context_invalid")
 
 
-def _validate_context(context: ReconciliationContext) -> None:
+def _validate_context(context: ReconciliationContext, *, campaign_version: CampaignVersion = "v1") -> None:
     if type(context) is not ReconciliationContext:
         raise ReconciliationFailure("reconciliation_context_invalid")
     _validate_identity(
@@ -465,7 +499,8 @@ def _validate_context(context: ReconciliationContext) -> None:
             cache_lane=context.cache_lane,
             pair_index=context.pair_index,
             attestation_sha256=context.attestation_sha256,
-        )
+        ),
+        campaign_version=campaign_version,
     )
     if any(
         not isinstance(value, str) or _SHA256.fullmatch(value) is None
@@ -548,7 +583,7 @@ def _valid_passed_artifact(value: object, context: ReconciliationContext) -> boo
     )
 
 
-def _artifact_context(value: object) -> ReconciliationContext | None:
+def _artifact_context(value: object, *, campaign_version: CampaignVersion = "v1") -> ReconciliationContext | None:
     if not isinstance(value, dict):
         return None
     try:
@@ -564,7 +599,7 @@ def _artifact_context(value: object) -> ReconciliationContext | None:
             request_ledger_sha256=value["request_ledger_sha256"],
             timing_ledger_sha256=value["timing_ledger_sha256"],
         )
-        _validate_context(context)
+        _validate_context(context, campaign_version=campaign_version)
     except (KeyError, ReconciliationFailure, TypeError):
         return None
     return context

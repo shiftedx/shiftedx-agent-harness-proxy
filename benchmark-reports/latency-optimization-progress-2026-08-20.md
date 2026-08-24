@@ -27,9 +27,7 @@ handoff threshold for reopening an alternate transport: the observed keep-alive 
   by a model-backed direct/proxy preflight.
 - Cache evidence now binds a privacy-safe compatible-prefix identity without retaining prompts,
   transcripts, receipts, or tool results.
-- The intervention fast path has a conservative server-controlled eligibility and structural shadow
-  seam. `enabled` is rejected without immutable promotion authority, and `shadow` is rejected unless
-  a private observer is explicitly injected. No bypass is active.
+- The unqualified bypass experiment was removed before performance qualification.
 - The production HTTPX pool now explicitly pins the existing `5.0 s` keep-alive expiry.
 
 ## Bounded mechanism evidence
@@ -80,12 +78,12 @@ lane, cross-case reuse, quality preservation, or end-to-end wall-time compliance
 
 - Build and sign a fresh exact ARM64 image from the reviewed merge and obtain green main CI.
 - Add a durable qualification-owned shadow sink and approved promotion authority for broader Local
-  Projection and the intervention fast path; run their frozen model-backed agreement corpora.
+  Projection; run its frozen model-backed agreement corpus.
 - Publish/version the authoritative MTPLX combined-capability implementation and pass native tools,
   strict terminal JSON, reasoning/tool transcript, cache, SSE, and direct/proxy parity preflight.
 - Produce true TTFT evidence or retain the matched TTFT gate as unavailable.
 - Freeze a new manifest and run the complete thirteen-instance campaign, all six cold/warm pairs,
   reconciliation, privacy scan, exact-image operational matrix, rollback, and final two-axis review.
 
-Until those blockers clear, no optimized latency, promotion, combined-mode, fast-path, or WebSocket
-claim is authorized.
+Until those blockers clear, no optimized latency, promotion, combined-mode, or WebSocket claim is
+authorized.

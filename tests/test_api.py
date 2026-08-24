@@ -1,3 +1,5 @@
+import asyncio
+import hashlib
 import json
 import logging
 from typing import Any
@@ -5,10 +7,10 @@ from typing import Any
 import httpx
 import pytest
 from pydantic import SecretStr
+from starlette.requests import ClientDisconnect
 
 from shiftedx_harness_proxy.api import create_app
 from shiftedx_harness_proxy.config import Settings
-from shiftedx_harness_proxy.fast_path import InMemoryFastPathObserver
 from shiftedx_harness_proxy.qualification_timing import (
     PrivateTimingSink,
     read_timing_capture_ledger,
@@ -140,45 +142,6 @@ class ObjectFinalizationUpstream(EchoUpstream):
         return {"id": "chatcmpl", "choices": [{"message": {"role": "assistant", "content": content}}]}
 
 
-def test_shadow_fast_path_requires_an_explicit_private_observer_at_app_construction() -> None:
-    with pytest.raises(ValueError, match="intervention_fast_path_shadow_observer_required"):
-        create_app(
-            Settings(upstream_base_url="http://upstream/v1", intervention_fast_path_mode="shadow"),
-            EchoUpstream(),
-        )
-
-
-def test_shadow_fast_path_from_process_environment_cannot_start_without_observer(monkeypatch) -> None:
-    monkeypatch.setenv("INTERVENTION_FAST_PATH_MODE", "shadow")
-    settings = Settings(upstream_base_url="http://upstream/v1")
-
-    with pytest.raises(ValueError, match="intervention_fast_path_shadow_observer_required"):
-        create_app(settings, EchoUpstream())
-
-
-@pytest.mark.asyncio
-async def test_injected_fast_path_observer_records_shadow_without_public_surface() -> None:
-    observer = InMemoryFastPathObserver()
-    app = create_app(
-        Settings(upstream_base_url="http://upstream/v1", intervention_fast_path_mode="shadow"),
-        EchoUpstream(),
-        fast_path_observer=observer,
-    )
-
-    async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
-            response = await client.post(
-                "/v1/chat/completions",
-                json={"model": "model", "messages": [{"role": "user", "content": "hello"}]},
-            )
-
-    assert response.status_code == 200
-    assert len(observer.records) == 1
-    assert observer.records[0].equivalent is True
-    assert not [name for name in response.headers if "fast" in name.lower()]
-    assert "fast_path" not in response.text
-
-
 @pytest.mark.asyncio
 async def test_injected_private_timing_sink_captures_chat_lifecycle_without_public_surface(tmp_path) -> None:
     ledger = tmp_path / "timing-captures.jsonl"
@@ -201,6 +164,10 @@ async def test_injected_private_timing_sink_captures_chat_lifecycle_without_publ
     captures = read_timing_capture_ledger(ledger)
     assert len(captures) == 1
     capture = captures[0]
+    assert capture["correlation_id_sha256"] == hashlib.sha256(
+        response.headers["x-request-id"].encode("utf-8")
+    ).hexdigest()
+    assert response.headers["x-request-id"] not in ledger.read_text(encoding="utf-8")
     assert capture["outcome"] == "succeeded"
     assert capture["body_read_ns"] > 0
     assert capture["admission_wait_ns"] >= 0
@@ -453,6 +420,321 @@ async def test_stream_replay_preserves_reasoning_tool_calls_finish_reason_and_us
     assert chunks[2]["choices"] == []
     assert chunks[2]["usage"] == {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
     assert events[-1] == "[DONE]"
+
+
+@pytest.mark.asyncio
+async def test_stream_replay_paces_complete_sse_events_for_fragmented_downstream_reads() -> None:
+    """A blocked downstream write must not let replay queue later SSE events."""
+    app = create_app(Settings(upstream_base_url="http://upstream/v1"), EchoUpstream())
+    first_write = asyncio.Event()
+    release_write = asyncio.Event()
+    body_chunks: list[bytes] = []
+    terminal_body_count = 0
+    received_request = False
+
+    async def receive() -> dict[str, Any]:
+        nonlocal received_request
+        if not received_request:
+            received_request = True
+            return {
+                "type": "http.request",
+                "body": json.dumps(
+                    {
+                        "model": "model",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": True,
+                    }
+                ).encode(),
+                "more_body": False,
+            }
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def send(message: dict[str, Any]) -> None:
+        nonlocal terminal_body_count
+        if message["type"] != "http.response.body":
+            return
+        if not message.get("body"):
+            if not message.get("more_body", False):
+                terminal_body_count += 1
+            return
+        body_chunks.append(message["body"])
+        if len(body_chunks) == 1:
+            first_write.set()
+            await release_write.wait()
+
+    scope: dict[str, Any] = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/chat/completions",
+        "raw_path": b"/v1/chat/completions",
+        "query_string": b"",
+        "headers": [],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+    }
+    task = asyncio.create_task(app(scope, receive, send))
+    await asyncio.wait_for(first_write.wait(), timeout=1)
+
+    assert len(body_chunks) == 1
+    assert body_chunks[0].count(b"data: ") == 1
+    assert body_chunks[0].endswith(b"\n\n")
+
+    release_write.set()
+    await asyncio.wait_for(task, timeout=1)
+    assert b"".join(body_chunks).endswith(b"data: [DONE]\n\n")
+    assert terminal_body_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_replay_disconnect_stops_after_the_current_sse_event(tmp_path) -> None:
+    ledger = tmp_path / "timing-captures.jsonl"
+    reserve_timing_capture_ledger(ledger)
+    app = create_app(
+        Settings(upstream_base_url="http://upstream/v1"),
+        EchoUpstream(),
+        timing_sink=PrivateTimingSink(ledger),
+    )
+    first_write = asyncio.Event()
+    allow_disconnect = asyncio.Event()
+    body_chunks: list[bytes] = []
+    received_request = False
+
+    async def receive() -> dict[str, Any]:
+        nonlocal received_request
+        if not received_request:
+            received_request = True
+            return {
+                "type": "http.request",
+                "body": b'{"model":"model","messages":[{"role":"user","content":"hello"}],"stream":true}',
+                "more_body": False,
+            }
+        await first_write.wait()
+        await allow_disconnect.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        if message["type"] == "http.response.body" and message.get("body"):
+            body_chunks.append(message["body"])
+            first_write.set()
+            await asyncio.Event().wait()
+
+    scope: dict[str, Any] = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/chat/completions",
+        "raw_path": b"/v1/chat/completions",
+        "query_string": b"",
+        "headers": [],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+    }
+
+    task = asyncio.create_task(app(scope, receive, send))
+    await asyncio.wait_for(first_write.wait(), timeout=1)
+    assert len(body_chunks) == 1
+    assert app.state.admission.snapshot().active == 1
+
+    allow_disconnect.set()
+    await asyncio.wait_for(task, timeout=1)
+    assert app.state.counters.cancellations == 1
+    assert app.state.counters.stream_replays == 0
+    assert read_timing_capture_ledger(ledger)[0]["outcome"] == "cancelled"
+    assert app.state.admission.snapshot().active == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_replay_deadline_releases_admission_after_headers(tmp_path) -> None:
+    ledger = tmp_path / "timing-captures.jsonl"
+    reserve_timing_capture_ledger(ledger)
+    app = create_app(
+        Settings(upstream_base_url="http://upstream/v1", total_request_deadline_seconds=0.01),
+        EchoUpstream(),
+        timing_sink=PrivateTimingSink(ledger),
+    )
+    first_write = asyncio.Event()
+    terminal_write = asyncio.Event()
+    messages: list[dict[str, Any]] = []
+    received_request = False
+
+    async def receive() -> dict[str, Any]:
+        nonlocal received_request
+        if not received_request:
+            received_request = True
+            return {
+                "type": "http.request",
+                "body": b'{"model":"model","messages":[{"role":"user","content":"hello"}],"stream":true}',
+                "more_body": False,
+            }
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def send(message: dict[str, Any]) -> None:
+        messages.append(message)
+        if message["type"] == "http.response.body" and message.get("body"):
+            first_write.set()
+            await asyncio.Event().wait()
+        if message["type"] == "http.response.body" and not message.get("more_body", False):
+            terminal_write.set()
+            assert app.state.admission.snapshot().active == 0
+            await asyncio.Event().wait()
+
+    scope: dict[str, Any] = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/chat/completions",
+        "raw_path": b"/v1/chat/completions",
+        "query_string": b"",
+        "headers": [],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+    }
+
+    task = asyncio.create_task(app(scope, receive, send))
+    await asyncio.wait_for(first_write.wait(), timeout=1)
+    assert app.state.admission.snapshot().active == 1
+
+    await asyncio.wait_for(terminal_write.wait(), timeout=1)
+    await asyncio.wait_for(task, timeout=1)
+    assert app.state.counters.deadline_expiries == 1
+    assert app.state.counters.errors == 1
+    assert app.state.counters.stream_replays == 0
+    assert app.state.admission.snapshot().active == 0
+    assert read_timing_capture_ledger(ledger)[0]["outcome"] == "deadline"
+    assert messages[0]["type"] == "http.response.start"
+    terminal_messages = [
+        message
+        for message in messages
+        if message["type"] == "http.response.body" and not message.get("more_body", False)
+    ]
+    assert terminal_messages == [{"type": "http.response.body", "body": b"", "more_body": False}]
+    assert not b"".join(
+        message["body"] for message in messages if message["type"] == "http.response.body"
+    ).endswith(b"data: [DONE]\n\n")
+
+
+@pytest.mark.asyncio
+async def test_stream_replay_deadline_before_headers_remains_json_504(tmp_path) -> None:
+    class WaitingUpstream(EchoUpstream):
+        async def chat(self, payload: dict[str, Any], request_headers: dict[str, str]) -> dict[str, Any]:
+            self.requests.append(payload)
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    ledger = tmp_path / "timing-captures.jsonl"
+    reserve_timing_capture_ledger(ledger)
+    app = create_app(
+        Settings(upstream_base_url="http://upstream/v1", total_request_deadline_seconds=0.01),
+        WaitingUpstream(),
+        timing_sink=PrivateTimingSink(ledger),
+    )
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+            )
+
+    assert response.status_code == 504
+    assert response.json()["error"]["code"] == "request_deadline_exceeded"
+    assert "x-shiftedx-stream-mode" not in response.headers
+    assert app.state.counters.deadline_expiries == 1
+    assert app.state.counters.errors == 1
+    assert app.state.counters.stream_replays == 0
+    assert app.state.admission.snapshot().active == 0
+    assert read_timing_capture_ledger(ledger)[0]["outcome"] == "deadline"
+
+
+@pytest.mark.asyncio
+async def test_stream_replay_send_disconnect_counts_cancellation_once() -> None:
+    app = create_app(Settings(upstream_base_url="http://upstream/v1"), EchoUpstream())
+    sent_first_event = False
+
+    async def receive() -> dict[str, Any]:
+        return {
+            "type": "http.request",
+            "body": b'{"model":"model","messages":[{"role":"user","content":"hello"}],"stream":true}',
+            "more_body": False,
+        }
+
+    async def send(message: dict[str, Any]) -> None:
+        nonlocal sent_first_event
+        if message["type"] == "http.response.body" and message.get("body"):
+            sent_first_event = True
+            raise OSError("downstream disconnected")
+
+    scope: dict[str, Any] = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/chat/completions",
+        "raw_path": b"/v1/chat/completions",
+        "query_string": b"",
+        "headers": [],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+    }
+
+    with pytest.raises(ClientDisconnect):
+        await app(scope, receive, send)
+    assert sent_first_event
+    assert app.state.counters.cancellations == 1
+    assert app.state.counters.stream_replays == 0
+    assert app.state.admission.snapshot().active == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_replay_is_bounded_before_sse_headers_are_sent() -> None:
+    upstream = ScriptedCompletionUpstream(
+        [
+            {
+                "id": "chatcmpl-large",
+                "model": "model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "x" * 1024},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+        ]
+    )
+    app = create_app(
+        Settings(upstream_base_url="http://upstream/v1", max_upstream_response_bytes=1024), upstream
+    )
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+            )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "upstream_response_too_large"
+    assert "x-shiftedx-stream-mode" not in response.headers
 
 
 @pytest.mark.asyncio
@@ -1029,6 +1311,38 @@ async def test_harness_opt_out_requires_server_enablement_and_a_trusted_principa
 
 
 @pytest.mark.asyncio
+async def test_trusted_harness_opt_out_cannot_bypass_server_tool_deny_policy() -> None:
+    upstream = EchoUpstream()
+    settings = Settings(
+        upstream_base_url="http://upstream/v1",
+        deployment_profile="production",
+        proxy_api_key=SecretStr("ordinary-client"),
+        trusted_policy_extension_api_keys=SecretStr("trusted-extension"),
+        allow_harness_opt_out=True,
+        denied_tools="apply_patch",
+    )
+    app = create_app(settings, upstream)
+    payload = {
+        "model": "model",
+        "messages": [{"role": "user", "content": "repair"}],
+        "tools": [{"type": "function", "function": {"name": "apply_patch", "parameters": {}}}],
+    }
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer trusted-extension", "X-Shiftedx-Harness": "off"},
+                json=payload,
+            )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "harness_opt_out_denied_by_tool_policy"
+    assert response.json()["error"]["message"] == "Harness opt-out is unavailable for this request."
+    assert upstream.requests == []
+
+
+@pytest.mark.asyncio
 async def test_cache_namespace_controls_are_rejected_for_both_authenticated_principals(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1437,8 +1751,9 @@ async def test_invalid_correlation_id_is_not_emitted_as_log_structure(caplog: py
             )
     correlation_id = response.headers["x-request-id"]
     assert correlation_id.startswith("shiftedx-")
-    assert f"correlation_id={correlation_id}" in caplog.text
-    assert "correlation_id=not safe" not in caplog.text
+    assert hashlib.sha256(correlation_id.encode("utf-8")).hexdigest() in caplog.text
+    assert correlation_id not in caplog.text
+    assert "not safe" not in caplog.text
     assert upstream.requests == []
 
 

@@ -8,7 +8,6 @@ from pydantic import BaseModel, ConfigDict
 
 from shiftedx_harness_proxy.config import Settings
 from shiftedx_harness_proxy.errors import ProxyError
-from shiftedx_harness_proxy.fast_path import InMemoryFastPathObserver
 from shiftedx_harness_proxy.service import ChatService
 
 
@@ -107,46 +106,6 @@ class CombinedScriptedUpstream(ScriptedUpstream):
     async def combined_tool_terminal_schema_supported(self) -> bool:
         self.capability_probes += 1
         return self.supported
-
-
-@pytest.mark.asyncio
-async def test_shadow_fast_path_records_hash_only_equivalence_but_sends_normal_harness_payload() -> None:
-    upstream = ScriptedUpstream([completion(content="done")])
-    observer = InMemoryFastPathObserver()
-    await ChatService(
-        Settings(upstream_base_url="http://upstream/v1", intervention_fast_path_mode="shadow"),
-        upstream,
-        fast_path_observer=observer,
-    ).complete({"model": "model", "messages": [{"role": "user", "content": "hello"}]}, {})
-
-    assert len(observer.records) == 1
-    safe = observer.records[0].to_safe_dict()
-    assert safe["eligible"] is True
-    assert safe["equivalent"] is True
-    assert "hello" not in str(safe)
-    assert upstream.requests[0]["messages"][0]["role"] == "system"
-    assert upstream.requests[0]["messages"][-1]["content"].startswith("[shiftedx harness]")
-
-
-@pytest.mark.asyncio
-async def test_client_body_or_header_never_selects_fast_path() -> None:
-    upstream = ScriptedUpstream([completion(content="done")])
-    observer = InMemoryFastPathObserver()
-    await ChatService(
-        Settings(upstream_base_url="http://upstream/v1"),
-        upstream,
-        fast_path_observer=observer,
-    ).complete(
-        {
-            "model": "model",
-            "messages": [{"role": "user", "content": "hello"}],
-            "x-shiftedx-fast-path": "enabled",
-        },
-        {"x-shiftedx-fast-path": "enabled"},
-    )
-
-    assert observer.records == []
-    assert upstream.requests[0]["messages"][0]["role"] == "system"
 
 
 @pytest.mark.asyncio
@@ -308,7 +267,145 @@ async def test_same_epoch_duplicate_never_reaches_client_and_is_retried_internal
     assert result.body["choices"][0]["message"]["tool_calls"] == []
     assert result.telemetry.blocked_duplicates == 1
     assert result.telemetry.upstream_calls == 2
-    assert "duplicate_call_blocked" in str(upstream.requests[1]["messages"])
+    retry_messages = upstream.requests[1]["messages"]
+    assert retry_messages[-2]["role"] == "assistant"
+    assert retry_messages[-2]["tool_calls"] == [duplicate]
+    assert retry_messages[-1]["role"] == "tool"
+    assert retry_messages[-1]["tool_call_id"] == "dup"
+    blocked = json.loads(retry_messages[-1]["content"])
+    assert blocked["shiftedx_harness"] == "duplicate_call_blocked"
+    assert blocked["execution_status"] == "blocked_not_executed"
+    assert "did not reach the client executor" in blocked["fact"]
+    assert blocked["instruction"]
+
+
+@pytest.mark.asyncio
+async def test_server_denied_first_time_tool_call_is_withheld_and_recovers() -> None:
+    denied = call("denied", "apply_patch", '{"patch":"x"}')
+    allowed = call("allowed", "read_file", '{"path":"a.py"}')
+    upstream = ScriptedUpstream([completion(calls=[denied]), completion(calls=[allowed])])
+
+    result = await ChatService(
+        Settings(upstream_base_url="http://upstream/v1", denied_tools="apply_patch"), upstream
+    ).complete(request([{"role": "user", "content": "repair"}]), {})
+
+    assert result.body["choices"][0]["message"]["tool_calls"] == [allowed]
+    assert result.telemetry.upstream_calls == 2
+    blocked = json.loads(upstream.requests[1]["messages"][-1]["content"])
+    assert blocked == {
+        "shiftedx_harness": "tool_denied_by_server",
+        "execution_status": "blocked_not_executed",
+        "fact": "This proposed call was blocked by the proxy and did not reach the client executor.",
+        "instruction": "Choose a permitted tool or return a safe final answer.",
+    }
+    assert "denied_tools" not in upstream.requests[0]
+    assert "apply_patch" not in blocked.values()
+
+
+@pytest.mark.asyncio
+async def test_server_denied_tool_withholds_the_entire_mixed_batch() -> None:
+    denied = call("denied", "apply_patch", '{"patch":"x"}')
+    sibling = call("sibling", "read_file", '{"path":"a.py"}')
+    reissued = call("reissued", "read_file", '{"path":"a.py"}')
+    upstream = ScriptedUpstream([completion(calls=[denied, sibling]), completion(calls=[reissued])])
+
+    result = await ChatService(
+        Settings(upstream_base_url="http://upstream/v1", denied_tools="apply_patch"), upstream
+    ).complete(request([{"role": "user", "content": "repair"}]), {})
+
+    assert result.body["choices"][0]["message"]["tool_calls"] == [reissued]
+    withheld = upstream.requests[1]["messages"]
+    assert [message["tool_call_id"] for message in withheld[-2:]] == ["denied", "sibling"]
+    assert "tool_denied_by_server" in withheld[-2]["content"]
+    assert "response_withheld_due_to_blocked_sibling" in withheld[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_server_denial_retries_are_bounded() -> None:
+    denied = call("denied", "apply_patch", '{"patch":"x"}')
+    upstream = ScriptedUpstream([completion(calls=[denied]), completion(calls=[denied])])
+
+    with pytest.raises(ProxyError) as raised:
+        await ChatService(
+            Settings(
+                upstream_base_url="http://upstream/v1",
+                denied_tools="apply_patch",
+                max_internal_retries=1,
+            ),
+            upstream,
+        ).complete(request([{"role": "user", "content": "repair"}]), {})
+
+    assert raised.value.code == "harness_retry_exhausted"
+    assert len(upstream.requests) == 2
+    assert "tool_denied_by_server" in str(upstream.requests[1]["messages"])
+
+
+@pytest.mark.asyncio
+async def test_client_cannot_inject_or_override_server_tool_deny_set() -> None:
+    payload = request([{"role": "user", "content": "repair"}])
+    payload["x-shiftedx-denied-tools"] = "read_file"
+    upstream = ScriptedUpstream([])
+
+    with pytest.raises(ProxyError) as raised:
+        await ChatService(
+            Settings(upstream_base_url="http://upstream/v1", denied_tools="apply_patch"), upstream
+        ).complete(payload, {})
+
+    assert raised.value.code == "tool_deny_override_denied"
+    assert upstream.requests == []
+
+
+@pytest.mark.asyncio
+async def test_server_tool_deny_set_rejects_harness_opt_out_before_upstream() -> None:
+    upstream = ScriptedUpstream([completion(content="must not be reached")])
+
+    with pytest.raises(ProxyError) as raised:
+        await ChatService(
+            Settings(upstream_base_url="http://upstream/v1", denied_tools="apply_patch"), upstream
+        ).complete(request([{"role": "user", "content": "repair"}]), {}, harness_enabled=False)
+
+    assert raised.value.code == "harness_opt_out_denied_by_tool_policy"
+    assert raised.value.message == "Harness opt-out is unavailable for this request."
+    assert upstream.requests == []
+
+
+@pytest.mark.asyncio
+async def test_harness_rejects_extra_upstream_choice_before_denied_call_can_escape() -> None:
+    response = completion(calls=[call("allowed", "read_file", '{"path":"a.py"}')])
+    response["choices"].append(
+        {
+            "index": 1,
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [call("denied", "apply_patch", '{"patch":"x"}')],
+            },
+            "finish_reason": "tool_calls",
+        }
+    )
+    upstream = ScriptedUpstream([response])
+
+    with pytest.raises(ProxyError) as raised:
+        await ChatService(
+            Settings(upstream_base_url="http://upstream/v1", denied_tools="apply_patch"), upstream
+        ).complete(request([{"role": "user", "content": "repair"}]), {})
+
+    assert raised.value.code == "upstream_malformed_completion"
+    assert len(upstream.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_server_tool_deny_set_leaves_allowed_call_unchanged() -> None:
+    allowed = call("allowed", "read_file", '{"path":"a.py"}')
+    upstream = ScriptedUpstream([completion(calls=[allowed])])
+    payload = request([{"role": "user", "content": "inspect"}])
+
+    result = await ChatService(
+        Settings(upstream_base_url="http://upstream/v1", denied_tools="apply_patch"), upstream
+    ).complete(payload, {})
+
+    assert result.body["choices"][0]["message"]["tool_calls"] == [allowed]
+    assert upstream.requests[0]["tools"] == payload["tools"]
 
 
 @pytest.mark.asyncio
@@ -406,7 +503,7 @@ async def test_phase_split_builds_a_fresh_outbound_payload_for_each_attempt() ->
 
 
 @pytest.mark.asyncio
-async def test_phase_split_releases_a_valid_receipt_backed_acquisition_terminal_without_finalization() -> None:
+async def test_phase_split_none_with_tools_and_strict_schema_starts_in_finalization() -> None:
     upstream = ScriptedUpstream([completion(content='{"status":"done"}')])
     payload = request(
         [
@@ -416,6 +513,7 @@ async def test_phase_split_releases_a_valid_receipt_backed_acquisition_terminal_
         ]
     )
     payload["response_format"] = strict_schema()
+    payload["tool_choice"] = "none"
 
     result = await ChatService(
         Settings(upstream_base_url="http://upstream/v1", upstream_tool_response_capability_mode="phase_split"),
@@ -425,7 +523,53 @@ async def test_phase_split_releases_a_valid_receipt_backed_acquisition_terminal_
     assert result.body["choices"][0]["message"]["content"] == '{"status":"done"}'
     assert result.telemetry.upstream_calls == 1
     assert len(upstream.requests) == 1
-    assert "tools" in upstream.requests[0]
+    assert upstream.requests[0]["response_format"] == payload["response_format"]
+    assert "tools" not in upstream.requests[0]
+    assert "tool_choice" not in upstream.requests[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "messages",
+    (
+        [{"role": "user", "content": "inspect"}],
+        [
+            {"role": "user", "content": "inspect"},
+            {"role": "assistant", "tool_calls": [call("old", "read_file", '{"path":"a.py"}')]},
+        ],
+        [
+            {"role": "user", "content": "inspect"},
+            {"role": "assistant", "tool_calls": [call("old", "apply_patch", "{} ")]},
+            {"role": "tool", "tool_call_id": "old", "content": "Patch applied."},
+        ],
+        [
+            {"role": "user", "content": "inspect"},
+            {"role": "assistant", "tool_calls": [call("old", "run_tests", "{} ")]},
+            {"role": "tool", "tool_call_id": "old", "content": "1 failed"},
+        ],
+        [
+            {"role": "user", "content": "inspect"},
+            {"role": "assistant", "tool_calls": [call("old", "read_file", '{"path":"a.py"}')]},
+            {"role": "tool", "tool_call_id": "old", "content": "error: failed"},
+        ],
+    ),
+)
+async def test_phase_split_none_starts_in_acquisition_when_transcript_is_not_safe_to_finalize(
+    messages: list[dict[str, Any]],
+) -> None:
+    allowed = call("new", "read_file", '{"path":"b.py"}')
+    upstream = ScriptedUpstream([completion(calls=[allowed])])
+    payload = request(messages)
+    payload["response_format"] = strict_schema()
+    payload["tool_choice"] = "none"
+
+    result = await ChatService(
+        Settings(upstream_base_url="http://upstream/v1", upstream_tool_response_capability_mode="phase_split"),
+        upstream,
+    ).complete(payload, {})
+
+    assert result.body["choices"][0]["message"]["tool_calls"] == [allowed]
+    assert upstream.requests[0]["tools"] == payload["tools"]
     assert "response_format" not in upstream.requests[0]
 
 

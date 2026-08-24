@@ -1,5 +1,5 @@
 from shiftedx_harness_proxy import AgentHarness, ToolRoles, receipt_status
-from shiftedx_harness_proxy.core import bare_json_issue
+from shiftedx_harness_proxy.core import HARNESS_SYSTEM_SUFFIX, bare_json_issue
 
 
 def test_structured_status_takes_priority_over_incidental_error_words() -> None:
@@ -25,6 +25,39 @@ def test_duplicates_are_epoch_scoped_and_mutation_requires_verification() -> Non
 
     state.record("run_tests", {}, "2 passed")
     assert state.terminal_issue('{"status":"passed"}') is None
+
+
+def test_blocked_duplicate_is_explicitly_not_a_client_execution() -> None:
+    state = AgentHarness("recover", available_tools={"run_tests"})
+    arguments = {"target": "original"}
+    prior = state.record("run_tests", arguments, "1 failed")
+
+    blocked = state.blocked_result(prior)
+
+    assert '"execution_status":"blocked_not_executed"' in blocked
+    assert "did not reach the client executor" in blocked
+    assert (
+        "Only downstream-visible assistant tool-call IDs paired with client-supplied role=tool "
+        "results count as executed"
+    ) in HARNESS_SYSTEM_SUFFIX
+
+
+def test_structured_failed_execution_claim_must_match_client_visible_receipts() -> None:
+    state = AgentHarness(
+        "recover",
+        available_tools={"run_tests", "apply_patch"},
+        enforce_failed_execution_claim=True,
+    )
+    state.record("run_tests", {"target": "original"}, "1 failed")
+    state.record("apply_patch", {}, "Patch applied.")
+    state.record("run_tests", {"target": "recovered"}, "8 passed")
+
+    assert "must be 1" in (
+        state.terminal_issue('{"failed_executions":2,"recovery_verified":true}') or ""
+    )
+    assert state.terminal_issue(
+        '{"failed_executions":1,"recovery_verified":true}'
+    ) is None
 
 
 def test_failed_verification_persists_through_investigation_and_stalls_at_three() -> None:

@@ -8,6 +8,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -19,7 +20,7 @@ import uuid
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, NamedTuple, TypeAlias
+from typing import Any, NamedTuple, TypeAlias, cast
 
 from shiftedx_bench.agentic import run_agentic_cases, scenario_set
 from shiftedx_bench.api import OpenAIClient
@@ -99,7 +100,26 @@ _SAMPLER_PROFILES: dict[SamplerProfile, dict[str, Any]] = {
         "reasoning_effort": "medium",
         "max_tokens": 1024,
     },
+    "ornith-productization-v1": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "thinking": {"enabled": True},
+        "reasoning_effort": "medium",
+        "max_tokens": 8192,
+    },
 }
+
+
+def _v2_private_scenario_deadline_seconds(value: str) -> float:
+    """Parse a private v2 whole-scenario deadline without accepting NaN or infinity."""
+    try:
+        deadline_s = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("v2 private scenario deadline must be finite and positive") from error
+    if not math.isfinite(deadline_s) or deadline_s <= 0:
+        raise argparse.ArgumentTypeError("v2 private scenario deadline must be finite and positive")
+    return deadline_s
 
 
 class _RejectAllRedirects(urllib.request.HTTPRedirectHandler):
@@ -117,8 +137,9 @@ _NO_PROXY_OPENER = urllib.request.build_opener(
 class ProxyHTTPFailure(RuntimeError):
     """A body-free proxy HTTP status used only for categorical accounting."""
 
-    def __init__(self, status_code: int) -> None:
+    def __init__(self, status_code: int, *, outcome: RequestOutcome | None = None) -> None:
         self.status_code = status_code
+        self.outcome: RequestOutcome = outcome or ("deadline" if status_code == 504 else "failed")
         super().__init__(f"proxy HTTP {status_code}")
 
 
@@ -139,6 +160,7 @@ class ProvisionalClientTimingRecord(NamedTuple):
     observer_record_count: int
     direct_attempt_wall_ns: tuple[int, ...]
     downstream_request_sha256: str
+    correlation_id_sha256: str | None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -152,6 +174,7 @@ class ProvisionalClientTimingRecord(NamedTuple):
             "observer_record_count": self.observer_record_count,
             "direct_attempt_wall_ns": list(self.direct_attempt_wall_ns),
             "downstream_request_sha256": self.downstream_request_sha256,
+            "correlation_id_sha256": self.correlation_id_sha256,
         }
 
 
@@ -163,6 +186,7 @@ class ProvisionalClientTimingLedger:
             raise ValueError("provisional timing cache lane is invalid")
         self.cache_lane = cache_lane
         self._next_pair_ordinal = 1
+        self._next_direct_attempt_sequence = 1
         self._records: list[ProvisionalClientTimingRecord] = []
 
     @property
@@ -184,11 +208,28 @@ class ProvisionalClientTimingLedger:
         observer_records: tuple[ModelBoundaryRecord, ...],
         direct_attempt_wall_ns: tuple[int, ...],
         downstream_request_sha256: str,
+        correlation_id_sha256: str | None,
     ) -> None:
         if arm not in {"direct", "proxy"}:
             raise ValueError("provisional timing arm is invalid")
         if client_wall_ns < 0:
             raise ValueError("provisional client wall time is invalid")
+        if arm == "direct" and observer_records:
+            local_sequences = [record.sequence for record in observer_records]
+            local_start = local_sequences[0]
+            if (
+                type(local_start) is not int
+                or local_start < 1
+                or any(type(sequence) is not int for sequence in local_sequences)
+                or local_sequences != list(range(local_start, local_start + len(local_sequences)))
+            ):
+                raise ProvisionalTimingLedgerFailure("provisional_direct_attempt_slice_invalid")
+            observer_sequence_start = self._next_direct_attempt_sequence
+            observer_sequence_end = observer_sequence_start + len(observer_records) - 1
+            self._next_direct_attempt_sequence = observer_sequence_end + 1
+        else:
+            observer_sequence_start = observer_records[0].sequence if observer_records else None
+            observer_sequence_end = observer_records[-1].sequence if observer_records else None
         self._records.append(
             ProvisionalClientTimingRecord(
                 pair_ordinal=pair_ordinal,
@@ -196,11 +237,12 @@ class ProvisionalClientTimingLedger:
                 cache_lane=self.cache_lane,
                 client_wall_ns=client_wall_ns,
                 outcome=outcome,
-                observer_sequence_start=observer_records[0].sequence if observer_records else None,
-                observer_sequence_end=observer_records[-1].sequence if observer_records else None,
+                observer_sequence_start=observer_sequence_start,
+                observer_sequence_end=observer_sequence_end,
                 observer_record_count=len(observer_records),
                 direct_attempt_wall_ns=direct_attempt_wall_ns,
                 downstream_request_sha256=downstream_request_sha256,
+                correlation_id_sha256=correlation_id_sha256,
             )
         )
 
@@ -227,15 +269,25 @@ def _provisional_outcome(error: BaseException | None) -> ProvisionalRequestOutco
         return "succeeded"
     if isinstance(error, asyncio.CancelledError):
         return "cancelled"
+    if isinstance(error, ProxyHTTPFailure):
+        return error.outcome
     if (
-        isinstance(error, ProxyHTTPFailure)
-        and error.status_code == 504
-        or isinstance(error, TimeoutError)
+        isinstance(error, TimeoutError)
         or isinstance(error, urllib.error.URLError)
         and isinstance(error.reason, TimeoutError)
     ):
         return "deadline"
     return "failed"
+
+
+def _proxy_request_outcome(upstream: Any, error: BaseException | None) -> RequestOutcome:
+    observed = getattr(upstream, "qualification_request_outcome", None)
+    outcome = observed() if callable(observed) else None
+    if outcome is None:
+        return _provisional_outcome(error)
+    if outcome not in {"succeeded", "failed", "cancelled", "deadline"}:
+        raise PreflightFailure("proxy request outcome is malformed")
+    return cast(RequestOutcome, outcome)
 
 
 def write_provisional_client_timing_ledger(
@@ -269,6 +321,13 @@ def write_provisional_client_timing_ledger(
             or type(record.observer_record_count) is not int
             or record.observer_record_count < 0
             or _SHA256_HEX.fullmatch(record.downstream_request_sha256) is None
+            or record.arm == "proxy"
+            and (
+                not isinstance(record.correlation_id_sha256, str)
+                or _SHA256_HEX.fullmatch(record.correlation_id_sha256) is None
+            )
+            or record.arm == "direct"
+            and record.correlation_id_sha256 is not None
         ):
             raise ProvisionalTimingLedgerFailure("provisional_request_ledger_invalid")
         has_observer_range = record.observer_sequence_start is not None or record.observer_sequence_end is not None
@@ -363,18 +422,46 @@ class ProjectionAwareOpenAIClient(OpenAIClient):
     """Retain only the validated Local Projection marker dropped by the benchmark normalizer."""
 
     capture_proxy_accounting = False
+    _qualification_request_outcome: RequestOutcome | None = None
+    _qualification_correlation_id_sha256: str | None = None
+    _pending_qualification_correlation_id: str | None = None
+
+    def qualification_request_outcome(self) -> RequestOutcome | None:
+        return self._qualification_request_outcome
+
+    def qualification_correlation_id_sha256(self) -> str | None:
+        return self._qualification_correlation_id_sha256
+
+    def prepare_qualification_request(self) -> str:
+        if self._pending_qualification_correlation_id is not None:
+            raise PreflightFailure("proxy qualification request is already prepared")
+        correlation_id = f"shiftedx-qualification-{uuid.uuid4().hex}"
+        self._pending_qualification_correlation_id = correlation_id
+        self._qualification_correlation_id_sha256 = hashlib.sha256(correlation_id.encode()).hexdigest()
+        return self._qualification_correlation_id_sha256
 
     def complete(self, payload: dict[str, Any], *, stream: bool = False) -> dict[str, Any]:
         if not self.capture_proxy_accounting:
             return super().complete(payload, stream=stream)
         if stream:
             raise PreflightFailure("proxy qualification requires non-streaming responses")
+        self._qualification_request_outcome = None
+        if self._pending_qualification_correlation_id is None:
+            self.prepare_qualification_request()
+        correlation_id = self._pending_qualification_correlation_id
+        self._pending_qualification_correlation_id = None
+        assert correlation_id is not None
         body = dict(payload)
         body["stream"] = False
         request = self._request(body)
+        add_header = getattr(request, "add_header", None)
+        if not callable(add_header):
+            raise PreflightFailure("proxy qualification request is malformed")
+        add_header("X-Request-ID", correlation_id)
         started = time.perf_counter()
         try:
             with _NO_PROXY_OPENER.open(request, timeout=self.timeout_s) as response:  # noqa: S310
+                self._qualification_request_outcome = "succeeded"
                 if response.geturl() != request.full_url:
                     raise PreflightFailure("proxy qualification final URL differed")
                 value = json.loads(_read_bounded_proxy_response(response).decode("utf-8"))
@@ -388,16 +475,22 @@ class ProjectionAwareOpenAIClient(OpenAIClient):
         except urllib.error.HTTPError as error:
             if 300 <= error.code < 400:
                 raise PreflightFailure("proxy qualification redirect rejected") from None
-            raise ProxyHTTPFailure(error.code) from None
+            outcome = _proxy_http_failure_outcome(error)
+            self._qualification_request_outcome = outcome
+            raise ProxyHTTPFailure(error.code, outcome=outcome) from None
         except PreflightFailure:
             raise
         except TimeoutError:
+            self._qualification_request_outcome = "deadline"
             raise TimeoutError("proxy request deadline exceeded") from None
         except urllib.error.URLError as error:
             if isinstance(error.reason, TimeoutError):
+                self._qualification_request_outcome = "deadline"
                 raise TimeoutError("proxy request deadline exceeded") from None
+            self._qualification_request_outcome = "failed"
             raise ConnectionError("proxy transport failed") from None
         except OSError:
+            self._qualification_request_outcome = "failed"
             raise ConnectionError("proxy transport failed") from None
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
             raise PreflightFailure("proxy response is malformed") from None
@@ -437,6 +530,19 @@ def _proxy_accounting_from_headers(headers: Any) -> dict[str, int]:
             raise PreflightFailure("proxy response accounting is unavailable")
         projected[key] = int(values[0])
     return projected
+
+
+def _proxy_http_failure_outcome(error: urllib.error.HTTPError) -> RequestOutcome:
+    if error.code != 504:
+        return "failed"
+    try:
+        document = json.loads(_read_bounded_proxy_response(error).decode("utf-8"))
+    except (PreflightFailure, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return "failed"
+    if not isinstance(document, dict):
+        return "failed"
+    detail = document.get("error")
+    return "deadline" if isinstance(detail, dict) and detail.get("code") == "request_deadline_exceeded" else "failed"
 
 
 def _read_bounded_proxy_response(response: Any) -> bytes:
@@ -558,14 +664,22 @@ class ProxyRequestAccounting:
             blocked_stalls=accounting["blocked_stalls"],
         )
 
-    def record_failure(self, observer_records: tuple[ModelBoundaryRecord, ...], error: BaseException) -> None:
+    def record_failure(
+        self,
+        observer_records: tuple[ModelBoundaryRecord, ...],
+        error: BaseException,
+        *,
+        observed_outcome: RequestOutcome | None = None,
+    ) -> None:
         outcome: RequestOutcome
-        if isinstance(error, asyncio.CancelledError):
+        if observed_outcome is not None:
+            outcome = observed_outcome
+        elif isinstance(error, asyncio.CancelledError):
             outcome = "cancelled"
+        elif isinstance(error, ProxyHTTPFailure):
+            outcome = error.outcome
         elif (
-            isinstance(error, ProxyHTTPFailure)
-            and error.status_code == 504
-            or isinstance(error, TimeoutError)
+            isinstance(error, TimeoutError)
             or isinstance(error, urllib.error.URLError)
             and isinstance(error.reason, TimeoutError)
         ):
@@ -644,6 +758,7 @@ class CompatibilityClient:
         require_cache_evidence: bool = False,
         request_accounting: ProxyRequestAccounting | None = None,
         provisional_timing: ProvisionalClientTimingLedger | None = None,
+        scenario_deadline_monotonic: float | None = None,
     ) -> None:
         self.upstream = upstream
         self.arm = arm
@@ -653,6 +768,7 @@ class CompatibilityClient:
         self.require_cache_evidence = require_cache_evidence
         self.request_accounting = request_accounting
         self.provisional_timing = provisional_timing
+        self.scenario_deadline_monotonic = scenario_deadline_monotonic
         self.planner = PhasePlanner()
         self.calls: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
         self.downstream_payloads: list[dict[str, Any]] = []
@@ -683,6 +799,8 @@ class CompatibilityClient:
                 return self._complete_proxy(payload, phases)
             if phases == ("terminal",):
                 return self._complete_direct("terminal", payload)
+            if phases == ("finalization",):
+                return self._complete_direct("finalization", self.planner.plan(payload, phase="finalization"))
             response = self._complete_direct("acquisition", self.planner.plan(payload, phase="acquisition"))
             if response.get("tool_calls"):
                 return response
@@ -708,10 +826,20 @@ class CompatibilityClient:
                     pair_ordinal=pair_ordinal,
                     arm=self.arm,
                     client_wall_ns=time.perf_counter_ns() - started_ns,
-                    outcome=_provisional_outcome(error),
+                    outcome=(
+                        _proxy_request_outcome(self.upstream, error)
+                        if self.arm == "proxy"
+                        else _provisional_outcome(error)
+                    ),
                     observer_records=observer_records,
                     direct_attempt_wall_ns=direct_attempt_wall_ns,
                     downstream_request_sha256=downstream_request_sha256(payload),
+                    correlation_id_sha256=(
+                        self.upstream.qualification_correlation_id_sha256()
+                        if self.arm == "proxy"
+                        and callable(getattr(self.upstream, "qualification_correlation_id_sha256", None))
+                        else None
+                    ),
                 )
 
     def _complete_direct(self, phase: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -719,7 +847,7 @@ class CompatibilityClient:
         sequence = len(self._direct_attempt_records) + 1
         started_ns = time.perf_counter_ns()
         try:
-            response = self.upstream.complete(payload, stream=False)
+            response = self._complete_upstream(payload)
         except BaseException:
             self._direct_attempt_records.append(
                 model_boundary_record(
@@ -749,18 +877,30 @@ class CompatibilityClient:
         local_projection = False
         response_accounting: dict[str, int] | None = None
         accounting_attempted = False
+        correlation_id_sha256: str | None = None
+        prepare_request = getattr(self.upstream, "prepare_qualification_request", None)
+        if callable(prepare_request):
+            correlation_id_sha256 = prepare_request()
         if self.observer is not None:
-            self.observer.begin_turn()
+            self.observer.begin_turn(correlation_id_sha256=correlation_id_sha256)
         try:
             call_started = True
-            response = self.upstream.complete(payload, stream=False)
+            response = self._complete_upstream(payload)
             if not isinstance(response, dict):
-                records = self._consume_proxy_observations(payload, require_records=True)
+                records = self._consume_proxy_observations(
+                    payload,
+                    require_records=True,
+                    correlation_id_sha256=correlation_id_sha256,
+                )
                 raise PreflightFailure("preflight_response_malformed")
             local_projection = _is_local_projection(response)
             if self.request_accounting is not None:
                 response_accounting = _take_proxy_response_accounting(response)
-            records = self._consume_proxy_observations(payload, require_records=not local_projection)
+            records = self._consume_proxy_observations(
+                payload,
+                require_records=not local_projection,
+                correlation_id_sha256=correlation_id_sha256,
+            )
             if self.request_accounting is not None:
                 assert response_accounting is not None
                 accounting_attempted = True
@@ -776,7 +916,11 @@ class CompatibilityClient:
                 records = self.observer.record_turns[-1]
             elif call_started:
                 try:
-                    records = self._consume_proxy_observations(payload, require_records=False)
+                    records = self._consume_proxy_observations(
+                        payload,
+                        require_records=False,
+                        correlation_id_sha256=correlation_id_sha256,
+                    )
                 except BaseException:
                     if self.observer is not None and len(self.observer.record_turns) > prior_turn_count:
                         records = self.observer.record_turns[-1]
@@ -792,15 +936,55 @@ class CompatibilityClient:
                         local_projection=local_projection,
                     )
                 else:
-                    self.request_accounting.record_failure(records, error)
+                    self.request_accounting.record_failure(
+                        records,
+                        error,
+                        observed_outcome=_proxy_request_outcome(self.upstream, error),
+                    )
             raise
 
+    def _complete_upstream(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Make one upstream request within the scenario budget and restore its normal timeout."""
+        remaining_s = self._remaining_scenario_budget()
+        original_timeout = getattr(self.upstream, "timeout_s", None)
+        timeout_capped = False
+        if remaining_s is not None:
+            if (
+                not isinstance(original_timeout, int | float)
+                or isinstance(original_timeout, bool)
+                or not math.isfinite(original_timeout)
+                or original_timeout <= 0
+            ):
+                raise TimeoutError("scenario deadline exceeded")
+            self.upstream.timeout_s = min(float(original_timeout), remaining_s)
+            timeout_capped = True
+        try:
+            return self.upstream.complete(payload, stream=False)
+        finally:
+            if timeout_capped:
+                self.upstream.timeout_s = original_timeout
+
+    def _remaining_scenario_budget(self) -> float | None:
+        if self.scenario_deadline_monotonic is None:
+            return None
+        remaining_s = self.scenario_deadline_monotonic - time.monotonic()
+        if not math.isfinite(remaining_s) or remaining_s <= 0:
+            raise TimeoutError("scenario deadline exceeded")
+        return remaining_s
+
     def _consume_proxy_observations(
-        self, payload: dict[str, Any], *, require_records: bool
+        self,
+        payload: dict[str, Any],
+        *,
+        require_records: bool,
+        correlation_id_sha256: str | None,
     ) -> tuple[ModelBoundaryRecord, ...]:
         if self.observer is None:
             return ()
-        records = self.observer.consume_turn(require_records=require_records)
+        records = self.observer.consume_turn(
+            require_records=require_records,
+            correlation_id_sha256=correlation_id_sha256,
+        )
         self._proxy_model_turns.append(records)
         if self.require_cache_evidence and require_records:
             raw_records = self.observer.record_turns[-1]
@@ -1145,6 +1329,21 @@ def main() -> None:
     parser.add_argument("--case-id", default=None)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
+        "--campaign-version",
+        choices=("v1", "v2"),
+        default="v1",
+        help="Private qualification campaign contract version; v2 is valid only for scored runs.",
+    )
+    parser.add_argument(
+        "--v2-private-scenario-deadline-seconds",
+        type=_v2_private_scenario_deadline_seconds,
+        default=None,
+        help=(
+            "Private v2-only whole-scenario deadline in seconds. It is not a per-request timeout "
+            "and is absent from v1 runs."
+        ),
+    )
+    parser.add_argument(
         "--proxy-policy",
         action="store_true",
         help="Send the proxy-only case receipt policy; never use this against a model server directly.",
@@ -1225,6 +1424,13 @@ def main() -> None:
     parser.add_argument("--cache-prime-only", action="store_true")
     parser.add_argument("--cache-prime-arm", choices=("direct", "proxy"))
     args = parser.parse_args()
+
+    if args.campaign_version == "v1" and args.v2_private_scenario_deadline_seconds is not None:
+        parser.error("--v2-private-scenario-deadline-seconds requires --campaign-version v2")
+    if args.campaign_version == "v2" and (args.paired_preflight or args.cache_prime_only):
+        parser.error("--campaign-version v2 is valid only for scored runs")
+    if args.campaign_version == "v2" and args.v2_private_scenario_deadline_seconds is None:
+        parser.error("scored v2 requires --v2-private-scenario-deadline-seconds")
 
     selected = scenario_set(args.agentic_set)
     if args.case_id is not None:
@@ -1311,6 +1517,7 @@ def main() -> None:
         runtime_attestation=args.runtime_attestation,
         preflight_runtime_outcome=args.preflight_runtime_outcome,
         direct_runtime_outcome=args.direct_runtime_outcome,
+        campaign_version=args.campaign_version,
     )
     api_key = _read_key(args.api_key_file)
     client = ProjectionAwareOpenAIClient(args.base_url, api_key=api_key, timeout_s=600.0)
@@ -1345,6 +1552,11 @@ def main() -> None:
             if args.cache_mode == "bypass":
                 overrides["metadata"] = {"cache_mode": "bypass"}
             started = time.perf_counter()
+            scenario_deadline_monotonic = (
+                time.monotonic() + args.v2_private_scenario_deadline_seconds
+                if args.v2_private_scenario_deadline_seconds is not None
+                else None
+            )
             planned_client: CompatibilityClient | None = None
             try:
                 planned_client = CompatibilityClient(
@@ -1356,18 +1568,25 @@ def main() -> None:
                     require_cache_evidence=True,
                     request_accounting=proxy_request_accounting,
                     provisional_timing=provisional_timing,
+                    scenario_deadline_monotonic=scenario_deadline_monotonic,
                 )
-                rows = run_agentic_cases(
-                    client=planned_client,
-                    model=args.model,
-                    output_path=args.output,
-                    request_overrides=overrides,
-                    variant_label=args.variant,
-                    run_id=run_id,
-                    control_profile="baseline",
-                    agentic_set=args.agentic_set,
-                    case_id=scenario.case_id,
-                )
+                run_kwargs = {
+                    "client": planned_client,
+                    "model": args.model,
+                    "output_path": args.output,
+                    "request_overrides": overrides,
+                    "variant_label": args.variant,
+                    "run_id": run_id,
+                    "control_profile": "baseline",
+                    "agentic_set": args.agentic_set,
+                    "case_id": scenario.case_id,
+                }
+                rows = run_agentic_cases(**run_kwargs)
+                if (
+                    scenario_deadline_monotonic is not None
+                    and time.monotonic() > scenario_deadline_monotonic
+                ):
+                    raise TimeoutError("scenario deadline exceeded")
                 if observer is not None:
                     observer.require_drained()
                 annotate_scored_rows(

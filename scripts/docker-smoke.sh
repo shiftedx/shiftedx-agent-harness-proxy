@@ -50,6 +50,7 @@ docker run --detach \
   --publish "127.0.0.1:$proxy_port:8090" \
   --env DEPLOYMENT_PROFILE=production \
   --env "UPSTREAM_BASE_URL=http://host.docker.internal:$upstream_port/v1" \
+  --env UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE=phase_split \
   --env MAX_UPSTREAM_RESPONSE_BYTES=1024 \
   "$image" >/dev/null
 
@@ -118,6 +119,23 @@ curl --fail --silent \
 await_status 401 "http://127.0.0.1:$proxy_port/metrics"
 curl --fail --silent --header "$auth_header" "http://127.0.0.1:$proxy_port/metrics" |
   grep 'shiftedx_proxy_downstream_requests_total 1' >/dev/null
+
+phase_response="$tmpdir/phase-response"
+curl --fail --silent \
+  --header "$auth_header" \
+  --header 'Content-Type: application/json' \
+  --data '{"model":"phase-split-smoke","messages":[{"role":"user","content":"inspect"},{"role":"assistant","tool_calls":[{"id":"smoke-old","type":"function","function":{"name":"read_file","arguments":"{}"}}]},{"role":"tool","tool_call_id":"smoke-old","content":"source"}],"tools":[{"type":"function","function":{"name":"read_file","parameters":{}}}],"tool_choice":"auto","response_format":{"type":"json_schema","json_schema":{"name":"smoke_result","strict":true,"schema":{"type":"object","properties":{"status":{"type":"string"}},"required":["status"],"additionalProperties":false}}}}' \
+  "http://127.0.0.1:$proxy_port/v1/chat/completions" >"$phase_response"
+grep --fixed-strings '"content":"{\"status\":\"ready\"}"' "$phase_response" >/dev/null
+
+stream_response="$tmpdir/stream-response"
+curl --fail --silent --no-buffer \
+  --header "$auth_header" \
+  --header 'Content-Type: application/json' \
+  --data '{"model":"fake-model","messages":[{"role":"user","content":"stream"}],"stream":true}' \
+  "http://127.0.0.1:$proxy_port/v1/chat/completions" >"$stream_response"
+grep --fixed-strings '"content":"fake upstream ready"' "$stream_response" >/dev/null
+test "$(grep -c '^data: \[DONE\]$' "$stream_response")" = "1"
 
 status="$(curl --silent --output "$tmpdir/response" --write-out '%{http_code}' \
   --header "$auth_header" \

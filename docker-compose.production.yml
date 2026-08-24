@@ -3,6 +3,7 @@ services:
     environment:
       DEPLOYMENT_PROFILE: "production"
       UPSTREAM_BASE_URL: "${UPSTREAM_BASE_URL:?Set UPSTREAM_BASE_URL to the explicit fixed upstream /v1 URL}"
+      UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE: "phase_split"
       TELEMETRY_ENABLED: "true"
     secrets:
       - proxy_api_key
