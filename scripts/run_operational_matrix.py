@@ -87,23 +87,24 @@ def _manifest_images(path: Path) -> tuple[str, str, str]:
         raw = path.read_bytes()
         runtime = json.loads(raw)["qualification_runtime"]
         image = runtime["image"]
-        rollback = runtime["rollback"]
-        if set(image) != {"reference", "digest", "uid", "gid"} or set(rollback) != {
-            "reference",
-            "digest",
-            "source_commit",
-            "workflow_url",
-            "approval_designation",
-            "approval_evidence_url",
-        }:
+        if set(image) != {"reference", "digest", "uid", "gid"}:
             raise ValueError
         candidate = _digest_image(image["reference"])
-        predecessor = _digest_image(rollback["reference"])
-        if image["digest"] != candidate.rsplit("@", 1)[1] or rollback["digest"] != predecessor.rsplit("@", 1)[1]:
+        rollback = qualification_runtime._parse_rollback(runtime["rollback"])
+        predecessor = _digest_image(rollback.reference)
+        if image["digest"] != candidate.rsplit("@", 1)[1] or rollback.digest != predecessor.rsplit("@", 1)[1]:
             raise ValueError
-        if candidate == predecessor or rollback["approval_designation"] != "approved-predecessor":
+        if candidate == predecessor:
             raise ValueError
-    except (KeyError, OSError, TypeError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+    except (
+        KeyError,
+        OSError,
+        TypeError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        ValueError,
+        qualification_runtime.QualificationRuntimeFailure,
+    ) as error:
         raise ValueError("operational_manifest_invalid") from error
     return hashlib.sha256(raw).hexdigest(), candidate, predecessor
 

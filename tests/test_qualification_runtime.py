@@ -259,7 +259,7 @@ def _manifest(tmp_path: Path) -> Path:
                 "source_commit": "d" * 40,
                 "workflow_url": "https://github.com/shiftedx/shiftedx-agent-harness-proxy/actions/runs/1",
                 "approval_designation": "approved-predecessor",
-                "approval_evidence_url": "https://github.com/shiftedx/shiftedx-agent-harness-proxy/pull/1",
+                "approval_evidence_url": "https://api.github.com/repos/shiftedx/shiftedx-agent-harness-proxy/issues/comments/1",
             },
             "model": _model_manifest_fields(tmp_path),
             "benchmark": {
@@ -450,6 +450,27 @@ def test_direct_stage_rejects_a_tampered_preflight_rollback_attestation(tmp_path
 
     assert direct.failure_category == "runtime_preflight_attestation_invalid"
     assert _docker_commands(runner) == []
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda rollback: rollback.pop("approval_evidence_url"),
+        lambda rollback: rollback.__setitem__("unexpected", True),
+        lambda rollback: rollback.__setitem__("digest", "sha256:" + "e" * 64),
+        lambda rollback: rollback.__setitem__("source_commit", "e" * 39),
+        lambda rollback: rollback.__setitem__("workflow_url", "http://github.com/a/b/actions/runs/1"),
+        lambda rollback: rollback.__setitem__("approval_designation", "candidate"),
+        lambda rollback: rollback.__setitem__("approval_evidence_url", "http://github.com/a/b/issues/1"),
+        lambda rollback: rollback.__setitem__("approval_evidence_url", "https://example.com/approval"),
+    ],
+)
+def test_rollback_attestation_uses_the_manifest_schema(mutate, tmp_path) -> None:
+    spec = runtime_module._load_runtime_spec(_manifest(tmp_path), _FakeRuntimeRunner())
+    rollback = runtime_module._rollback_attestation_record(spec.rollback)
+    mutate(rollback)
+
+    assert not runtime_module._matches_rollback_attestation(rollback, spec.rollback)
 
 
 def test_timing_capture_initializer_locks_mode_before_transferring_ownership(tmp_path) -> None:

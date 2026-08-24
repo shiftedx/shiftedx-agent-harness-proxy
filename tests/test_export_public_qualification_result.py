@@ -88,6 +88,8 @@ def _outcome() -> dict[str, object]:
                 "direct_only_success_count": 4,
                 "proxy_only_success_count": 64,
                 "discordant_pair_count": 68,
+                "one_sided_tail_numerator": 866_848,
+                "one_sided_tail_denominator": 295147905179352825856,
                 "supports_proxy_benefit": True,
             },
         },
@@ -191,6 +193,12 @@ def test_allowlist_only_export_excludes_private_sentinels_and_paths() -> None:
     assert result["qualification"]["pooled"]["direct_penalized_p99_wall_us"] == 600_000_000
     assert result["qualification"]["pooled"]["proxy_penalized_p99_wall_us"] == 600_000_000
     assert result["qualification"]["final_decision"] == "PROMOTE"
+    assert result["qualification"]["mcnemar"]["one_sided_tail_numerator"] == "866848"
+    assert result["qualification"]["mcnemar"]["one_sided_tail_denominator"] == "295147905179352825856"
+    assert result["operational"]["artifacts"] == {
+        "candidate_digest": "sha256:" + "c" * 64,
+        "rollback_digest": "sha256:" + "d" * 64,
+    }
     assert result["operational"]["decode"]["cold"]["proxy_to_direct_ratio_ppm"] == 950_000
 
 

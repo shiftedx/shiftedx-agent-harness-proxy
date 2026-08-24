@@ -619,7 +619,7 @@ def _read_private_regular_file(path: Path) -> bytes:
         os.close(descriptor)
 
 
-def _load_rollback_attestation(value: Any, candidate_digest: str) -> RollbackAttestation:
+def parse_rollback_attestation(value: Any, candidate_digest: str | None = None) -> RollbackAttestation:
     """Validate the exact, independently deployable rollback identity."""
     rollback_keys = {
         "reference",
@@ -748,7 +748,7 @@ def load_runtime_attestation(
     ):
         raise RuntimeAttestationFailure("runtime_attestation_invalid")
     try:
-        rollback_identity = _load_rollback_attestation(rollback, image_digest)
+        rollback_identity = parse_rollback_attestation(rollback, image_digest)
     except ValueError as error:
         raise RuntimeAttestationFailure("runtime_attestation_invalid") from error
     return RuntimeAttestation(

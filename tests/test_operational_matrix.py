@@ -32,7 +32,7 @@ def _manifest(path: Path, candidate: str, rollback: str) -> Path:
                 "approval_designation": "approved-predecessor",
                 "source_commit": "a" * 40,
                 "workflow_url": "https://github.com/example/repo/actions/runs/1",
-                "approval_evidence_url": "https://github.com/example/repo/issues/1",
+                "approval_evidence_url": "https://api.github.com/repos/example/repo/issues/comments/1",
             },
         }
     }
@@ -113,7 +113,20 @@ def test_phase_idle_requires_proxy_gauges_and_authoritative_ledger_to_drain_afte
     assert module._phase_idle(gauges, {"active": 0})
 
 
-def test_manifest_binds_candidate_and_approved_distinct_rollback(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda rollback: rollback.pop("approval_evidence_url"),
+        lambda rollback: rollback.__setitem__("unexpected", True),
+        lambda rollback: rollback.__setitem__("digest", "sha256:" + "c" * 64),
+        lambda rollback: rollback.__setitem__("source_commit", "c" * 39),
+        lambda rollback: rollback.__setitem__("workflow_url", "http://github.com/a/b/actions/runs/1"),
+        lambda rollback: rollback.__setitem__("approval_designation", "candidate"),
+        lambda rollback: rollback.__setitem__("approval_evidence_url", "http://github.com/a/b/issues/1"),
+        lambda rollback: rollback.__setitem__("approval_evidence_url", "https://example.com/approval"),
+    ],
+)
+def test_manifest_binds_candidate_and_approved_distinct_rollback(mutate, tmp_path: Path) -> None:
     module = _load_script()
     candidate = "example/proxy@sha256:" + "a" * 64
     rollback = "example/proxy@sha256:" + "b" * 64
@@ -125,7 +138,7 @@ def test_manifest_binds_candidate_and_approved_distinct_rollback(tmp_path: Path)
     assert actual_candidate == candidate
     assert actual_rollback == rollback
     document = json.loads(path.read_text(encoding="utf-8"))
-    document["qualification_runtime"]["rollback"]["approval_designation"] = "candidate"
+    mutate(document["qualification_runtime"]["rollback"])
     path.write_text(json.dumps(document), encoding="utf-8")
     with pytest.raises(ValueError, match="operational_manifest_invalid"):
         module._manifest_images(path)

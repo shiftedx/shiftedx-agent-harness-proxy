@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import stat
+from math import comb
 from pathlib import Path
 from typing import Any
 
@@ -164,20 +165,23 @@ def public_qualification_result(
     conditional_latency = _conditional_latency(_require_object(evaluator, "conditional_latency"), gates, expected_lanes)
     pooled = _summary(_require_object(evaluator, "pooled"))
     lanes = _lanes(_require_object(evaluator, "lanes"), expected_lanes)
-    mcnemar = _mcnemar(_require_object(evaluator, "mcnemar"))
+    mcnemar = _mcnemar(
+        _require_object(evaluator, "mcnemar"), alpha_ppm=_require_nonnegative_int(contract, "mcnemar_alpha_ppm")
+    )
     final_report = _final_report(
         final_report_bytes,
         outcome_bytes=outcome_bytes,
         manifest_sha256=manifest_sha256,
         lanes=expected_lanes,
     )
-    operational_gates = _operational_evidence(
+    operational = _operational_evidence(
         operational_evidence_bytes,
         expected_sha256=final_report["operational_evidence_sha256"],
         manifest_sha256=manifest_sha256,
         outcome_sha256=hashlib.sha256(outcome_bytes).hexdigest(),
         head_event_sha256=head_event_sha256,
     )
+    operational_gates = operational["gates"]
     if final_report["operational_gates"] != operational_gates:
         raise PublicQualificationExportError("public_qualification_outcome_invalid")
     _validate_final_decision(
@@ -211,6 +215,7 @@ def public_qualification_result(
             "mcnemar": mcnemar,
         },
         "operational": {
+            "artifacts": operational["artifacts"],
             "gates": operational_gates,
             "decode": final_report["decode"],
             "amplification": final_report["amplification"],
@@ -407,19 +412,28 @@ def _lanes(document: dict[str, Any], expected_lanes: list[str]) -> dict[str, dic
     return {lane: _summary(_require_object(document, lane)) for lane in expected_lanes}
 
 
-def _mcnemar(document: dict[str, Any]) -> dict[str, int | bool]:
-    result: dict[str, int | bool] = {
+def _mcnemar(document: dict[str, Any], *, alpha_ppm: int) -> dict[str, int | bool | str]:
+    result: dict[str, int | bool | str] = {
         key: _require_nonnegative_int(document, key)
         for key in ("direct_only_success_count", "proxy_only_success_count", "discordant_pair_count")
     }
+    numerator = _require_nonnegative_int(document, "one_sided_tail_numerator")
+    denominator = _require_nonnegative_int(document, "one_sided_tail_denominator")
     supports = document.get("supports_proxy_benefit")
+    discordant = result["discordant_pair_count"]
+    proxy_only = result["proxy_only_success_count"]
+    assert isinstance(discordant, int) and isinstance(proxy_only, int)
     if (
         type(supports) is not bool
-        or result["discordant_pair_count"]
-        != result["direct_only_success_count"] + result["proxy_only_success_count"]
+        or discordant != result["direct_only_success_count"] + proxy_only
+        or denominator != 1 << discordant
+        or numerator != sum(comb(discordant, value) for value in range(proxy_only, discordant + 1))
+        or supports != (numerator * 1_000_000 < denominator * alpha_ppm)
     ):
         raise PublicQualificationExportError("public_qualification_outcome_invalid")
     result["supports_proxy_benefit"] = supports
+    result["one_sided_tail_numerator"] = str(numerator)
+    result["one_sided_tail_denominator"] = str(denominator)
     return result
 
 
@@ -467,7 +481,7 @@ def _operational_evidence(
     manifest_sha256: str,
     outcome_sha256: str,
     head_event_sha256: str,
-) -> dict[str, bool]:
+) -> dict[str, object]:
     if not isinstance(expected_sha256, str) or hashlib.sha256(payload).hexdigest() != expected_sha256:
         raise PublicQualificationExportError("public_qualification_outcome_invalid")
     evidence = _load_json(payload)
@@ -489,7 +503,13 @@ def _operational_evidence(
     gates = _operational_gates(_require_object(evidence, "gates"))
     if evidence.get("passed") is not all(gates.values()):
         raise PublicQualificationExportError("public_qualification_outcome_invalid")
-    return gates
+    return {
+        "artifacts": {
+            "candidate_digest": candidate.rsplit("@", 1)[1],
+            "rollback_digest": rollback.rsplit("@", 1)[1],
+        },
+        "gates": gates,
+    }
 
 
 def _operational_gates(document: dict[str, Any]) -> dict[str, bool]:

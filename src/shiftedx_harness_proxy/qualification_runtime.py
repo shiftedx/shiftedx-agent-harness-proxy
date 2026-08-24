@@ -50,6 +50,7 @@ from .qualification_contract import (
     RuntimeOutcomeFailure,
     load_model_evidence,
     load_runtime_outcome,
+    parse_rollback_attestation,
     read_model_boundary_observer_records,
 )
 from .qualification_contract import (
@@ -94,7 +95,6 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SOURCE_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _IMAGE_REFERENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]*$")
-_WORKFLOW_URL = re.compile(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[1-9][0-9]*$")
 _APPROVED_PREDECESSOR = "approved-predecessor"
 _FAILURE_CATEGORY = re.compile(r"^[a-z0-9_]+$")
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
@@ -1420,30 +1420,16 @@ def _parse_image(value: Any) -> _ImageSpec:
 
 
 def _parse_rollback(value: Any) -> _RollbackSpec:
-    rollback = _exact_object(
-        value,
-        {
-            "reference",
-            "digest",
-            "source_commit",
-            "workflow_url",
-            "approval_designation",
-            "approval_evidence_url",
-        },
-    )
-    reference, digest = _digest_qualified_reference(rollback)
-    workflow_url = _required_text(rollback.get("workflow_url"))
-    if _WORKFLOW_URL.fullmatch(workflow_url) is None:
-        raise QualificationRuntimeFailure("runtime_manifest_invalid")
-    approval_evidence_url = _safe_absolute_url(rollback.get("approval_evidence_url"), frozenset({"https"}))
-    if rollback.get("approval_designation") != _APPROVED_PREDECESSOR:
-        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    try:
+        rollback = parse_rollback_attestation(value)
+    except ValueError:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid") from None
     return _RollbackSpec(
-        reference,
-        digest,
-        _exact_string(rollback, "source_commit", _SOURCE_COMMIT),
-        workflow_url,
-        approval_evidence_url,
+        rollback.reference,
+        rollback.digest,
+        rollback.source_commit,
+        rollback.workflow_url,
+        rollback.approval_evidence_url,
     )
 
 
@@ -3382,7 +3368,7 @@ def _validate_existing_preflight_attestation(private_run_dir: Path, spec: _Runti
         or value.get("stage") != "preflight"
         or value.get("source_commit") != spec.source_commit
         or value.get("image_digest") != spec.image.digest
-        or value.get("rollback") != _rollback_attestation_record(spec.rollback)
+        or not _matches_rollback_attestation(value.get("rollback"), spec.rollback)
         or value.get("run_manifest_sha256") != spec.manifest_sha256
         or value.get("model_id_sha256") != _canonical_sha256(spec.model.public_id)
         or value.get("benchmark_revision") != spec.benchmark.revision
@@ -3400,6 +3386,15 @@ def _validate_existing_preflight_attestation(private_run_dir: Path, spec: _Runti
     ):
         raise QualificationRuntimeFailure("runtime_preflight_attestation_invalid")
     return path
+
+
+def _matches_rollback_attestation(value: Any, expected: _RollbackSpec) -> bool:
+    """Accept only the same strict rollback object the manifest parser accepts."""
+
+    try:
+        return _rollback_attestation_record(_parse_rollback(value)) == _rollback_attestation_record(expected)
+    except QualificationRuntimeFailure:
+        return False
 
 
 def _attestation_model_identity(path: Path) -> str:
