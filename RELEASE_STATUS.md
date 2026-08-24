@@ -1,10 +1,10 @@
 # Release status
 
-## r14 qualified exact-image deployment
+## v0.1.0 public qualified release
 
-The r14 qualification decision is `PROMOTE` for the exact candidate below. It authorizes controlled,
-authenticated production deployment—not a generally available package, public registry image, tag,
-support SLA, or claim about a future rebuild. The public evidence is
+The r14 qualification decision is `PROMOTE` for the exact public image below. Version `v0.1.0` is
+recommended for controlled, authenticated production deployment on the supported topology. This is
+not a support-SLA or future-rebuild claim. The public evidence is
 [v2-qualification-result-2026-08-24.json](benchmark-reports/v2-qualification-result-2026-08-24.json).
 
 Across the fixed 240-row direct-then-proxy comparison, valid outcomes rose from direct `160/240`
@@ -42,12 +42,11 @@ Those items remain outside the qualified surface.
 ## Exact artifacts and gates
 
 - Candidate source: `b5cdd1e5d5444d3064179baea0dc30cccfecb0ee`.
-- Candidate OCI index: `sha256:cee2d12b263358414ff4519d11220d319684a431d4894215b04baedf0807afed`.
+- Public candidate OCI index: `ghcr.io/shiftedx/shiftedx-agent-harness-proxy@sha256:cee2d12b263358414ff4519d11220d319684a431d4894215b04baedf0807afed`.
 - Approved rollback predecessor: `sha256:c673ec73ffded8d28200f6157b696fb451735a3416a55407e686587150fe4230`.
 
-The candidate digest is retained qualification evidence, not a public registry URL. Operators must
-verify and preload it or mirror it to an approved private registry without changing the digest. A
-source rebuild, local tag, or later `main` commit is not the evaluated artifact.
+The public reference resolves anonymously to the qualified amd64/arm64 OCI index. A source rebuild,
+mutable tag, or later `main` commit is not the evaluated artifact.
 
 All r14 operational gates passed: candidate readiness; transient recovery; restart readiness and
 graceful in-flight restart; sustained load and overload; upstream-concurrency and exact accounting; bounded
@@ -56,9 +55,8 @@ cancellation; injected timeout/disconnect/malformed/5xx/429 faults; privacy prob
 ceilings; and rollback readiness plus smoke within 60 seconds. Decode remained at least `90%` of
 direct in each lane, and reconciliation and amplification gates passed. Raw evidence remains private.
 
-Controlled deployment still requires `phase_split`, authenticated private/loopback operation, a
-canary with end-to-end monitoring, and the approved rollback artifact locally available. Do not
-claim general availability until a durable public image reference is published.
+Deployment still requires `phase_split`, authenticated private/loopback operation, a canary with
+end-to-end monitoring, and the approved rollback artifact locally available.
 
 ## Public review map
 

@@ -4,10 +4,10 @@ This runbook covers the authenticated r14-qualified Chat Completions image. The
 Harness Proxy is policy middleware: it does not provide TLS, execute tools, select arbitrary
 upstreams, or sandbox the Downstream Client's tool runner.
 
-The exact r14 artifact is qualified for controlled production deployment under
-[Release status](../RELEASE_STATUS.md). It is not generally available: no durable public image
-reference exists. `stream=true` is qualified validate-then-replay compatibility streaming, not a
-progressive/token-time or TTFT improvement. A later source checkout is not a substitute.
+The exact public r14 artifact is qualified for controlled production deployment under
+[Release status](../RELEASE_STATUS.md). `stream=true` is qualified validate-then-replay
+compatibility streaming, not a progressive/token-time or TTFT improvement. A later source checkout
+is not a substitute.
 
 ## Supported topology
 
@@ -39,12 +39,10 @@ Record and retain:
 For production qualification or promotion, deploy an exact approved image. Do not rebuild from a
 floating branch or use an unverified local tag.
 
-The qualified candidate is source `b5cdd1e5d5444d3064179baea0dc30cccfecb0ee`, OCI index
-`sha256:cee2d12b263358414ff4519d11220d319684a431d4894215b04baedf0807afed`. Its approved rollback
+The qualified candidate is source `b5cdd1e5d5444d3064179baea0dc30cccfecb0ee`, public OCI index
+`ghcr.io/shiftedx/shiftedx-agent-harness-proxy@sha256:cee2d12b263358414ff4519d11220d319684a431d4894215b04baedf0807afed`. Its approved rollback
 predecessor is `sha256:c673ec73ffded8d28200f6157b696fb451735a3416a55407e686587150fe4230`.
-These are retained artifact identities, not registry URLs. Verify and preload them or mirror them
-to an approved internal registry, preserving the digests; a source build does not reproduce the
-evaluated bytes.
+A source build does not reproduce the evaluated bytes.
 
 ## Secrets
 
@@ -79,11 +77,10 @@ UPSTREAM_BASE_URL=http://host.docker.internal:8000/v1 \
   config
 ```
 
-For an exact prebuilt image, first make the approved registry digest or preloaded immutable image
-reference available to Docker, then add the no-build release overlay:
+For the exact public image, add the no-build release overlay:
 
 ```bash
-APPROVED_PROXY_IMAGE='registry.example/shiftedx-agent-harness-proxy@sha256:<digest>'
+APPROVED_PROXY_IMAGE='ghcr.io/shiftedx/shiftedx-agent-harness-proxy@sha256:cee2d12b263358414ff4519d11220d319684a431d4894215b04baedf0807afed'
 PROXY_IMAGE="$APPROVED_PROXY_IMAGE" \
 UPSTREAM_BASE_URL=http://host.docker.internal:8000/v1 \
   docker compose \
@@ -120,7 +117,7 @@ UPSTREAM_BASE_URL=http://host.docker.internal:8000/v1 \
 Exact-image qualification or release operation:
 
 ```bash
-APPROVED_PROXY_IMAGE='registry.example/shiftedx-agent-harness-proxy@sha256:<digest>'
+APPROVED_PROXY_IMAGE='ghcr.io/shiftedx/shiftedx-agent-harness-proxy@sha256:cee2d12b263358414ff4519d11220d319684a431d4894215b04baedf0807afed'
 PROXY_IMAGE="$APPROVED_PROXY_IMAGE" \
 UPSTREAM_BASE_URL=http://host.docker.internal:8000/v1 \
   docker compose \
@@ -176,7 +173,9 @@ Before exposing an exact image to ingress, run its deterministic image smoke fro
 source checkout. Pull the immutable image first; the smoke must not rebuild it:
 
 ```bash
+APPROVED_PROXY_IMAGE='ghcr.io/shiftedx/shiftedx-agent-harness-proxy@sha256:cee2d12b263358414ff4519d11220d319684a431d4894215b04baedf0807afed'
 docker pull "$APPROVED_PROXY_IMAGE"
+docker manifest inspect "$APPROVED_PROXY_IMAGE" >/dev/null
 IMAGE="$APPROVED_PROXY_IMAGE" BUILD_IMAGE=0 ./scripts/docker-smoke.sh
 ```
 
