@@ -3,19 +3,24 @@
 [![CI](https://github.com/shiftedx/shiftedx-agent-harness-proxy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/shiftedx/shiftedx-agent-harness-proxy/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Status: qualified for controlled production deployment of one exact artifact; not yet generally
-available.** The r14 campaign improved valid agent outcomes from `160/240` (`66.7%`) direct to
+**Status: public v0.1.0 release, qualified for controlled production deployment.** The r14 campaign
+improved valid agent outcomes from `160/240` (`66.7%`) direct to
 `220/240` (`91.7%`) proxy-assisted, while deadline-penalized mean time to a valid outcome fell
 from `203.488 s` to `54.605 s` (`73.2%` lower; `3.73×` faster). This is not a raw-inference or
 token-latency claim. The exact evaluated source is `b5cdd1e5d5444d3064179baea0dc30cccfecb0ee` and
-the OCI index digest is `sha256:cee2d12b263358414ff4519d11220d319684a431d4894215b04baedf0807afed`;
-there is no durable public registry reference yet. See [release status](RELEASE_STATUS.md), the
+the public OCI index is
+`ghcr.io/shiftedx/shiftedx-agent-harness-proxy@sha256:cee2d12b263358414ff4519d11220d319684a431d4894215b04baedf0807afed`.
+See [release status](RELEASE_STATUS.md), the
 [public r14 result](benchmark-reports/v2-qualification-result-2026-08-24.json), and the
 [operator runbook](docs/operator-runbook.md).
 
 A small, stateless policy proxy for OpenAI-compatible Chat Completions. It blocks repeated or
 stalled tool calls, requires verification after mutations, and corrects malformed terminal JSON
 within fixed retry limits. It never executes tools or changes model weights.
+
+```bash
+docker pull ghcr.io/shiftedx/shiftedx-agent-harness-proxy@sha256:cee2d12b263358414ff4519d11220d319684a431d4894215b04baedf0807afed
+```
 
 ## Qualified agent-outcome performance
 
@@ -253,6 +258,5 @@ in [benchmarking](docs/benchmarking.md), the
 [v2 qualification plan](benchmark-reports/v2-qualification-plan.md), and the
 [public r14 result](benchmark-reports/v2-qualification-result-2026-08-24.json).
 
-This is a qualified exact-image deployment, not a generally available package or image. Authorized
-operators must preload or mirror the evaluated digest into an approved private registry; a source
-build, a local tag, or a later commit is not the qualified artifact.
+The public digest above is the qualified artifact. A source build, mutable tag, or later commit is
+not a substitute for that evaluated image.
