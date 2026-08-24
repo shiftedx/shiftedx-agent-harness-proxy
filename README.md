@@ -40,8 +40,7 @@ SERVED_MODEL=your-openai-model-id
   --draft-temperature 1 --draft-top-p .95 --draft-top-k 20 --no-stats-footer
 
 UPSTREAM_BASE_URL=http://host.docker.internal:8000/v1 \
-UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE=phase_split \
-INTERVENTION_FAST_PATH_MODE=disabled docker compose up --build -d
+UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE=phase_split docker compose up --build -d
 ```
 
 Keep an opaque Chat Completions `user` value stable per conversation for MTPLX session affinity.
@@ -153,6 +152,10 @@ network is not a substitute for authentication.
 
 - Reconstructs compact receipts from paired assistant calls and public tool results.
 - Blocks identical calls only while state is unchanged; successful mutation opens a new epoch.
+- Marks an internally blocked duplicate as `blocked_not_executed`; only downstream-visible calls
+  paired with client tool results count as executed. The strict, versioned
+  `shiftedx_recovery_result_v1` response schema checks its `failed_executions` field against that
+  ledger; unrelated schemas and unstructured prose keep ordinary prompt-grounded semantics.
 - Requires successful verification after mutation and preserves unresolved failures.
 - Withholds an entire parallel batch if one sibling is blocked, preventing false execution state.
 - Applies at most two terminal-format corrections and hard-bounds every internal retry loop.
@@ -183,10 +186,10 @@ projection, parallel calls, and degraded transcript behavior.
 | `PROXY_API_KEY` | unset | Independent client-facing bearer token |
 | `TRUSTED_POLICY_EXTENSION_API_KEYS` | unset | Distinct comma-separated opaque bearer capabilities allowed to disable receipt requirements or override protected tool roles |
 | `ALLOW_HARNESS_OPT_OUT` | `false` | Allows only trusted policy-extension principals to send `X-Shiftedx-Harness: off` |
-| `INTERVENTION_FAST_PATH_MODE` | `disabled` | `shadow` requires an explicitly injected observer; no durable qualification sink is wired; `enabled` fails closed pending signed promotion authority |
 | `UPSTREAM_CACHE_CAPABILITY_MODE` | `disabled` | Generic cache capability profile; `disabled` and `unknown` reject client namespace controls |
 | `UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE` | `passthrough` | `phase_split` is the qualified MTPLX fallback; experimental `combined_v1` requires the exact upstream capability contract and remains outside qualification |
 | `UPSTREAM_CACHE_NAMESPACE_FIELDS` | unset | Comma-separated, nonblank additional top-level client cache namespace field names to reject |
+| `DENIED_TOOLS` | unset | Comma-separated server-only tool names to withhold before client execution; disables harness opt-out while nonempty |
 | `MAX_INTERNAL_RETRIES` | `4` | Internal policy retries per request |
 | `MAX_UPSTREAM_CALLS` | `7` | Total upstream-call ceiling per request |
 | `UPSTREAM_TIMEOUT_SECONDS` | `120` | Upstream timeout |
@@ -237,7 +240,7 @@ uv run mypy src
 ./scripts/docker-smoke.sh
 ```
 
-The current release-candidate branch has 847 tests. CI also runs the near-body-limit admission soak,
+CI runs the full test suite and the near-body-limit admission soak,
 dependency audit, multi-architecture OCI build, hardened production-profile smoke, exact-image
 vulnerability/secret/misconfiguration scan, SBOM generation, release-manifest capture, and SLSA
 provenance attestation. The complete evidence boundary is summarized in

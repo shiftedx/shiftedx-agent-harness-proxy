@@ -8,6 +8,7 @@ import pytest
 from shiftedx_harness_proxy.qualification_contract import (
     BENCHMARK_REVISION,
     CacheObservation,
+    ModelBoundaryObserverCursor,
     ModelBoundaryRecord,
     ModelEvidence,
     ModelEvidenceFailure,
@@ -204,6 +205,41 @@ def test_model_boundary_records_load_exact_safe_response_cache_projection(tmp_pa
     assert "private prompt" not in path.read_text(encoding="utf-8")
 
 
+def test_model_boundary_cursor_consumes_only_its_correlation_and_rejects_leftovers(tmp_path) -> None:
+    fingerprint = model_boundary_fingerprint({"model": "model", "messages": []})
+    path = tmp_path / "observer.jsonl"
+    path.touch()
+    path.chmod(0o600)
+    cursor = ModelBoundaryObserverCursor(path, ["scenario"])
+    late = ModelBoundaryRecord(1, fingerprint.digest, fingerprint.fields, 200, None, "a" * 64)
+    current = ModelBoundaryRecord(2, fingerprint.digest, fingerprint.fields, 200, None, "b" * 64)
+    rows = "\n".join(json.dumps(record.to_dict(), sort_keys=True, separators=(",", ":")) for record in (late, current))
+    path.write_text(rows + "\n", encoding="utf-8")
+
+    cursor.begin_turn(correlation_id_sha256="b" * 64)
+    assert len(cursor.consume_turn(require_records=True, correlation_id_sha256="b" * 64)) == 1
+    with pytest.raises(PreflightFailure, match="unconsumed"):
+        cursor.require_drained()
+
+    cursor.begin_turn(correlation_id_sha256="a" * 64)
+    assert len(cursor.consume_turn(require_records=True)) == 1
+    cursor.require_drained()
+
+
+def test_model_boundary_reader_rejects_malformed_correlation_but_accepts_direct_record(tmp_path) -> None:
+    fingerprint = model_boundary_fingerprint({"model": "model", "messages": []})
+    direct = ModelBoundaryRecord(1, fingerprint.digest, fingerprint.fields, 200, None)
+    path = tmp_path / "direct.jsonl"
+    path.write_text(json.dumps(direct.to_dict(), sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+    assert read_model_boundary_observer_records(path) == (direct,)
+
+    malformed = direct.to_dict() | {"correlation_id_sha256": "not-a-hash"}
+    path.write_text(json.dumps(malformed, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    with pytest.raises(PreflightFailure, match="observer ledger is invalid"):
+        read_model_boundary_observer_records(path)
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -372,6 +408,58 @@ def test_runtime_outcome_loads_exact_private_evidence_identity(tmp_path) -> None
     assert outcome.model_evidence_sha256 == document["model_evidence_sha256"]
     assert outcome.output_ledger_sha256 == document["output_ledger_sha256"]
     assert outcome.output_record_count == 5
+
+
+def test_scored_direct_runtime_outcome_accepts_v2_eighth_warm_predecessor_slot(tmp_path) -> None:
+    attestation = tmp_path / "preflight-runtime-attestation.json"
+    attestation.write_text('{"model_identity_sha256":"' + "f" * 64 + '"}\n', encoding="utf-8")
+    attestation.chmod(0o600)
+    output = tmp_path / "scored-direct.jsonl"
+    output.write_text('{"record":1}\n', encoding="utf-8")
+    output.chmod(0o600)
+    evidence = _write_model_evidence(
+        tmp_path / "scored-direct-model-cache-evidence.json", stage="score-direct"
+    )
+    path = tmp_path / "scored-direct-runtime-outcome.json"
+    document = {
+        "schema_version": "1.0",
+        "record_type": "qualification_runtime_outcome",
+        "stage": "scored-direct",
+        "status": "passed",
+        "action_exit_code": 0,
+        "failure_category": None,
+        "run_manifest_sha256": "c" * 64,
+        "attestation_sha256": hashlib.sha256(attestation.read_bytes()).hexdigest(),
+        "model_evidence_sha256": hashlib.sha256(evidence.read_bytes()).hexdigest(),
+        "output_ledger_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+        "output_record_count": 1,
+        "proxy_reconciliation_sha256": None,
+        "campaign_id_sha256": "a" * 64,
+        "slot_ordinal": 8,
+        "cache_lane": "warm-prefix",
+        "pair_index": 4,
+    }
+    path.write_text(json.dumps(document), encoding="utf-8")
+    path.chmod(0o600)
+
+    outcome = load_runtime_outcome(
+        path,
+        expected_stage="scored-direct",
+        run_manifest_sha256="c" * 64,
+        attestation=attestation,
+        model_evidence=evidence,
+        model_identity_sha256="f" * 64,
+        model_contract_sha256="f" * 64,
+        output_ledger=output,
+        expected_output_record_count=1,
+        campaign_id_sha256="a" * 64,
+        slot_ordinal=8,
+        cache_lane="warm-prefix",
+        pair_index=4,
+        campaign_version="v2",
+    )
+
+    assert outcome.stage == "scored-direct"
 
 
 def test_passed_runtime_outcome_rejects_absent_campaign_identity(tmp_path) -> None:

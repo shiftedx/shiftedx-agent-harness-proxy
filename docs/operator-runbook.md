@@ -31,8 +31,8 @@ Record and retain:
 - release manifest, OCI archive checksum, SBOM, provenance, and green CI URL;
 - `uv.lock`, base-image, Compose files, and configuration digests;
 - fixed upstream URL and model/runtime identity;
-- the process-fixed `UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE`; use `phase_split` only after a
-  synthetic strict primitive-object tool/schema preflight confirms the upstream cannot combine both grammars;
+- the production-pinned `UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE=phase_split` and its synthetic
+  strict primitive-object tool/schema preflight;
 - ingress limits, host/container profile, monitoring destination, and rollback image;
 - secret owner and rotation procedure without copying secret values into the record.
 
@@ -86,7 +86,6 @@ reference available to Docker, then add the no-build release overlay:
 APPROVED_PROXY_IMAGE='registry.example/shiftedx-agent-harness-proxy@sha256:<digest>'
 PROXY_IMAGE="$APPROVED_PROXY_IMAGE" \
 UPSTREAM_BASE_URL=http://host.docker.internal:8000/v1 \
-UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE=phase_split \
   docker compose \
   -f docker-compose.yml \
   -f docker-compose.production.yml \
@@ -98,8 +97,7 @@ Inspect the rendered configuration. Production must retain:
 
 - `DEPLOYMENT_PROFILE=production`;
 - an explicit fixed `UPSTREAM_BASE_URL` ending at the intended `/v1` base;
-- the preflight-approved `UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE`; the tested AEON/MTPLX contract
-  requires `phase_split`;
+- `UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE=phase_split`;
 - loopback/private publication rather than `0.0.0.0:8090`;
 - non-root UID/GID `10001:10001`, read-only root filesystem, all capabilities dropped, and
   `no-new-privileges`;
@@ -125,7 +123,6 @@ Exact-image qualification or release operation:
 APPROVED_PROXY_IMAGE='registry.example/shiftedx-agent-harness-proxy@sha256:<digest>'
 PROXY_IMAGE="$APPROVED_PROXY_IMAGE" \
 UPSTREAM_BASE_URL=http://host.docker.internal:8000/v1 \
-UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE=phase_split \
   docker compose \
   -f docker-compose.yml \
   -f docker-compose.production.yml \
@@ -136,13 +133,64 @@ UPSTREAM_TOOL_RESPONSE_CAPABILITY_MODE=phase_split \
 If an upstream secret is required, include `-f docker-compose.secrets.yml` in the same ordered file
 list. Save the exact rendered configuration digest with the deployment record.
 
+## Hermes provider
+
+For a separately qualified immutable streaming image, save this as `$HERMES_HOME/config.yaml`,
+replace the endpoint and model ID, and keep the bearer token out of the file:
+
+```yaml
+model:
+  default: served-model-id
+  provider: shiftedx-proxy
+providers:
+  shiftedx-proxy:
+    api: https://proxy.internal/v1
+    key_env: SHIFTEDX_PROXY_API_KEY
+    transport: chat_completions
+    default_model: served-model-id
+    discover_models: false
+    models:
+      - served-model-id
+display:
+  streaming: true
+```
+
+Set `SHIFTEDX_PROXY_API_KEY` through the operator's secret mechanism; stock Hermes reads the named
+environment variable and sends it as the provider bearer. Do not put the credential in this file. Then run
+`hermes chat --provider shiftedx-proxy --model served-model-id`. Hermes uses the stock Chat
+Completions API; when it requests streaming, the proxy performs validate-then-replay: it buffers
+and validates the complete upstream completion before emitting OpenAI-compatible SSE events. This
+is compatibility streaming, not a token-time/TTFT improvement. Do not use this configuration to
+claim that the historical non-streaming candidate is qualified for streaming.
+
 The quality result also binds the client-side `historical-aeon-v1` sampler: temperature `1.0`,
 top-p `0.95`, top-k `20`, thinking enabled at medium effort, and a 1024-token response limit.
 Changing that profile is allowed operationally but is not covered by the reported quality evidence.
 
 ## Preflight
 
-Use only synthetic, non-sensitive content:
+Use only synthetic, non-sensitive content. `/readyz` remains an upstream-reachability signal; the
+deployment controller must not enable ingress/backend readiness until both the deterministic
+exact-image smoke and the live-upstream synthetic smoke pass.
+
+Before exposing an exact image to ingress, run its deterministic image smoke from the matching public
+source checkout. Pull the immutable image first; the smoke must not rebuild it:
+
+```bash
+docker pull "$APPROVED_PROXY_IMAGE"
+IMAGE="$APPROVED_PROXY_IMAGE" BUILD_IMAGE=0 ./scripts/docker-smoke.sh
+```
+
+The deterministic exact-image smoke uses a local fake upstream, not the deployed model. It fails if
+`phase_split` forwards a merged tool/schema request, if its finalization request retains tools or
+`tool_choice`, or if validate-then-replay SSE loses semantic content or emits anything other than
+one `[DONE]`. It also retains the authenticated Models, readiness, bounded-response, hardening,
+secret-redaction, and graceful-shutdown checks. This is deterministic image/protocol evidence, not
+a model-performance claim or a replacement for the synthetic live-upstream smoke below.
+
+After the exact image is running against the fixed live upstream, run this separate synthetic smoke
+with a non-sensitive model ID and prompt. It verifies live reachability, authentication, and
+validate-then-replay transport; the deterministic smoke above remains the grammar proof.
 
 ```bash
 curl -fsS http://127.0.0.1:8090/healthz
@@ -155,6 +203,12 @@ curl -fsS \
   -H 'Content-Type: application/json' \
   --data '{"model":"served-model-id","messages":[{"role":"user","content":"Return a short readiness acknowledgement."}]}' \
   http://127.0.0.1:8090/v1/chat/completions
+curl -fsSN \
+  -H "Authorization: Bearer $CLIENT_PROXY_KEY" \
+  -H 'Content-Type: application/json' \
+  --data '{"model":"served-model-id","messages":[{"role":"user","content":"Return a short readiness acknowledgement."}],"stream":true}' \
+  http://127.0.0.1:8090/v1/chat/completions |
+  awk '/^data: / { event = 1 } /^data: \[DONE\]$/ { done++ } END { exit !(event && done == 1) }'
 ```
 
 Also verify that unauthenticated `/v1/models`, `/v1/chat/completions`, and `/metrics` fail, the
@@ -183,13 +237,22 @@ Scrape `/metrics` through the authenticated management path. At minimum alert on
   state.
 
 Metrics intentionally have no prompt, tool, credential, tenant, or principal labels. Do not add
-request-derived labels in downstream monitoring relabel rules.
+request-derived labels in downstream monitoring relabel rules. Use counter deltas over a five-minute
+window and the existing ingress/container collector for end-to-end latency and resource values.
 
-For the tested AEON profile, alert on complete agentic case latency, not only proxy service time.
-Proxy-only p95 was `7.783 ms`, but full-agentic p95 was `170.5%` of direct when cold and `145.6%`
-when warm-prefix, failing the `125%` ceiling because the policy can add bounded model turns. Canary
-before broader traffic and stop expansion if end-to-end latency or correction tails exceed the
-deployment's accepted budget.
+| Signal | Stop the canary / page when |
+| --- | --- |
+| End-to-end p95 | Either cold or warm lane is `>125%` of its matched direct baseline. |
+| Upstream amplification | `shiftedx_proxy_upstream_calls_total / shiftedx_proxy_downstream_requests_total` delta is `>2.0`. |
+| Errors and cancellations | Error delta exceeds 1% of admitted request delta, or cancellation delta exceeds 5%, for five minutes. |
+| Readiness | Any canary has no successful `/readyz` probe for 60 seconds, or no ready backend remains. |
+| Corrections / blocks | Correction, duplicate, or stall deltas exceed 5% of admitted request delta for 15 minutes. |
+| Resource pressure | RSS, CPU, or PIDs stay above 80% of the configured container limit for five minutes. |
+
+Start with one backend or no more than 5% of traffic for 15 minutes. Expand only if every row stays
+within its threshold; otherwise remove the canary from ingress and use the rollback procedure. The
+historical AEON result still fails the end-to-end p95 gate, so these rules do not authorize its
+promotion without fresh exact-image evidence.
 
 ## Public error and retry behavior
 

@@ -52,6 +52,29 @@ def _canonical_sha256(value: object) -> str:
     ).hexdigest()
 
 
+def test_observer_timeout_leaves_a_small_strict_margin_below_the_proxy_timeout() -> None:
+    assert runtime_module._observer_timeout_seconds({"upstream_timeout_seconds": 120.0}) == "119.0"
+    assert runtime_module._observer_timeout_seconds({"upstream_timeout_seconds": 0.5}) == "0.45"
+    with pytest.raises(runtime_module.QualificationRuntimeFailure, match="runtime_manifest_invalid"):
+        runtime_module._observer_timeout_seconds({"upstream_timeout_seconds": 0})
+
+
+def test_runtime_supervisor_passes_the_bounded_observer_timeout(tmp_path) -> None:
+    runner = _FakeRuntimeRunner()
+    outcome = _supervise(
+        manifest=_manifest(tmp_path),
+        stage="preflight",
+        private_run_dir=_private_run(tmp_path),
+        action=_write_complete_ledger,
+        command_runner=runner,
+    )
+
+    assert outcome.status == "passed"
+    environment = next(call[2] for call in runner.calls if call[0] == "spawn")
+    assert environment is not None
+    assert float(environment["QUALIFICATION_OBSERVER_TIMEOUT_SECONDS"]) < 120.0
+
+
 def _private_file(path: Path, value: bytes) -> Path:
     path.write_bytes(value)
     path.chmod(0o600)
@@ -266,6 +289,9 @@ def _manifest(tmp_path: Path) -> Path:
                 "treatment_order": ["direct", "proxy"],
                 "model_instance_policy": "fresh-per-scored-treatment",
                 "failure_policy": "terminal-no-rerun",
+                "policy_benefit_families": ["policy"],
+                "policy_benefit_case_count": 1,
+                "policy_benefit_case_ids_sha256": _canonical_sha256(["case-policy"]),
             },
             "observer": {
                 "host": "127.0.0.1",
@@ -287,6 +313,7 @@ def _manifest(tmp_path: Path) -> Path:
                     "upstream_cache_capability_mode": "disabled",
                     "telemetry_enabled": True,
                     "metrics_enabled": True,
+                    "denied_tools": "",
                     "max_internal_retries": 4,
                     "max_upstream_calls": 7,
                     "upstream_timeout_seconds": 120.0,
@@ -306,6 +333,98 @@ def _manifest(tmp_path: Path) -> Path:
     path = tmp_path / "approved-manifest.json"
     path.write_text(json.dumps(document), encoding="utf-8")
     return path
+
+
+def _v2_campaign() -> dict[str, object]:
+    critical_scenario_ordinals = [29, 30]
+    return {
+        "campaign_version": "v2",
+        "campaign_id": "qualification-campaign-v2",
+        "slots": [
+            {"cache_lane": lane, "pair_index": pair, "run_id": f"qualification-v2-{lane}-{pair}"}
+            for lane in ("cold", "warm-prefix")
+            for pair in range(1, 5)
+        ],
+        "stage_order": ["preflight", "score-direct", "score-proxy"],
+        "treatment_order": ["direct", "proxy"],
+        "model_instance_policy": "fresh-per-scored-treatment",
+        "failure_policy": "terminal-no-rerun",
+        "critical_scenario_ordinals": critical_scenario_ordinals,
+        "critical_scenario_ordinals_sha256": _canonical_sha256(critical_scenario_ordinals),
+        "scenario_deadline_seconds": 600,
+    }
+
+
+def test_manifest_accepts_ornith_productization_sampler_profile(tmp_path) -> None:
+    manifest = _manifest(tmp_path)
+    document = _manifest_document(manifest)
+    benchmark = document["qualification_runtime"]["benchmark"]
+    assert isinstance(benchmark, dict)
+    benchmark["sampler_profile"] = "ornith-productization-v1"
+    _store_manifest(manifest, document)
+
+    spec = runtime_module._load_runtime_spec(manifest, _FakeRuntimeRunner())
+
+    assert spec.benchmark.sampler_profile == "ornith-productization-v1"
+
+
+def test_timing_capture_initializer_locks_mode_before_transferring_ownership(tmp_path) -> None:
+    runner = _FakeRuntimeRunner()
+    spec = runtime_module._load_runtime_spec(_manifest(tmp_path), runner)
+
+    runtime_module._initialize_timing_capture(
+        runner,
+        spec,
+        "qualification-timing-volume",
+        "qualification-instance",
+        "score-proxy",
+    )
+
+    argv = runner.calls[-1][1]
+    script = argv[-1]
+    assert argv.count("--cap-add") == 2
+    assert "FOWNER" not in argv
+    assert script.index(": > /target/capture.jsonl") < script.index("chmod 0600 /target/capture.jsonl")
+    assert script.index("chmod 0600 /target/capture.jsonl") < script.index("chown 10001:10001 /target/capture.jsonl")
+    assert script.endswith(
+        "test \"$(stat -c '%u:%g:%a' /target/capture.jsonl)\" = 10001:10001:600"
+    )
+
+
+def test_ornith_sampler_profile_binds_enabled_ssd_cache_in_model_evidence_contract(tmp_path) -> None:
+    manifest = _manifest(tmp_path)
+    document = _manifest_document(manifest)
+    runtime = document["qualification_runtime"]
+    assert isinstance(runtime, dict)
+    benchmark = runtime["benchmark"]
+    model = runtime["model"]
+    assert isinstance(benchmark, dict)
+    assert isinstance(model, dict)
+    benchmark["sampler_profile"] = "ornith-productization-v1"
+    model["required_launch_flags"] = [
+        "--host=127.0.0.1",
+        "--port=19999",
+        "--no-auth",
+        "--generation-mode=mtp",
+        "--depth=3",
+        "--temperature=0",
+        "--ssd-session-cache=on",
+    ]
+    _store_manifest(manifest, document)
+
+    spec = runtime_module._load_runtime_spec(manifest, _FakeRuntimeRunner())
+    binding = runtime_module._StageBinding(
+        spec.campaign.campaign_id_sha256,
+        1,
+        "cold",
+        1,
+        spec.campaign.slots[0].run_id,
+        tmp_path,
+    )
+    contract = runtime_module._model_evidence_contract(spec, "score-direct", binding)
+
+    assert contract.sampler_profile == "ornith-productization-v1"
+    assert "--ssd-session-cache=on" in contract.required_launch_flags
 
 
 def _supervise(
@@ -955,6 +1074,7 @@ def _manifest_settings() -> dict[str, object]:
         "upstream_cache_capability_mode": "disabled",
         "telemetry_enabled": True,
         "metrics_enabled": True,
+        "denied_tools": "",
         "max_internal_retries": 4,
         "max_upstream_calls": 7,
         "upstream_timeout_seconds": 120.0,
@@ -987,6 +1107,7 @@ def _runtime_inspect(
         "UPSTREAM_CACHE_CAPABILITY_MODE=disabled",
         "TELEMETRY_ENABLED=true",
         "METRICS_ENABLED=true",
+        "DENIED_TOOLS=",
     ]
     mounts = [{"Type": "volume", "Name": volume_name, "Destination": "/run/secrets", "RW": False}]
     if scored_proxy:
@@ -1377,6 +1498,7 @@ def _write_proxy_timing(
             "schema_version": "2.1",
             "record_type": "qualification_timing_capture",
             "sequence": request.sequence,
+            "correlation_id_sha256": "c" * 64,
             "outcome": request.outcome,
             "downstream_wall_ns": len(attempts) + 1,
             "admission_wait_ns": 0,
@@ -1407,6 +1529,7 @@ def _write_proxy_timing(
             "observer_record_count": request.attempt_count,
             "direct_attempt_wall_ns": [],
             "downstream_request_sha256": "a" * 64,
+            "correlation_id_sha256": "c" * 64,
         }
         for request in requests
     ]
@@ -1432,6 +1555,7 @@ def _write_direct_provisional(lease: RuntimeLease, *, attempt_count: int = 1) ->
                 "observer_record_count": attempt_count,
                 "direct_attempt_wall_ns": [1] * attempt_count,
                 "downstream_request_sha256": "a" * 64,
+                "correlation_id_sha256": None,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -1447,6 +1571,7 @@ def _model_attempt(
     cache: CacheObservation | None,
     *,
     status_code: int | None = 200,
+    correlation_id_sha256: str | None = None,
 ) -> ModelBoundaryRecord:
     fingerprint = model_boundary_fingerprint(
         {
@@ -1456,7 +1581,9 @@ def _model_attempt(
             "tools": [{"type": "function", "function": {"name": "safe"}}],
         }
     )
-    return ModelBoundaryRecord(sequence, fingerprint.digest, fingerprint.fields, status_code, cache)
+    return ModelBoundaryRecord(
+        sequence, fingerprint.digest, fingerprint.fields, status_code, cache, correlation_id_sha256
+    )
 
 
 def _cold_cache() -> CacheObservation:
@@ -1847,7 +1974,7 @@ def test_proxy_stage_adapts_only_its_fresh_observer_attempts(tmp_path) -> None:
         _write_scored_output(lease)
         assert lease.observer_ledger is not None
         assert lease.proxy_request_accounting_provisional_ledger is not None
-        observer_record = _model_attempt(1, _cold_cache())
+        observer_record = _model_attempt(1, _cold_cache(), correlation_id_sha256="c" * 64)
         lease.observer_ledger.write_text(
             json.dumps(observer_record.to_dict(), sort_keys=True, separators=(",", ":")) + "\n"
         )
@@ -1963,7 +2090,7 @@ def test_warm_proxy_attestation_keeps_the_single_preflight_runtime_contract(tmp_
         assert lease.proxy_request_accounting_provisional_ledger is not None
         assert lease.prime_model_attempt_ledger is not None
         write_model_boundary_attempt_ledger(lease.prime_model_attempt_ledger, [_model_attempt(1, _warm_prime_cache())])
-        observer_record = _model_attempt(1, _warm_hit_cache())
+        observer_record = _model_attempt(1, _warm_hit_cache(), correlation_id_sha256="c" * 64)
         lease.observer_ledger.write_text(
             json.dumps(observer_record.to_dict(), sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"
         )
@@ -2474,6 +2601,197 @@ def test_campaign_identity_is_strict_and_blocks_runtime_resources(field, value, 
 
     assert outcome.failure_category == "runtime_manifest_invalid"
     assert _docker_commands(runner) == []
+
+
+def test_v2_campaign_parser_commits_exact_eight_slot_topology_and_deadline() -> None:
+    spec = runtime_module._parse_campaign(_v2_campaign())
+
+    assert spec.version == "v2"
+    assert spec.v2_private_scenario_deadline_seconds == 600
+    assert len(spec.slots) == 8
+    assert [(slot.cache_lane, slot.pair_index) for slot in spec.slots] == [
+        ("cold", 1),
+        ("cold", 2),
+        ("cold", 3),
+        ("cold", 4),
+        ("warm-prefix", 1),
+        ("warm-prefix", 2),
+        ("warm-prefix", 3),
+        ("warm-prefix", 4),
+    ]
+
+
+def test_v2_runtime_manifest_requires_the_fixed_thirty_scenario_denominator(tmp_path) -> None:
+    manifest = _manifest(tmp_path)
+    document = _manifest_document(manifest)
+    runtime = document["qualification_runtime"]
+    assert isinstance(runtime, dict)
+    runtime["campaign"] = _v2_campaign()
+    _store_manifest(manifest, document)
+
+    with pytest.raises(runtime_module.QualificationRuntimeFailure, match="^runtime_manifest_invalid$"):
+        runtime_module._load_runtime_spec(manifest, _FakeRuntimeRunner())
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda campaign: campaign["slots"].__setitem__(
+            3,
+            {"cache_lane": "warm-prefix", "pair_index": 4, "run_id": "wrong"},
+        ),
+        lambda campaign: campaign.__setitem__("scenario_deadline_seconds", 599),
+        lambda campaign: campaign.__setitem__("critical_scenario_ordinals_sha256", "0" * 64),
+        lambda campaign: campaign.__setitem__("critical_scenario_ordinals", []),
+        lambda campaign: campaign.__setitem__("critical_scenario_ordinals", [31]),
+        lambda campaign: campaign.update(
+            critical_scenario_ordinals=[1],
+            critical_scenario_ordinals_sha256=hashlib.sha256(b"[1]").hexdigest(),
+        ),
+        lambda campaign: campaign.__setitem__("campaign_version", "v3"),
+    ],
+)
+def test_v2_campaign_parser_rejects_invalid_topology_or_commitments(mutate) -> None:
+    campaign = _v2_campaign()
+    mutate(campaign)
+
+    with pytest.raises(runtime_module.QualificationRuntimeFailure, match="^runtime_manifest_invalid$"):
+        runtime_module._parse_campaign(campaign)
+
+
+def test_v2_stage_binding_accepts_slot_eight_proxy_at_sequence_seventeen_only(tmp_path) -> None:
+    campaign = runtime_module._parse_campaign(_v2_campaign())
+    slots_dir = tmp_path / "slots"
+    slot_dir = slots_dir / "08-warm-prefix-pair4"
+    slots_dir.mkdir()
+    expected_slot = campaign.slots[7]
+    runtime_spec = SimpleNamespace(campaign=campaign, manifest_sha256="a" * 64)
+    request = StageRequest(
+        manifest=tmp_path / "manifest.json",
+        manifest_sha256="a" * 64,
+        sequence=17,
+        slot=CampaignSlot(8, "warm-prefix", 4, expected_slot.run_id),
+        stage="score-proxy",
+        private_run_dir=slot_dir,
+        outcome_path=slot_dir / "scored-proxy-runtime-outcome.json",
+    )
+
+    binding = runtime_module._stage_binding(runtime_spec, "score-proxy", slot_dir, request)
+
+    assert (binding.slot_ordinal, binding.cache_lane, binding.pair_index) == (8, "warm-prefix", 4)
+    with pytest.raises(runtime_module.QualificationRuntimeFailure, match="^runtime_campaign_request_invalid$"):
+        runtime_module._stage_binding(runtime_spec, "score-proxy", slot_dir, replace(request, sequence=16))
+
+
+def test_v2_scored_leases_carry_the_manifest_deadline_but_preflight_does_not(tmp_path) -> None:
+    campaign = runtime_module._parse_campaign(_v2_campaign())
+    spec = SimpleNamespace(
+        manifest_sha256="a" * 64,
+        source_commit="b" * 40,
+        image=SimpleNamespace(digest="sha256:" + "c" * 64),
+        model=SimpleNamespace(public_id="model", upstream_url="http://127.0.0.1:19999/v1"),
+        benchmark=SimpleNamespace(
+            revision="revision",
+            agentic_set="expanded",
+            sampler_profile="corrected-parity-v1",
+            scenario_order_sha256="d" * 64,
+            scenario_count=30,
+            checkout_path=tmp_path,
+        ),
+        credentials=SimpleNamespace(upstream_model_api_key_file=None),
+        campaign=campaign,
+    )
+    model_session = SimpleNamespace(model_identity_sha256="e" * 64, model_contract_sha256="f" * 64)
+    binding = runtime_module._StageBinding(
+        campaign.campaign_id_sha256,
+        8,
+        "warm-prefix",
+        4,
+        campaign.slots[7].run_id,
+        tmp_path,
+    )
+
+    scored = runtime_module._direct_lease(
+        spec, "score-direct", tmp_path, tmp_path / "attestation.json", model_session, binding
+    )
+    preflight = runtime_module._direct_lease(
+        spec, "preflight", tmp_path, tmp_path / "attestation.json", model_session, binding
+    )
+
+    assert (scored.campaign_version, scored.v2_private_scenario_deadline_seconds) == ("v2", 600)
+    assert (preflight.campaign_version, preflight.v2_private_scenario_deadline_seconds) == ("v2", None)
+
+
+def test_v2_durable_outcome_inspection_uses_the_v2_loader_contract(monkeypatch, tmp_path) -> None:
+    campaign = runtime_module._parse_campaign(_v2_campaign())
+    slot_dir = tmp_path / "08-warm-prefix-pair4"
+    request = StageRequest(
+        manifest=tmp_path / "manifest.json",
+        manifest_sha256="a" * 64,
+        sequence=16,
+        slot=CampaignSlot(8, "warm-prefix", 4, campaign.slots[7].run_id),
+        stage="score-direct",
+        private_run_dir=slot_dir,
+        outcome_path=slot_dir / "scored-direct-runtime-outcome.json",
+    )
+    spec = SimpleNamespace(manifest_sha256="a" * 64, benchmark=SimpleNamespace(scenario_count=30), campaign=campaign)
+    binding = runtime_module._StageBinding(
+        campaign.campaign_id_sha256,
+        8,
+        "warm-prefix",
+        4,
+        campaign.slots[7].run_id,
+        tmp_path,
+    )
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(runtime_module, "_read_private_file", lambda *_args: b'{"status":"passed"}')
+    monkeypatch.setattr(runtime_module, "_valid_stage_outcome_document", lambda *_args: True)
+    monkeypatch.setattr(runtime_module, "_attestation_model_identity", lambda _path: "e" * 64)
+    monkeypatch.setattr(
+        runtime_module,
+        "load_model_evidence",
+        lambda *_args, **_kwargs: SimpleNamespace(runtime_instance_sha256="f" * 64),
+    )
+
+    def load_outcome(*_args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(file_sha256="1" * 64, proxy_reconciliation_sha256=None)
+
+    monkeypatch.setattr(runtime_module, "load_runtime_outcome", load_outcome)
+
+    result = runtime_module._inspect_durable_stage_outcome(request, spec, binding)
+
+    assert result is not None
+    assert result.model_identity_sha256 == "e" * 64
+    assert captured["campaign_version"] == "v2"
+
+
+def test_v2_proxy_reconciliation_begins_with_the_v2_identity_contract(monkeypatch, tmp_path) -> None:
+    attestation = tmp_path / "attestation.json"
+    attestation.write_text("{}", encoding="utf-8")
+    attestation.chmod(0o600)
+    captured: dict[str, object] = {}
+    sentinel = object()
+
+    def begin(identity, _reader, *, campaign_version):
+        captured["identity"] = identity
+        captured["campaign_version"] = campaign_version
+        return sentinel
+
+    monkeypatch.setattr(runtime_module.ProxyReconciliationSession, "begin", staticmethod(begin))
+    spec = SimpleNamespace(
+        manifest_sha256="a" * 64,
+        proxy=SimpleNamespace(container_port=8090),
+        campaign=SimpleNamespace(version="v2"),
+    )
+    binding = runtime_module._StageBinding("b" * 64, 8, "warm-prefix", 4, "slot-eight", tmp_path)
+
+    assert runtime_module._begin_proxy_reconciliation(object(), "container", spec, binding, attestation) is sentinel
+    assert captured["campaign_version"] == "v2"
+    identity = captured["identity"]
+    assert isinstance(identity, runtime_module.ReconciliationIdentity)
+    assert (identity.slot_ordinal, identity.cache_lane, identity.pair_index) == (8, "warm-prefix", 4)
 
 
 def test_campaign_stage_runner_inspects_absent_partial_failed_and_passed_outcomes(tmp_path) -> None:
@@ -3398,6 +3716,8 @@ def test_thin_cli_derives_fixed_child_argv_without_secret_values(stage) -> None:
     assert "--candidate-source-commit" in argv
     assert "--candidate-image-digest" in argv
     assert "--run-manifest-sha256" in argv
+    assert "--campaign-version" not in argv
+    assert "--v2-private-scenario-deadline-seconds" not in argv
     assert argv[argv.index("--sampler-profile") + 1] == "historical-aeon-v1"
     assert argv[argv.index("--run-id") + 1] == "qualified-run"
     assert argv[argv.index("--cache-mode") + 1] == ("bypass" if stage == "preflight" else "warm-prefix")
@@ -3432,6 +3752,46 @@ def test_thin_cli_derives_fixed_child_argv_without_secret_values(stage) -> None:
         assert argv[argv.index("--variant") + 1] == "warm-prefix-pair2-proxy-expanded"
         assert argv[argv.index("--preflight-runtime-outcome") + 1] == "/private/preflight-runtime-outcome.json"
         assert argv[argv.index("--direct-runtime-outcome") + 1] == "/private/scored-direct-runtime-outcome.json"
+
+
+@pytest.mark.parametrize("stage", ["score-direct", "score-proxy"])
+def test_thin_cli_adds_v2_contract_only_to_scored_child(stage: str) -> None:
+    cli = _load_runtime_cli()
+    lease = replace(
+        _lease(stage),
+        campaign_version="v2",
+        v2_private_scenario_deadline_seconds=600,
+    )
+
+    argv = cli.paired_runner_argv(lease)
+
+    assert argv[argv.index("--campaign-version") + 1] == "v2"
+    assert argv[argv.index("--v2-private-scenario-deadline-seconds") + 1] == "600"
+
+
+def test_thin_cli_never_adds_v2_contract_to_preflight_or_priming() -> None:
+    cli = _load_runtime_cli()
+    preflight = replace(_lease("preflight"), campaign_version="v2")
+    scored = replace(
+        _lease("score-direct"),
+        campaign_version="v2",
+        v2_private_scenario_deadline_seconds=600,
+    )
+
+    preflight_argv = cli.paired_runner_argv(preflight)
+    prime_argv = cli._prime_runner_argv(scored)
+
+    assert "--campaign-version" not in preflight_argv
+    assert "--v2-private-scenario-deadline-seconds" not in preflight_argv
+    assert "--campaign-version" not in prime_argv
+    assert "--v2-private-scenario-deadline-seconds" not in prime_argv
+
+
+def test_thin_cli_rejects_v2_scored_lease_without_deadline() -> None:
+    cli = _load_runtime_cli()
+
+    with pytest.raises(ValueError, match="v2 scored qualification lease requires a scenario deadline"):
+        cli.paired_runner_argv(replace(_lease("score-direct"), campaign_version="v2"))
 
 
 def test_thin_cli_forces_preflight_bypass_even_for_a_warm_campaign() -> None:
@@ -3527,6 +3887,27 @@ def test_campaign_cli_advances_only_the_manifest_derived_next_stage(tmp_path) ->
         )
 
 
+@pytest.mark.parametrize(
+    ("advance_kind", "expected_exit"),
+    (("campaign_passed", 0), ("campaign_scored_complete", 3)),
+)
+def test_campaign_cli_distinguishes_v1_promotion_from_v2_scored_completion(
+    tmp_path, advance_kind: str, expected_exit: int
+) -> None:
+    cli = _load_runtime_cli()
+
+    def campaign_advancer(*_args, **_kwargs):
+        return SimpleNamespace(kind=advance_kind)
+
+    assert (
+        cli.main(
+            ["--manifest", str(tmp_path / "manifest.json"), "--private-campaign-dir", str(tmp_path)],
+            campaign_advancer=campaign_advancer,
+        )
+        == expected_exit
+    )
+
+
 def test_campaign_cli_rejects_relative_campaign_dir_before_creating_campaign_state(tmp_path) -> None:
     """A relative run root would later produce rejected relative evidence paths."""
 
@@ -3602,10 +3983,14 @@ def test_benchmarking_manifest_example_is_duplicate_rejecting_json_with_c1_model
         "treatment_order",
         "model_instance_policy",
         "failure_policy",
+        "policy_benefit_families",
+        "policy_benefit_case_count",
+        "policy_benefit_case_ids_sha256",
     }
     assert len(campaign["slots"]) == 6
-    assert "--ssd-session-cache=off" in model["required_launch_flags"]
-    assert runtime["benchmark"]["scenario_count"] > 0
+    assert runtime["benchmark"]["sampler_profile"] == "ornith-productization-v1"
+    assert "--ssd-session-cache=on" in model["required_launch_flags"]
+    assert runtime["benchmark"]["scenario_count"] == 30
     assert "restart it from the exact frozen model" in document
     assert "Preflight always sends" in document
 

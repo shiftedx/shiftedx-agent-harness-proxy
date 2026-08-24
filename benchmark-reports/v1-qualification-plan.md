@@ -13,16 +13,24 @@ reviewers can verify that thresholds were not changed after results were known.
 - Harness profile: `shiftedx-harness-v1`
 - Benchmark: Shiftedx Bench revision
   `335e6694e4aec13e9370af8a993d8c8f14d7ffb5`
-- Candidate model revision:
-  `b5a54ea5d7745b6ddada238f83b66d63c979b9a5`
-- Sampler: temperature `0.0`, top-p `0.95`, top-k `20`
-- Reasoning: thinking enabled, reasoning effort `medium`
+- Served model: `ornith-1.5-35b-a3b-abliterated`
+- Artifact: `ornith-1.5-35b-a3b-abliterated-attention8-bf16recurrence-vision-mtplx`
+- Runtime: MTPLX `2.9.0`, `sustained` profile, native MTP depth `1`; serial scheduler, `agent`
+  batching, SSD session cache enabled, and paged-KV quantization disabled
+- Public artifact identities: `config.json` `60717e3978992f7f967abfe7c100405b667d7bf48f5084affd9f933326d31750`;
+  `tokenizer_config.json` `5186f0defcd7f232382c7f0aebcd2252d073bb921ab240e407b7ae8745d2b29b`;
+  `chat_template.jinja` `182e77dd83bd8e9ca818b240b82e28f243762cd5dda32e6eef327df7b1cd107e`;
+  `mtplx_runtime.json` `0f4619009ce61b168091d891c2a204ba960703f993229390609118b8e84478b3`;
+  `model.safetensors.index.json` `5ea79f00036b670d13ef98ae1a4d597437921cdcf6896d1e95c151ead09b24ba`
+- Sampler profile: `ornith-productization-v1` — temperature `1.0`, top-p `0.95`, top-k `20`,
+  thinking enabled, reasoning effort `medium`, and `max_tokens=8192`; this immutable profile
+  requires `--ssd-session-cache=on` in the model launch contract
 - Treatments: direct upstream baseline and proxy-assisted, both using the benchmark runner's
   `baseline` control profile
 - Trials: at least three complete matched pairs for every declared lane
 
-A different model, sampler, reasoning mode, benchmark revision, or treatment contract requires a
-reviewed plan revision committed before trial 1. It may not be changed in response to results.
+A different model, sampler, profile-bound cache mode, reasoning mode, benchmark revision, or treatment
+contract requires a reviewed plan revision committed before trial 1. It may not be changed in response to results.
 
 ## Immutable run manifest
 
@@ -70,6 +78,7 @@ Any violation is an automatic `DO NOT PROMOTE`, regardless of aggregate quality 
 | Quality | Aggregate proxy-assisted passed-case count is at least the direct baseline count, with no critical-case regression |
 | Proxy-only latency | Scripted-upstream processing p95 `< 15 ms` and p99 `< 30 ms` |
 | Pass-through latency | For responses requiring no policy retry or Local Projection, added p95 wall time and TTFT are each no more than the larger of `15 ms` or `5%` of the matched baseline |
+| Policy-benefit performance | Across the preregistered policy-benefit and recovery cohorts, proxy p95 wall time to a valid outcome is `<=80%` of the matched direct p95; failed outcomes remain in the denominator |
 | Full agentic latency | Aggregate p95 wall time to final valid outcome is no more than `125%` of matched baseline in each cache lane |
 | Decode throughput | Weighted decode throughput is at least `90%` of matched baseline in each cache lane |
 | Upstream amplification | Mean upstream calls per downstream request `<= 2.0`; every request remains `<= MAX_UPSTREAM_CALLS` |
@@ -84,6 +93,30 @@ Any violation is an automatic `DO NOT PROMOTE`, regardless of aggregate quality 
 The public report includes p50/p95/p99, sample counts, confidence/variance notes, throughput, TTFT,
 RSS, open connections, active/queued work, error/rejection counts, recovery time, and every failed
 gate. A hard container limit is not itself proof of a passing resource result.
+
+The policy-benefit performance cohort is fixed before scoring: tasks with duplicate, stall,
+verification, terminal-schema, or repeated-failure recovery pressure. Ordinary tool-use and
+pass-through tasks remain separate cohorts and cannot be moved into or out of this cohort after
+results are observed. A faster invalid answer is not a valid outcome.
+
+The immutable private campaign manifest binds this cohort before trial 1 through its allowed
+scenario-family list (`failed_search_recovery`, `repair_loop`, `stale_evidence`,
+`structured_status`, and `wrong_path_recovery`), canonical selected-case-ID hash
+`73c007092312a9b187b66c67fd73e4d343641696ab59aafc56b36d2284ff1fc1`, and selected-case count
+`22` against frozen expanded revision `335e6694e4aec13e9370af8a993d8c8f14d7ffb5`. At terminal
+completion, every direct/proxy scored ledger in all three cold and all three warm-prefix pairs must
+contain the same bound cohort with `passed: true` and finite positive runner `telemetry.wall_s`.
+The campaign computes p95 with the frozen sorted index `(n - 1) * 95 // 100` from all twelve
+matched treatment rows per selected case and passes only when proxy p95 is `<=80%` of direct p95.
+A missing, malformed, failed, zero-sample, or
+mismatched row is a terminal failed gate, never a reason to remove it from the calculation. The
+published campaign outcome contains hash/count and aggregate timing only.
+
+Before filtering that fixed cohort, the terminal campaign verifies every scored ledger against its
+immutable runtime-outcome ledger digest and verifies the full 30-case ordered ledger against the
+manifest's scenario-order hash. Every row must have a unique case ID and valid family, outcome, and
+runner timing, so a duplicate or relabelled row cannot hide a failed policy-benefit case to improve
+the ratio.
 
 ## Cache lanes
 

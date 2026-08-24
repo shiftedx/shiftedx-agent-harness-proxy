@@ -136,3 +136,30 @@ def test_standard_response_schema_derives_all_declared_primitive_keys() -> None:
     )
     assert contract.keys == ("status", "tests")
     assert contract.types == {"status": "string", "tests": "integer"}
+
+
+def test_only_versioned_strict_recovery_schema_enables_execution_claim_contract() -> None:
+    def response_format(name: str) -> dict:
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": name,
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "failed_executions": {"type": "integer"},
+                        "recovery_verified": {"type": "boolean"},
+                    },
+                    "required": ["failed_executions", "recovery_verified"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    assert response_schema_contract(
+        response_format("shiftedx_recovery_result_v1")
+    ).enforce_failed_execution_claim
+    assert not response_schema_contract(
+        response_format("unrelated_result")
+    ).enforce_failed_execution_claim

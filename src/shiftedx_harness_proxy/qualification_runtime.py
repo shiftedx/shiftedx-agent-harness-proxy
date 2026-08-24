@@ -96,6 +96,7 @@ _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _IMAGE_REFERENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]*$")
 _FAILURE_CATEGORY = re.compile(r"^[a-z0-9_]+$")
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_V2_CRITICAL_SCENARIO_ORDINALS = [29, 30]
 _HTTP_BEARER_TOKEN = re.compile(r"^[A-Za-z0-9\-._~+/]+={0,}$")
 _SETTINGS_KEYS = frozenset(
     {
@@ -105,6 +106,7 @@ _SETTINGS_KEYS = frozenset(
         "upstream_cache_capability_mode",
         "telemetry_enabled",
         "metrics_enabled",
+        "denied_tools",
         "max_internal_retries",
         "max_upstream_calls",
         "upstream_timeout_seconds",
@@ -529,7 +531,7 @@ class RuntimeLease:
     model: str
     benchmark_revision: str
     agentic_set: str
-    sampler_profile: Literal["corrected-parity-v1", "historical-aeon-v1"]
+    sampler_profile: Literal["corrected-parity-v1", "historical-aeon-v1", "ornith-productization-v1"]
     scenario_order_sha256: str
     scenario_count: int
     benchmark_source_path: Path
@@ -559,6 +561,8 @@ class RuntimeLease:
     proxy_provisional_request_ledger: Path | None = None
     direct_provisional_request_ledger: Path | None = None
     proxy_request_accounting_provisional_ledger: Path | None = None
+    campaign_version: Literal["v1", "v2"] = "v1"
+    v2_private_scenario_deadline_seconds: int | None = None
 
 
 @dataclass(frozen=True)
@@ -613,7 +617,7 @@ class _BenchmarkSpec:
     checkout_path: Path
     interpreter_sha256: str
     agentic_set: str
-    sampler_profile: Literal["corrected-parity-v1", "historical-aeon-v1"]
+    sampler_profile: Literal["corrected-parity-v1", "historical-aeon-v1", "ornith-productization-v1"]
     scenario_order_sha256: str
     scenario_count: int
 
@@ -654,11 +658,16 @@ class _TrialSpec:
 
 @dataclass(frozen=True)
 class _CampaignSpec:
-    """The immutable six-slot master-campaign identity, without exposing run IDs in evidence."""
+    """The immutable versioned campaign identity, without exposing run IDs in evidence."""
 
     campaign_id: str
     campaign_id_sha256: str
     slots: tuple[_TrialSpec, ...]
+    policy_benefit_families: tuple[str, ...]
+    policy_benefit_case_count: int
+    policy_benefit_case_ids_sha256: str
+    version: Literal["v1", "v2"]
+    v2_private_scenario_deadline_seconds: int | None
 
 
 @dataclass(frozen=True)
@@ -723,7 +732,7 @@ def _stage_binding(
             expected.run_id,
             private_run_dir,
         )
-    if request_slot.ordinal not in range(1, 7):
+    if request_slot.ordinal not in range(1, len(spec.campaign.slots) + 1):
         raise QualificationRuntimeFailure("runtime_campaign_request_invalid")
     expected_slot = spec.campaign.slots[request_slot.ordinal - 1]
     if (
@@ -1244,6 +1253,7 @@ def _inspect_durable_stage_outcome(
             slot_ordinal=binding.slot_ordinal,
             cache_lane=binding.cache_lane,
             pair_index=binding.pair_index,
+            campaign_version=spec.campaign.version,
         )
     except (
         QualificationRuntimeFailure,
@@ -1258,6 +1268,7 @@ def _inspect_durable_stage_outcome(
         loaded.file_sha256,
         model_evidence.runtime_instance_sha256,
         loaded.proxy_reconciliation_sha256,
+        model_identity_sha256,
     )
 
 
@@ -1358,6 +1369,8 @@ def _load_runtime_spec(manifest: Path, runner: RuntimeCommandRunner) -> _Runtime
     proxy = _parse_proxy(section.get("proxy"), observer)
     credentials = _parse_credentials(section.get("credentials"), model.upstream_authenticated)
     campaign = _parse_campaign(section.get("campaign"))
+    if campaign.version == "v2" and benchmark.scenario_count != 30:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
     _validate_settings(proxy.settings, observer.container_url, proxy.container_port, model.upstream_authenticated)
     return _RuntimeSpec(manifest_sha256, source_commit, image, model, benchmark, observer, proxy, credentials, campaign)
 
@@ -1470,7 +1483,7 @@ def _parse_benchmark(value: Any) -> _BenchmarkSpec:
     if agentic_set not in {"core", "expanded", "repo"}:
         raise QualificationRuntimeFailure("runtime_manifest_invalid")
     sampler_profile = benchmark.get("sampler_profile")
-    if sampler_profile not in {"corrected-parity-v1", "historical-aeon-v1"}:
+    if sampler_profile not in {"corrected-parity-v1", "historical-aeon-v1", "ornith-productization-v1"}:
         raise QualificationRuntimeFailure("runtime_manifest_invalid")
     order_hash = _exact_string(benchmark, "scenario_order_sha256", _SHA256)
     count = _positive_int(benchmark.get("scenario_count"))
@@ -1495,19 +1508,64 @@ def _parse_campaign(value: Any) -> _CampaignSpec:
     a caller-selected trial object.
     """
 
-    campaign = _exact_object(
-        value,
-        {
-            "campaign_id",
-            "slots",
-            "stage_order",
-            "treatment_order",
-            "model_instance_policy",
-            "failure_policy",
-        },
-    )
+    if not isinstance(value, dict):
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    version = value.get("campaign_version", "v1")
+    if version == "v1":
+        campaign = _exact_object(
+            value,
+            {
+                "campaign_id",
+                "slots",
+                "stage_order",
+                "treatment_order",
+                "model_instance_policy",
+                "failure_policy",
+                "policy_benefit_families",
+                "policy_benefit_case_count",
+                "policy_benefit_case_ids_sha256",
+            },
+        )
+        v2_private_scenario_deadline_seconds: int | None = None
+    elif version == "v2":
+        campaign = _exact_object(
+            value,
+            {
+                "campaign_version",
+                "campaign_id",
+                "slots",
+                "stage_order",
+                "treatment_order",
+                "model_instance_policy",
+                "failure_policy",
+                "critical_scenario_ordinals",
+                "critical_scenario_ordinals_sha256",
+                "scenario_deadline_seconds",
+            },
+        )
+        raw_critical_ordinals = campaign.get("critical_scenario_ordinals")
+        if (
+            not isinstance(raw_critical_ordinals, list)
+            or not raw_critical_ordinals
+            or any(
+                not isinstance(ordinal, int) or isinstance(ordinal, bool) or not 1 <= ordinal <= 30
+                for ordinal in raw_critical_ordinals
+            )
+            or raw_critical_ordinals != _V2_CRITICAL_SCENARIO_ORDINALS
+            or not isinstance(campaign.get("critical_scenario_ordinals_sha256"), str)
+            or _SHA256.fullmatch(campaign["critical_scenario_ordinals_sha256"]) is None
+            or campaign["critical_scenario_ordinals_sha256"] != _canonical_sha256(raw_critical_ordinals)
+            or campaign.get("scenario_deadline_seconds") != 600
+        ):
+            raise QualificationRuntimeFailure("runtime_manifest_invalid")
+        v2_private_scenario_deadline_seconds = 600
+    else:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
     campaign_id = _required_text(campaign.get("campaign_id"))
     raw_slots = campaign.get("slots")
+    raw_families = campaign.get("policy_benefit_families")
+    case_count = campaign.get("policy_benefit_case_count")
+    case_ids_sha256 = campaign.get("policy_benefit_case_ids_sha256")
     if (
         _RUN_ID.fullmatch(campaign_id) is None
         or campaign.get("stage_order") != ["preflight", "score-direct", "score-proxy"]
@@ -1515,16 +1573,34 @@ def _parse_campaign(value: Any) -> _CampaignSpec:
         or campaign.get("model_instance_policy") != "fresh-per-scored-treatment"
         or campaign.get("failure_policy") != "terminal-no-rerun"
         or not isinstance(raw_slots, list)
-        or len(raw_slots) != 6
+        or len(raw_slots) != (6 if version == "v1" else 8)
+        or version == "v1"
+        and (
+            not isinstance(raw_families, list)
+            or not raw_families
+            or any(not isinstance(family, str) or _RUN_ID.fullmatch(family) is None for family in raw_families)
+            or len(set(raw_families)) != len(raw_families)
+            or not isinstance(case_count, int)
+            or isinstance(case_count, bool)
+            or case_count <= 0
+            or not isinstance(case_ids_sha256, str)
+            or _SHA256.fullmatch(case_ids_sha256) is None
+        )
     ):
         raise QualificationRuntimeFailure("runtime_manifest_invalid")
     expected: tuple[tuple[Literal["cold", "warm-prefix"], int], ...] = (
-        ("cold", 1),
-        ("cold", 2),
-        ("cold", 3),
-        ("warm-prefix", 1),
-        ("warm-prefix", 2),
-        ("warm-prefix", 3),
+        (("cold", 1), ("cold", 2), ("cold", 3), ("warm-prefix", 1), ("warm-prefix", 2), ("warm-prefix", 3))
+        if version == "v1"
+        else (
+            ("cold", 1),
+            ("cold", 2),
+            ("cold", 3),
+            ("cold", 4),
+            ("warm-prefix", 1),
+            ("warm-prefix", 2),
+            ("warm-prefix", 3),
+            ("warm-prefix", 4),
+        )
     )
     slots: list[_TrialSpec] = []
     run_ids: set[str] = set()
@@ -1540,7 +1616,16 @@ def _parse_campaign(value: Any) -> _CampaignSpec:
             raise QualificationRuntimeFailure("runtime_manifest_invalid")
         run_ids.add(run_id)
         slots.append(_TrialSpec(run_id, lane, pair_index, ("direct", "proxy")))
-    return _CampaignSpec(campaign_id, hashlib.sha256(campaign_id.encode("utf-8")).hexdigest(), tuple(slots))
+    return _CampaignSpec(
+        campaign_id,
+        hashlib.sha256(campaign_id.encode("utf-8")).hexdigest(),
+        tuple(slots),
+        tuple(raw_families) if isinstance(raw_families, list) else (),
+        case_count if isinstance(case_count, int) and not isinstance(case_count, bool) else 0,
+        case_ids_sha256 if isinstance(case_ids_sha256, str) else "",
+        cast(Literal["v1", "v2"], version),
+        v2_private_scenario_deadline_seconds,
+    )
 
 
 def _validate_benchmark_checkout(runner: RuntimeCommandRunner, benchmark: _BenchmarkSpec) -> None:
@@ -1908,8 +1993,8 @@ def _initialize_timing_capture(
             spec.image.reference,
             "-ceu",
             (
-                "umask 077; : > /target/capture.jsonl; chown 10001:10001 /target/capture.jsonl; "
-                "chmod 0600 /target/capture.jsonl; "
+                "umask 077; : > /target/capture.jsonl; chmod 0600 /target/capture.jsonl; "
+                "chown 10001:10001 /target/capture.jsonl; "
                 "test \"$(stat -c '%u:%g:%a' /target/capture.jsonl)\" = 10001:10001:600"
             ),
         )
@@ -2045,11 +2130,26 @@ def _start_observer(
         "QUALIFICATION_OBSERVER_HOST": spec.observer.host,
         "QUALIFICATION_OBSERVER_PORT": str(spec.observer.port),
         "QUALIFICATION_OBSERVER_INSTANCE_SHA256": observer_identity,
+        "QUALIFICATION_OBSERVER_TIMEOUT_SECONDS": _observer_timeout_seconds(spec.proxy.settings),
     }
     try:
         return runner.spawn((sys.executable, "-m", "shiftedx_harness_proxy.qualification_observer"), env=env)
     except Exception as error:
         raise QualificationRuntimeFailure("runtime_observer_start_failed") from error
+
+
+def _observer_timeout_seconds(settings: Mapping[str, Any]) -> str:
+    """Leave a bounded loopback margin without materially changing model time."""
+
+    try:
+        upstream_timeout = Decimal(str(settings["upstream_timeout_seconds"]))
+    except (InvalidOperation, KeyError, ValueError) as error:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid") from error
+    margin = min(Decimal("1"), upstream_timeout / 10)
+    observer_timeout = upstream_timeout - margin
+    if not upstream_timeout.is_finite() or observer_timeout <= 0 or observer_timeout >= upstream_timeout:
+        raise QualificationRuntimeFailure("runtime_manifest_invalid")
+    return format(observer_timeout, "f")
 
 
 def _wait_for_observer(runner: RuntimeCommandRunner, observer: _ObserverSpec, observer_identity: str) -> None:
@@ -2096,6 +2196,7 @@ def _launch_proxy(
         "UPSTREAM_CACHE_CAPABILITY_MODE": settings["upstream_cache_capability_mode"],
         "TELEMETRY_ENABLED": _env_bool(settings["telemetry_enabled"]),
         "METRICS_ENABLED": _env_bool(settings["metrics_enabled"]),
+        "DENIED_TOOLS": settings["denied_tools"],
         "MAX_INTERNAL_RETRIES": str(settings["max_internal_retries"]),
         "MAX_UPSTREAM_CALLS": str(settings["max_upstream_calls"]),
         "UPSTREAM_TIMEOUT_SECONDS": str(settings["upstream_timeout_seconds"]),
@@ -2300,6 +2401,7 @@ def _verify_proxy_environment(value: Any, spec: _RuntimeSpec, stage: RuntimeStag
         "UPSTREAM_CACHE_CAPABILITY_MODE": "disabled",
         "TELEMETRY_ENABLED": "true",
         "METRICS_ENABLED": "true",
+        "DENIED_TOOLS": str(spec.proxy.settings["denied_tools"]),
     }
     if any(environment.get(key) != item for key, item in expected.items()):
         raise QualificationRuntimeFailure("runtime_inspect_drift")
@@ -2497,6 +2599,10 @@ def _proxy_lease(
         proxy_request_accounting_provisional_ledger=(
             _proxy_request_accounting_provisional_ledger_path(private_run_dir) if stage == "score-proxy" else None
         ),
+        campaign_version=spec.campaign.version,
+        v2_private_scenario_deadline_seconds=(
+            spec.campaign.v2_private_scenario_deadline_seconds if stage != "preflight" else None
+        ),
     )
 
 
@@ -2544,6 +2650,10 @@ def _direct_lease(
         direct_provisional_request_ledger=(
             _direct_provisional_request_ledger_path(private_run_dir) if stage == "score-direct" else None
         ),
+        campaign_version=spec.campaign.version,
+        v2_private_scenario_deadline_seconds=(
+            spec.campaign.v2_private_scenario_deadline_seconds if stage != "preflight" else None
+        ),
     )
 
 
@@ -2576,6 +2686,7 @@ def _model_evidence_contract(spec: _RuntimeSpec, stage: RuntimeStage, binding: _
         health_contract_sha256=spec.model.health_contract_sha256,
         settings_contract_sha256=spec.model.settings_contract_sha256,
         cache_lane=lane,
+        sampler_profile=spec.benchmark.sampler_profile,
     )
 
 
@@ -2753,6 +2864,7 @@ def _begin_proxy_reconciliation(
         return ProxyReconciliationSession.begin(
             identity,
             _ContainerMetricsReader(runner, container_id, spec.proxy.container_port),
+            campaign_version=spec.campaign.version,
         )
     except (ReconciliationFailure, QualificationRuntimeFailure) as error:
         raise QualificationRuntimeFailure(error.category) from None
@@ -3231,6 +3343,7 @@ def _validate_prior_outcome(
             slot_ordinal=prior_binding.slot_ordinal,
             cache_lane=prior_binding.cache_lane,
             pair_index=prior_binding.pair_index,
+            campaign_version=spec.campaign.version,
         )
         # Keep the static stage mapping visible to type checking and future
         # schema changes: C1's output stage is part of the prior-evidence gate.

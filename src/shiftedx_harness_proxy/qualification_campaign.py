@@ -14,19 +14,30 @@ import os
 import re
 import stat
 from dataclasses import dataclass
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal, Protocol
+
+from shiftedx_harness_proxy.qualification_timing import TIMING_EVIDENCE_MAX_BYTES
 
 CacheLane = Literal["cold", "warm-prefix"]
 CampaignLane = Literal["preflight", "cold", "warm-prefix"]
 CampaignStage = Literal["preflight", "score-direct", "score-proxy"]
 StageStatus = Literal["passed", "failed", "interrupted"]
-AdvanceKind = Literal["stage_completed", "restart_required", "campaign_passed", "campaign_failed"]
+AdvanceKind = Literal[
+    "stage_completed",
+    "restart_required",
+    "campaign_passed",
+    "campaign_scored_complete",
+    "campaign_failed",
+]
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _FAILURE_CATEGORY = re.compile(r"^[a-z0-9_]{1,64}$")
 _STAGES: tuple[CampaignStage, ...] = ("preflight", "score-direct", "score-proxy")
+_V2_CRITICAL_SCENARIO_ORDINALS = [29, 30]
+_METADATA_FILE_MAX_BYTES = 1024 * 1024
 _OUTCOME_NAMES: dict[CampaignStage, str] = {
     "preflight": "preflight-runtime-outcome.json",
     "score-direct": "scored-direct-runtime-outcome.json",
@@ -78,6 +89,7 @@ class StageResult:
     outcome_sha256: str
     model_runtime_instance_sha256: str | None
     proxy_reconciliation_sha256: str | None
+    model_identity_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -120,6 +132,14 @@ class _CampaignSpec:
     campaign_id_sha256: str
     preflight: CampaignSlot
     slots: tuple[CampaignSlot, ...]
+    policy_benefit_families: tuple[str, ...]
+    policy_benefit_case_count: int
+    policy_benefit_case_ids_sha256: str
+    benchmark_scenario_count: int
+    benchmark_scenario_order_sha256: str
+    campaign_version: Literal["v1", "v2"] = "v1"
+    critical_scenario_ordinals: tuple[int, ...] = ()
+    scenario_deadline_seconds: Decimal | None = None
 
 
 def advance_qualification_campaign(
@@ -146,7 +166,7 @@ def advance_qualification_campaign(
         events, used_instances = _load_events(spec, manifest, slots_dir, events_dir, heads_dir, stage_runner)
         if events and events[-1][0]["status"] != "passed":
             return _terminal_advance(spec, manifest, slots_dir, events[-1][0], events[-1][1])
-        if len(events) == 13:
+        if len(events) == _event_count(spec):
             return _complete_campaign(spec, private_campaign_dir, events, used_instances)
         request = _stage_request(spec, manifest, slots_dir, len(events) + 1)
         inspection = _inspect_stage(stage_runner, request)
@@ -215,9 +235,14 @@ def advance_qualification_campaign(
             request,
             result,
             previous_event_sha256=events[-1][1] if events else None,
+            direct_predecessor_runtime_outcome_sha256=(
+                events[-1][0].get("runtime_outcome_sha256")
+                if spec.campaign_version == "v2" and request.stage == "score-proxy" and events
+                else None
+            ),
         )
         event_sha256 = _write_event(events_dir, heads_dir, request.sequence, event)
-        if request.sequence == 13 and result.status == "passed":
+        if request.sequence == _event_count(spec) and result.status == "passed":
             if result.model_runtime_instance_sha256 is None:
                 raise CampaignFailure("campaign_model_instance_invalid")
             used_instances.add(result.model_runtime_instance_sha256)
@@ -259,7 +284,7 @@ def _load_events(
     head_names = [path.name for path in head_paths]
     if (
         [path.name for path in paths] != expected_names
-        or len(paths) > 13
+        or len(paths) > _event_count(spec)
         or head_names not in (expected_names, expected_names[:-1])
     ):
         raise CampaignFailure("campaign_event_chain_invalid")
@@ -282,7 +307,18 @@ def _load_events(
             if inspection.state != "complete" or inspection.result is None:
                 raise CampaignFailure("campaign_event_chain_invalid")
             _validate_stage_result(request, inspection.result)
-            expected = _event_record(spec, request, inspection.result, previous_event_sha256=previous)
+            predecessor = (
+                events[-1][0].get("runtime_outcome_sha256")
+                if spec.campaign_version == "v2" and request.stage == "score-proxy" and events
+                else None
+            )
+            expected = _event_record(
+                spec,
+                request,
+                inspection.result,
+                previous_event_sha256=previous,
+                direct_predecessor_runtime_outcome_sha256=predecessor,
+            )
         if event != expected:
             raise CampaignFailure("campaign_event_chain_invalid")
         canonical = (json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n").encode()
@@ -323,7 +359,7 @@ def _stage_request(spec: _CampaignSpec, manifest: Path, slots_dir: Path, sequenc
     if sequence == 1:
         slot = spec.preflight
         stage: CampaignStage = "preflight"
-    elif 2 <= sequence <= 13:
+    elif 2 <= sequence <= _event_count(spec):
         offset = sequence - 2
         slot = spec.slots[offset // 2]
         stage = "score-direct" if offset % 2 == 0 else "score-proxy"
@@ -362,7 +398,7 @@ def _partial_event_record(
     *,
     previous_event_sha256: str | None,
 ) -> dict[str, Any]:
-    return {
+    record = {
         "schema_version": "1.0",
         "record_type": "qualification_campaign_event",
         "campaign_manifest_sha256": spec.manifest_sha256,
@@ -379,6 +415,14 @@ def _partial_event_record(
         "proxy_reconciliation_sha256": None,
         "previous_event_sha256": previous_event_sha256,
     }
+    if spec.campaign_version == "v2":
+        record.update(
+            {
+                "direct_predecessor_runtime_outcome_sha256": None,
+                "model_identity_sha256": None,
+            }
+        )
+    return record
 
 
 def _terminal_advance(
@@ -410,12 +454,16 @@ def _complete_campaign(
     events: list[tuple[dict[str, Any], str]],
     used_instances: set[str],
 ) -> CampaignAdvance:
+    if spec.campaign_version == "v2":
+        return _complete_v2_campaign(spec, private_campaign_dir, events, used_instances)
     if len(used_instances) != 13:
         raise CampaignFailure("campaign_model_instance_invalid")
+    policy_benefit_gate = _policy_benefit_gate(spec, private_campaign_dir, events)
+    status = "passed" if policy_benefit_gate["status"] == "passed" else "failed"
     outcome = {
         "schema_version": "1.0",
         "record_type": "qualification_campaign_outcome",
-        "status": "passed",
+        "status": status,
         "campaign_manifest_sha256": spec.manifest_sha256,
         "head_event_sha256": events[-1][1],
         "event_count": 13,
@@ -427,6 +475,7 @@ def _complete_campaign(
             for event, _digest in events
             if event["stage"] == "score-proxy"
         ],
+        "policy_benefit_gate": policy_benefit_gate,
     }
     path = private_campaign_dir / "qualification-campaign-outcome.json"
     if path.exists() or path.is_symlink():
@@ -440,7 +489,359 @@ def _complete_campaign(
     else:
         serialized = _atomic_write_no_clobber(path, outcome)
     digest = hashlib.sha256(serialized).hexdigest()
-    return CampaignAdvance("campaign_passed", None, None, None, None, None, events[-1][1], digest)
+    return CampaignAdvance(
+        "campaign_passed" if status == "passed" else "campaign_failed",
+        None,
+        None,
+        None,
+        None,
+        None if status == "passed" else str(policy_benefit_gate["failure_category"]),
+        events[-1][1],
+        digest,
+    )
+
+
+def _complete_v2_campaign(
+    spec: _CampaignSpec,
+    private_campaign_dir: Path,
+    events: list[tuple[dict[str, Any], str]],
+    used_instances: set[str],
+) -> CampaignAdvance:
+    """Reduce the complete private v2 evidence graph to one aggregate-only outcome."""
+
+    if len(events) != 17 or len(used_instances) != 17 or spec.scenario_deadline_seconds is None:
+        raise CampaignFailure("campaign_event_chain_invalid")
+    try:
+        from shiftedx_harness_proxy.qualification_campaign_v2 import (
+            QualificationV2Failure,
+            evaluate_qualification_v2,
+        )
+        from shiftedx_harness_proxy.qualification_campaign_v2_evidence import (
+            QualificationV2EvidenceFailure,
+            V2EvidenceSpec,
+            V2ScoredLedger,
+            adapt_v2_scored_evidence,
+        )
+
+        event_by_slot_stage = {
+            (event["slot_ordinal"], event["stage"]): event for event, _digest in events
+        }
+        records = []
+        reconciliation_hashes: list[str] = []
+        preflight_dir = private_campaign_dir / "slots" / _slot_directory_name(spec.preflight)
+        preflight_attestation = preflight_dir / "preflight-runtime-attestation.json"
+        for slot in spec.slots:
+            direct_event = event_by_slot_stage[(slot.ordinal, "score-direct")]
+            proxy_event = event_by_slot_stage[(slot.ordinal, "score-proxy")]
+            direct_identity = direct_event.get("model_identity_sha256")
+            proxy_identity = proxy_event.get("model_identity_sha256")
+            direct_hash = direct_event.get("runtime_outcome_sha256")
+            proxy_hash = proxy_event.get("runtime_outcome_sha256")
+            predecessor = proxy_event.get("direct_predecessor_runtime_outcome_sha256")
+            reconciliation = proxy_event.get("proxy_reconciliation_sha256")
+            if (
+                not isinstance(direct_identity, str)
+                or not isinstance(proxy_identity, str)
+                or not isinstance(direct_hash, str)
+                or not isinstance(proxy_hash, str)
+                or predecessor != direct_hash
+                or not isinstance(reconciliation, str)
+            ):
+                raise QualificationV2EvidenceFailure("qualification_v2_evidence_invalid")
+            slot_dir = private_campaign_dir / "slots" / _slot_directory_name(slot)
+            evidence_spec = V2EvidenceSpec(
+                manifest_sha256=spec.manifest_sha256,
+                campaign_id_sha256=spec.campaign_id_sha256,
+                scenario_order_sha256=spec.benchmark_scenario_order_sha256,
+                critical_scenario_ordinals=spec.critical_scenario_ordinals,
+                critical_scenario_ordinals_sha256=hashlib.sha256(
+                    json.dumps(spec.critical_scenario_ordinals, separators=(",", ":")).encode()
+                ).hexdigest(),
+                cache_lane=slot.cache_lane,
+                replicate=slot.pair_index,
+                slot_ordinal=slot.ordinal,
+                pair_index=slot.pair_index,
+                deadline_s=spec.scenario_deadline_seconds,
+                expected_direct_outcome_sha256=direct_hash,
+            )
+            records.extend(
+                adapt_v2_scored_evidence(
+                    evidence_spec,
+                    (
+                        V2ScoredLedger(
+                            "direct",
+                            slot_dir / "scored-direct.jsonl",
+                            slot_dir / _OUTCOME_NAMES["score-direct"],
+                            direct_hash,
+                            preflight_attestation,
+                            slot_dir / "scored-direct-model-cache-evidence.json",
+                            direct_identity,
+                            None,
+                            None,
+                        ),
+                        V2ScoredLedger(
+                            "proxy",
+                            slot_dir / "scored-proxy.jsonl",
+                            slot_dir / _OUTCOME_NAMES["score-proxy"],
+                            proxy_hash,
+                            slot_dir / "scored-proxy-runtime-attestation.json",
+                            slot_dir / "scored-proxy-model-cache-evidence.json",
+                            proxy_identity,
+                            slot_dir / "scored-proxy-reconciliation.json",
+                            predecessor,
+                        ),
+                    ),
+                )
+            )
+            reconciliation_hashes.append(reconciliation)
+        evaluator = evaluate_qualification_v2(records)
+        gates = evaluator.get("gates")
+        decision = (
+            "scored_passed"
+            if isinstance(gates, dict) and gates.get("promotion_passed") is True
+            else "scored_failed"
+        )
+        failure_category: str | None = None if decision == "scored_passed" else "v2_scored_gate_failed"
+    except (QualificationV2EvidenceFailure, QualificationV2Failure):
+        evaluator = None
+        reconciliation_hashes = []
+        decision = "scored_failed"
+        failure_category = "v2_evidence_invalid"
+    outcome = {
+        "schema_version": "2.0",
+        "record_type": "qualification_campaign_outcome",
+        "status": "scored_complete" if evaluator is not None else "failed",
+        "scored_decision": decision,
+        "failure_category": failure_category,
+        "campaign_manifest_sha256": spec.manifest_sha256,
+        "head_event_sha256": events[-1][1],
+        "event_count": 17,
+        "slot_count": 8,
+        "scored_stage_count": 16,
+        "scored_model_instance_count": 16,
+        "proxy_reconciliation_sha256s": reconciliation_hashes,
+        "evaluator": evaluator,
+    }
+    path = private_campaign_dir / "qualification-campaign-outcome.json"
+    if path.exists() or path.is_symlink():
+        try:
+            serialized = _read_regular_file(path, private=True)
+            if json.loads(serialized, object_pairs_hook=_unique_object) != outcome:
+                raise ValueError("outcome mismatch")
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            raise CampaignFailure("campaign_outcome_invalid") from None
+    else:
+        serialized = _atomic_write_no_clobber(path, outcome)
+    digest = hashlib.sha256(serialized).hexdigest()
+    return CampaignAdvance(
+        "campaign_scored_complete" if evaluator is not None else "campaign_failed",
+        None,
+        None,
+        None,
+        None,
+        failure_category,
+        events[-1][1],
+        digest,
+    )
+
+
+def _policy_benefit_gate(
+    spec: _CampaignSpec, private_campaign_dir: Path, events: list[tuple[dict[str, Any], str]]
+) -> dict[str, Any]:
+    """Fail closed on the frozen policy-benefit cohort in every scored slot."""
+
+    try:
+        direct_samples: list[Decimal] = []
+        proxy_samples: list[Decimal] = []
+        event_by_slot_stage = {
+            (event["slot_ordinal"], event["stage"]): event for event, _event_sha256 in events
+        }
+        for slot in spec.slots:
+            slot_dir = private_campaign_dir / "slots" / _slot_directory_name(slot)
+            direct_event = event_by_slot_stage[(slot.ordinal, "score-direct")]
+            proxy_event = event_by_slot_stage[(slot.ordinal, "score-proxy")]
+            direct_rows = _policy_benefit_rows(
+                slot_dir / "scored-direct.jsonl",
+                slot_dir / _OUTCOME_NAMES["score-direct"],
+                direct_event["runtime_outcome_sha256"],
+                "scored-direct",
+                slot,
+                spec,
+            )
+            proxy_rows = _policy_benefit_rows(
+                slot_dir / "scored-proxy.jsonl",
+                slot_dir / _OUTCOME_NAMES["score-proxy"],
+                proxy_event["runtime_outcome_sha256"],
+                "scored-proxy",
+                slot,
+                spec,
+            )
+            if direct_rows.keys() != proxy_rows.keys() or any(
+                direct_rows[case_id][0] != proxy_rows[case_id][0] for case_id in direct_rows
+            ):
+                raise ValueError("unmatched cohort")
+            direct_samples.extend(wall_s for _family, wall_s in direct_rows.values())
+            proxy_samples.extend(wall_s for _family, wall_s in proxy_rows.values())
+        expected_samples = len(spec.slots) * spec.policy_benefit_case_count
+        if len(direct_samples) != expected_samples or len(proxy_samples) != expected_samples:
+            raise ValueError("incomplete cohort")
+        direct_p95 = _frozen_p95(direct_samples)
+        proxy_p95 = _frozen_p95(proxy_samples)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, InvalidOperation):
+        return _policy_benefit_gate_failure(spec, "policy_benefit_evidence_invalid")
+
+    ratio_ppm = int((proxy_p95 * Decimal(1_000_000) / direct_p95).to_integral_value(rounding=ROUND_CEILING))
+    summary = {
+        "cohort_case_ids_sha256": spec.policy_benefit_case_ids_sha256,
+        "cohort_case_count": spec.policy_benefit_case_count,
+        "matched_slot_count": len(spec.slots),
+        "matched_sample_count": len(direct_samples),
+        "direct_p95_wall_us": _wall_microseconds(direct_p95),
+        "proxy_p95_wall_us": _wall_microseconds(proxy_p95),
+        "proxy_to_direct_p95_ratio_ppm": ratio_ppm,
+    }
+    if proxy_p95 > direct_p95 * Decimal("0.80"):
+        return {"status": "failed", "failure_category": "policy_benefit_gate_failed", **summary}
+    return {"status": "passed", "failure_category": None, **summary}
+
+
+def _policy_benefit_gate_failure(spec: _CampaignSpec, category: str) -> dict[str, Any]:
+    return {
+        "status": "failed",
+        "failure_category": category,
+        "cohort_case_ids_sha256": spec.policy_benefit_case_ids_sha256,
+        "cohort_case_count": spec.policy_benefit_case_count,
+        "matched_slot_count": 0,
+        "matched_sample_count": 0,
+        "direct_p95_wall_us": None,
+        "proxy_p95_wall_us": None,
+        "proxy_to_direct_p95_ratio_ppm": None,
+    }
+
+
+def _policy_benefit_rows(
+    path: Path,
+    outcome_path: Path,
+    expected_outcome_sha256: Any,
+    expected_stage: Literal["scored-direct", "scored-proxy"],
+    slot: CampaignSlot,
+    spec: _CampaignSpec,
+) -> dict[str, tuple[str, Decimal]]:
+    serialized = _read_regular_file(path, private=True)
+    _validate_scored_ledger_outcome(
+        outcome_path, expected_outcome_sha256, serialized, expected_stage, slot, spec
+    )
+    rows: dict[str, tuple[str, Decimal]] = {}
+    all_case_ids: list[str] = []
+    for line in serialized.decode("utf-8").splitlines():
+        if not line:
+            raise ValueError("blank row")
+        row = json.loads(line, object_pairs_hook=_unique_object, parse_float=Decimal)
+        if not isinstance(row, dict):
+            raise ValueError("row is not object")
+        case_id = row.get("case_id")
+        metadata = row.get("metadata")
+        family = metadata.get("agentic_family") if isinstance(metadata, dict) else None
+        passed = row.get("passed")
+        if not isinstance(case_id, str) or _SAFE_ID.fullmatch(case_id) is None:
+            raise ValueError("case id")
+        if (
+            case_id in all_case_ids
+            or not isinstance(family, str)
+            or _SAFE_ID.fullmatch(family) is None
+            or not isinstance(passed, bool)
+        ):
+            raise ValueError("scored row identity")
+        telemetry = row.get("telemetry")
+        wall_s = telemetry.get("wall_s") if isinstance(telemetry, dict) else None
+        if isinstance(wall_s, bool) or not isinstance(wall_s, int | Decimal):
+            raise ValueError("wall time")
+        wall = Decimal(wall_s)
+        if not wall.is_finite() or wall <= 0:
+            raise ValueError("wall time")
+        all_case_ids.append(case_id)
+        if family not in spec.policy_benefit_families:
+            continue
+        if not passed:
+            raise ValueError("invalid policy outcome")
+        rows[case_id] = (family, wall)
+    if (
+        len(all_case_ids) != spec.benchmark_scenario_count
+        or hashlib.sha256(json.dumps(all_case_ids, separators=(",", ":")).encode()).hexdigest()
+        != spec.benchmark_scenario_order_sha256
+    ):
+        raise ValueError("scored ledger order")
+    case_ids = sorted(rows)
+    if (
+        len(case_ids) != spec.policy_benefit_case_count
+        or hashlib.sha256(json.dumps(case_ids, separators=(",", ":")).encode()).hexdigest()
+        != spec.policy_benefit_case_ids_sha256
+    ):
+        raise ValueError("cohort mismatch")
+    return rows
+
+
+def _validate_scored_ledger_outcome(
+    outcome_path: Path,
+    expected_outcome_sha256: Any,
+    ledger: bytes,
+    expected_stage: Literal["scored-direct", "scored-proxy"],
+    slot: CampaignSlot,
+    spec: _CampaignSpec,
+) -> None:
+    serialized = _read_regular_file(outcome_path, private=True)
+    document = json.loads(serialized, object_pairs_hook=_unique_object)
+    expected_keys = {
+        "schema_version",
+        "record_type",
+        "stage",
+        "status",
+        "action_exit_code",
+        "failure_category",
+        "run_manifest_sha256",
+        "attestation_sha256",
+        "model_evidence_sha256",
+        "output_ledger_sha256",
+        "output_record_count",
+        "proxy_reconciliation_sha256",
+        "campaign_id_sha256",
+        "slot_ordinal",
+        "cache_lane",
+        "pair_index",
+    }
+    if (
+        not isinstance(expected_outcome_sha256, str)
+        or hashlib.sha256(serialized).hexdigest() != expected_outcome_sha256
+        or not isinstance(document, dict)
+        or set(document) != expected_keys
+        or document.get("schema_version") != "1.0"
+        or document.get("record_type") != "qualification_runtime_outcome"
+        or document.get("stage") != expected_stage
+        or document.get("status") != "passed"
+        or not isinstance(document.get("action_exit_code"), int)
+        or isinstance(document.get("action_exit_code"), bool)
+        or document.get("action_exit_code") != 0
+        or document.get("failure_category") is not None
+        or document.get("output_ledger_sha256") != hashlib.sha256(ledger).hexdigest()
+        or not isinstance(document.get("output_record_count"), int)
+        or isinstance(document.get("output_record_count"), bool)
+        or document.get("output_record_count") != spec.benchmark_scenario_count
+        or document.get("campaign_id_sha256") != spec.campaign_id_sha256
+        or document.get("slot_ordinal") != slot.ordinal
+        or document.get("cache_lane") != slot.cache_lane
+        or document.get("pair_index") != slot.pair_index
+    ):
+        raise ValueError("runtime outcome")
+
+
+def _frozen_p95(samples: list[Decimal]) -> Decimal:
+    if not samples:
+        raise ValueError("zero samples")
+    return sorted(samples)[(len(samples) - 1) * 95 // 100]
+
+
+def _wall_microseconds(value: Decimal) -> int:
+    return int((value * Decimal(1_000_000)).to_integral_value(rounding=ROUND_CEILING))
 
 
 def _load_campaign_spec(path: Path) -> _CampaignSpec:
@@ -451,18 +852,46 @@ def _load_campaign_spec(path: Path) -> _CampaignSpec:
         raise CampaignFailure("campaign_manifest_invalid") from None
     runtime = document.get("qualification_runtime") if isinstance(document, dict) else None
     campaign = runtime.get("campaign") if isinstance(runtime, dict) else None
-    expected_keys = {
+    benchmark = runtime.get("benchmark") if isinstance(runtime, dict) else None
+    v1_keys = {
         "campaign_id",
         "slots",
         "stage_order",
         "treatment_order",
         "model_instance_policy",
         "failure_policy",
+        "policy_benefit_families",
+        "policy_benefit_case_count",
+        "policy_benefit_case_ids_sha256",
     }
-    if not isinstance(campaign, dict) or set(campaign) != expected_keys:
+    v2_keys = {
+        "campaign_version",
+        "campaign_id",
+        "slots",
+        "stage_order",
+        "treatment_order",
+        "model_instance_policy",
+        "failure_policy",
+        "critical_scenario_ordinals",
+        "critical_scenario_ordinals_sha256",
+        "scenario_deadline_seconds",
+    }
+    if not isinstance(campaign, dict):
+        raise CampaignFailure("campaign_manifest_invalid")
+    campaign_version: Literal["v1", "v2"]
+    if set(campaign) == v1_keys:
+        campaign_version = "v1"
+    elif set(campaign) == v2_keys and campaign.get("campaign_version") == "v2":
+        campaign_version = "v2"
+    else:
         raise CampaignFailure("campaign_manifest_invalid")
     campaign_id = campaign.get("campaign_id")
     raw_slots = campaign.get("slots")
+    raw_families = campaign.get("policy_benefit_families")
+    case_count = campaign.get("policy_benefit_case_count")
+    case_ids_sha256 = campaign.get("policy_benefit_case_ids_sha256")
+    scenario_count = benchmark.get("scenario_count") if isinstance(benchmark, dict) else None
+    scenario_order_sha256 = benchmark.get("scenario_order_sha256") if isinstance(benchmark, dict) else None
     if (
         not isinstance(campaign_id, str)
         or _SAFE_ID.fullmatch(campaign_id) is None
@@ -471,7 +900,25 @@ def _load_campaign_spec(path: Path) -> _CampaignSpec:
         or campaign.get("model_instance_policy") != "fresh-per-scored-treatment"
         or campaign.get("failure_policy") != "terminal-no-rerun"
         or not isinstance(raw_slots, list)
-        or len(raw_slots) != 6
+        or len(raw_slots) != (6 if campaign_version == "v1" else 8)
+        or not isinstance(scenario_count, int)
+        or isinstance(scenario_count, bool)
+        or scenario_count < (case_count if isinstance(case_count, int) else 30)
+        or (campaign_version == "v2" and scenario_count != 30)
+        or not isinstance(scenario_order_sha256, str)
+        or _SHA256.fullmatch(scenario_order_sha256) is None
+    ):
+        raise CampaignFailure("campaign_manifest_invalid")
+    if campaign_version == "v1" and (
+        not isinstance(raw_families, list)
+        or not raw_families
+        or any(not isinstance(family, str) or _SAFE_ID.fullmatch(family) is None for family in raw_families)
+        or len(set(raw_families)) != len(raw_families)
+        or not isinstance(case_count, int)
+        or isinstance(case_count, bool)
+        or case_count <= 0
+        or not isinstance(case_ids_sha256, str)
+        or _SHA256.fullmatch(case_ids_sha256) is None
     ):
         raise CampaignFailure("campaign_manifest_invalid")
     expected_pairs: tuple[tuple[CacheLane, int], ...] = (
@@ -482,6 +929,17 @@ def _load_campaign_spec(path: Path) -> _CampaignSpec:
         ("warm-prefix", 2),
         ("warm-prefix", 3),
     )
+    if campaign_version == "v2":
+        expected_pairs = (
+            ("cold", 1),
+            ("cold", 2),
+            ("cold", 3),
+            ("cold", 4),
+            ("warm-prefix", 1),
+            ("warm-prefix", 2),
+            ("warm-prefix", 3),
+            ("warm-prefix", 4),
+        )
     slots: list[CampaignSlot] = []
     run_ids: set[str] = set()
     for ordinal, (raw, expected) in enumerate(zip(raw_slots, expected_pairs, strict=True), start=1):
@@ -499,11 +957,41 @@ def _load_campaign_spec(path: Path) -> _CampaignSpec:
             raise CampaignFailure("campaign_manifest_invalid")
         run_ids.add(run_id)
         slots.append(CampaignSlot(ordinal, lane, pair, run_id))
+    critical_ordinals: tuple[int, ...] = ()
+    deadline: Decimal | None = None
+    if campaign_version == "v2":
+        raw_critical = campaign.get("critical_scenario_ordinals")
+        deadline_value = campaign.get("scenario_deadline_seconds")
+        if (
+            not isinstance(raw_critical, list)
+            or not raw_critical
+            or any(
+                not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 30
+                for value in raw_critical
+            )
+            or raw_critical != _V2_CRITICAL_SCENARIO_ORDINALS
+            or campaign.get("critical_scenario_ordinals_sha256")
+            != hashlib.sha256(json.dumps(raw_critical, separators=(",", ":")).encode()).hexdigest()
+            or isinstance(deadline_value, bool)
+            or not isinstance(deadline_value, int | Decimal)
+            or Decimal(deadline_value) != Decimal(600)
+        ):
+            raise CampaignFailure("campaign_manifest_invalid")
+        critical_ordinals = tuple(raw_critical)
+        deadline = Decimal(deadline_value)
     return _CampaignSpec(
         manifest_sha256=hashlib.sha256(serialized).hexdigest(),
         campaign_id_sha256=hashlib.sha256(campaign_id.encode()).hexdigest(),
         preflight=CampaignSlot(0, "preflight", 0, f"{campaign_id}-preflight"),
         slots=tuple(slots),
+        policy_benefit_families=tuple(raw_families) if isinstance(raw_families, list) else (),
+        policy_benefit_case_count=case_count if isinstance(case_count, int) and not isinstance(case_count, bool) else 0,
+        policy_benefit_case_ids_sha256=case_ids_sha256 if isinstance(case_ids_sha256, str) else "",
+        benchmark_scenario_count=scenario_count,
+        benchmark_scenario_order_sha256=scenario_order_sha256,
+        campaign_version=campaign_version,
+        critical_scenario_ordinals=critical_ordinals,
+        scenario_deadline_seconds=deadline,
     )
 
 
@@ -620,8 +1108,9 @@ def _event_record(
     result: StageResult,
     *,
     previous_event_sha256: str | None,
+    direct_predecessor_runtime_outcome_sha256: object | None = None,
 ) -> dict[str, Any]:
-    return {
+    record = {
         "schema_version": "1.0",
         "record_type": "qualification_campaign_event",
         "campaign_manifest_sha256": spec.manifest_sha256,
@@ -638,6 +1127,28 @@ def _event_record(
         "proxy_reconciliation_sha256": result.proxy_reconciliation_sha256,
         "previous_event_sha256": previous_event_sha256,
     }
+    if spec.campaign_version == "v2":
+        if request.stage in {"score-direct", "score-proxy"} and (
+            result.model_identity_sha256 is not None
+            and (
+                not isinstance(result.model_identity_sha256, str)
+                or _SHA256.fullmatch(result.model_identity_sha256) is None
+            )
+            or result.status == "passed" and result.model_identity_sha256 is None
+        ):
+            raise CampaignFailure("campaign_stage_outcome_invalid")
+        if request.stage == "score-proxy" and (
+            not isinstance(direct_predecessor_runtime_outcome_sha256, str)
+            or _SHA256.fullmatch(direct_predecessor_runtime_outcome_sha256) is None
+        ):
+            raise CampaignFailure("campaign_event_chain_invalid")
+        record.update(
+            {
+                "direct_predecessor_runtime_outcome_sha256": direct_predecessor_runtime_outcome_sha256,
+                "model_identity_sha256": result.model_identity_sha256,
+            }
+        )
+    return record
 
 
 def _atomic_write_no_clobber(path: Path, document: dict[str, Any]) -> bytes:
@@ -663,7 +1174,18 @@ def _atomic_write_no_clobber(path: Path, document: dict[str, Any]) -> bytes:
     return serialized
 
 
-def _read_regular_file(path: Path, *, private: bool) -> bytes:
+def _read_regular_file(
+    path: Path,
+    *,
+    private: bool,
+    max_bytes: int = _METADATA_FILE_MAX_BYTES,
+) -> bytes:
+    if (
+        isinstance(max_bytes, bool)
+        or not isinstance(max_bytes, int)
+        or not 0 < max_bytes <= TIMING_EVIDENCE_MAX_BYTES
+    ):
+        raise OSError("invalid file")
     status = path.lstat()
     if path.is_symlink() or not stat.S_ISREG(status.st_mode) or (private and stat.S_IMODE(status.st_mode) != 0o600):
         raise OSError("invalid file")
@@ -673,7 +1195,7 @@ def _read_regular_file(path: Path, *, private: bool) -> bytes:
         if (
             not stat.S_ISREG(opened.st_mode)
             or (opened.st_dev, opened.st_ino) != (status.st_dev, status.st_ino)
-            or opened.st_size > 1024 * 1024
+            or opened.st_size > max_bytes
             or (private and stat.S_IMODE(opened.st_mode) != 0o600)
         ):
             raise OSError("invalid file")
@@ -690,6 +1212,10 @@ def _write_all(descriptor: int, data: bytes) -> None:
 
 def _slot_directory_name(slot: CampaignSlot) -> str:
     return f"{slot.ordinal:02d}-{slot.cache_lane}-pair{slot.pair_index}"
+
+
+def _event_count(spec: _CampaignSpec) -> int:
+    return 17 if spec.campaign_version == "v2" else 13
 
 
 def _public_position(slot: CampaignSlot) -> CampaignPosition:

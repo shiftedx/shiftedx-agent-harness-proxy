@@ -30,17 +30,22 @@ an evaluation adapter, not benchmark or proxy policy derived from expected answe
 
 ## Parity preflight and score gate
 
-The default replacement qualification uses the named `corrected-parity-v1` sampler:
-`temperature=0.0`, `top_p=0.95`, `top_k=20`, thinking enabled, reasoning effort `medium`, and
-`max_tokens=1024`.
+The frozen Ornith productization campaign uses the named `ornith-productization-v1` sampler:
+`temperature=1.0`, `top_p=0.95`, `top_k=20`, thinking enabled, reasoning effort `medium`, and
+`max_tokens=8192`. Its immutable model contract requires `--ssd-session-cache=on`.
+
+`corrected-parity-v1` remains the separate temperature-0 replacement-qualification profile. It uses
+exactly `temperature=0.0`, `top_p=0.95`, `top_k=20`, thinking enabled, reasoning effort `medium`,
+and `max_tokens=1024`, with `--ssd-session-cache=off`.
 
 `historical-aeon-v1` is the separate historical AEON parity profile. It uses exactly
 `temperature=1.0`, `top_p=0.95`, `top_k=20`, thinking enabled, reasoning effort `medium`, and
 `max_tokens=1024`, matching the recorded AEON benchmark setting. The profile name is immutable
 manifest material: it is forwarded to preflight, cold scoring, warm priming, and scoring; its
 constants are therefore included in the downstream/model-boundary fingerprints and score gates.
-There are no individual sampler command-line overrides, and ledgers from these profiles must never
-be compared or combined.
+It also selects the sole allowed SSD-cache launch flag: `on` only for Ornith productization and `off`
+for the two parity profiles. There are no individual sampler or cache command-line overrides, and
+ledgers from these profiles must never be compared or combined.
 
 Before a scored command, run the paired preflight against the direct and proxy arms. It uses the
 same versioned phase planner on each arm while keeping the proxy's downstream request standard:
@@ -80,10 +85,13 @@ uv run python scripts/run_qualification_runtime.py \
   --manifest "$RUN_MANIFEST" --private-campaign-dir "$CAMPAIGN_DIR"
 ```
 
-Run that same command again only after it reports the prior stage complete. It advances one event
-at a time in this fixed order: the sole preflight, then direct/proxy for cold pairs 1–3, then
-direct/proxy for warm-prefix pairs 1–3. An exit status of `2` means the next scored stage requires
-the independently operated MTPLX restart; this includes an intentionally stopped model listener.
+Run that same command again only after it reports the prior stage complete. For v1, it advances one
+event at a time in this fixed order: the sole preflight, then direct/proxy for cold pairs 1–3, then
+direct/proxy for warm-prefix pairs 1–3. The v2 schedule is the sole preflight followed by eight
+direct-then-proxy pairs: cold pairs 1–4, then warm-prefix pairs 1–4, for 17 total events. An exit
+status of `2` means the next scored stage requires the independently operated MTPLX restart; this
+includes an intentionally stopped model listener. For v2 only, exit status `3` means
+`campaign_scored_complete`: scoring finished, but it is not a promotion or deployment approval.
 The supervisor recognizes only a typed connection-refused result from its dedicated loopback
 listener probe as offline, and returns `2` before reserving a slot directory, evidence file, or
 terminal campaign event. A timeout or other socket error is indeterminate and fails closed; a live
@@ -113,6 +121,26 @@ canonical model/order hashes, benchmark revision, runtime-contract/instance hash
 true checks. It contains no endpoint, host path, container name, PID, secret, or credential hash.
 The separate outcome is categorical only and does not rewrite either attestation or benchmark
 ledger.
+
+### Private manifest v2
+
+V2 uses the same private, duplicate-rejecting JSON envelope, but its `campaign` object is a
+separate strict contract. It must declare `"campaign_version": "v2"`, exactly eight ordered slots
+(cold pairs 1–4 followed by warm-prefix pairs 1–4), and
+`"scenario_deadline_seconds": 600`. Every scored treatment retains all 30 authenticated ordered
+scenarios; v2 has no selected cohort. The manifest must also declare
+`"critical_scenario_ordinals": [29, 30]` and the canonical SHA-256 of that exact array in
+`"critical_scenario_ordinals_sha256"`. These are full-order ordinals, not public scenario IDs.
+
+The runtime rejects v2 values that differ from this fixed topology, critical set, or deadline. It
+forwards the private 600-second deadline only to scored children, so it bounds each complete
+scenario rather than preflight. The final v2 scorer exit is `3` (`campaign_scored_complete`), which
+records completed scoring only. It does not emit `PROMOTE`, authorize deployment, or waive the
+remaining operational evidence and owner decision in the [v2 qualification plan](../benchmark-reports/v2-qualification-plan.md).
+
+The private proxy-to-model observer uses an evidence-flush timeout up to one second shorter than
+the candidate proxy's upstream timeout. This is a conservative qualification-only disadvantage for
+the proxy arm, not literal timeout parity, and cannot turn a failed request into a passing one.
 
 ### Private manifest v1
 
@@ -154,7 +182,7 @@ uses `"schema_version": "1.0"` and exactly these keys:
         "--generation-mode=mtp",
         "--depth=3",
         "--temperature=0",
-        "--ssd-session-cache=off"
+        "--ssd-session-cache=on"
       ],
       "health_contract_sha256": "0303030303030303030303030303030303030303030303030303030303030303",
       "settings_contract_sha256": "0404040404040404040404040404040404040404040404040404040404040404"
@@ -166,9 +194,9 @@ uses `"schema_version": "1.0"` and exactly these keys:
       "checkout_path": "/absolute/private/path/shiftedx-bench",
       "interpreter_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
       "agentic_set": "expanded",
-      "sampler_profile": "corrected-parity-v1",
+      "sampler_profile": "ornith-productization-v1",
       "scenario_order_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-      "scenario_count": 12
+      "scenario_count": 30
     },
     "campaign": {
       "campaign_id": "qualification-2026-08-20",
@@ -183,7 +211,16 @@ uses `"schema_version": "1.0"` and exactly these keys:
       "stage_order": ["preflight", "score-direct", "score-proxy"],
       "treatment_order": ["direct", "proxy"],
       "model_instance_policy": "fresh-per-scored-treatment",
-      "failure_policy": "terminal-no-rerun"
+      "failure_policy": "terminal-no-rerun",
+      "policy_benefit_families": [
+        "failed_search_recovery",
+        "repair_loop",
+        "stale_evidence",
+        "structured_status",
+        "wrong_path_recovery"
+      ],
+      "policy_benefit_case_count": 22,
+      "policy_benefit_case_ids_sha256": "73c007092312a9b187b66c67fd73e4d343641696ab59aafc56b36d2284ff1fc1"
     },
     "observer": {
       "host": "127.0.0.1",
@@ -246,9 +283,9 @@ put endpoint bodies in the manifest. The placeholder flag list above is illustra
 manifest carries the complete frozen semantic vector for that model process.
 
 The supervisor probes only `/health`, `/v1/models`, and `/v1/mtplx/settings`, joins the health
-startup PID to the sole loopback listener, and verifies the executable, launch vector (including
-`--ssd-session-cache=off`), package, model identity, and quiescent request count before and after
-each stage. A scored lane requires a newly restarted instance with `requests_completed == 0`; an
+startup PID to the sole loopback listener, and verifies the executable, launch vector (including the
+sampler-profile-bound SSD-cache flag), package, model identity, and quiescent request count before
+and after each stage. A scored lane requires a newly restarted instance with `requests_completed == 0`; an
 already-ready unrelated service, a replacement PID, a reused preceding-stage instance, or
 intervening model traffic fails the exclusive qualification window. No model endpoint, path, PID,
 launch argv, or server response is emitted into an attestation, outcome, or cache-evidence artifact.
@@ -300,18 +337,37 @@ the child, validates its request/observer/model evidence after the child, and fa
 counter or partition mismatch. The supervisor supplies each slot's frozen run ID to both
 treatments and derives variants as `<cache_lane>-pair<pair_index>-direct|proxy-<agentic_set>`.
 
+At terminal campaign completion, the orchestrator also enforces the frozen policy-benefit gate.
+Before trial 1, the manifest commits the eligible `metadata.agentic_family` values, the selected
+case count, and the SHA-256 of the canonical sorted selected case-ID list. It never infers the
+cohort from observed intervention results. Each direct/proxy scored ledger must supply that exact
+cohort in every one of the six slots (three cold and three warm-prefix), with matching IDs/families,
+`passed: true`, and a finite positive runner-measured `telemetry.wall_s`. The frozen p95 index
+`(n - 1) * 95 // 100` over all matched direct rows and all matched proxy rows is compared; proxy
+must be at most `80%` of direct. Missing, malformed, mismatched, zero-sample, or failed cohort
+evidence fails closed and is
+not excluded from the ratio. The private campaign outcome records only the cohort hash/count and
+aggregate p95/ratio fields—never case IDs or prompts—and its status cannot be `passed` until this
+gate passes.
+
+Before cohort selection, the terminal check verifies each scored ledger against the SHA-256 recorded
+in that slot's immutable runtime outcome, then requires all `scenario_count` rows to have unique
+case IDs in the manifest's hashed order and valid family, outcome, and timing fields. Thus a later
+ledger rewrite, duplicate, or non-cohort relabel cannot hide a failed policy-benefit case or improve the
+ratio.
+
 `cache_lane` is measured proof, not a `cache_proof_sha256` self-assertion. Preflight always sends
 `--cache-mode bypass`, including a later `warm-prefix` campaign: every successful preflight attempt
 must report bypass, no RAM or SSD hit, zero cached tokens, a full new prefill, and no postcommit
 store. The `cold` scored lane enforces the same evidence on its dedicated zero-counter process. In
-the `warm-prefix` scored lane, that separate process has persistent SSD cache disabled and the
-supervisor first runs one direct-to-model prime child with the same frozen run ID, scenario order,
-variant, and a `direct` or `proxy` prime arm. It records exactly one safe prime attempt, then runs
-the scored child. The prime request digest must equal the first measured request digest; that first
-measured attempt must be a non-bypass **RAM** hit with positive cached tokens and no SSD-hit fields,
-and the server request-count delta must leave no room for intervening traffic. A pending postcommit
-flag is corroborating information only, because a tool-required MTPLX prime can commit after the
-first matching request.
+the `warm-prefix` scored lane, the supervisor first runs one direct-to-model prime child with the
+same frozen run ID, scenario order, variant, and a `direct` or `proxy` prime arm. It records exactly
+one safe prime attempt, then runs the scored child. The prime request digest must equal the first
+measured request digest; that first measured attempt must be a non-bypass **RAM** hit with positive
+cached tokens and no SSD-hit fields, and the server request-count delta must leave no room for
+intervening traffic. This server-authored no-SSD-hit proof applies even when the frozen Ornith
+service has SSD cache enabled. A pending postcommit flag is corroborating information only, because
+a tool-required MTPLX prime can commit after the first matching request.
 
 The paired child still fails before any scored row when either arm produces zero native acquisition
 calls, phase/field fingerprints differ outside the declared proxy receipt policy, proxy phase

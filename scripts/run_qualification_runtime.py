@@ -96,6 +96,7 @@ def paired_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
         ]
         if lease.direct_api_key_file is not None:
             argv.extend(("--api-key-file", str(lease.direct_api_key_file)))
+        _append_v2_scored_options(argv, lease)
         return tuple(argv)
     if lease.stage == "score-proxy":
         (
@@ -130,6 +131,7 @@ def paired_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
             "--direct-runtime-outcome",
             str(lease.output_ledger.with_name("scored-direct-runtime-outcome.json")),
         ]
+        _append_v2_scored_options(argv, lease)
         return tuple(argv)
     raise ValueError("unsupported qualification runtime stage")
 
@@ -202,6 +204,28 @@ def _prime_runner_argv(lease: RuntimeLease) -> tuple[str, ...]:
     return tuple(argv)
 
 
+def _append_v2_scored_options(argv: list[str], lease: RuntimeLease) -> None:
+    """Append the manifest-derived v2-only scored-run contract, never to priming/preflight."""
+
+    if lease.campaign_version == "v1":
+        if lease.v2_private_scenario_deadline_seconds is not None:
+            raise ValueError("v1 qualification lease must not carry a v2 scenario deadline")
+        return
+    if (
+        lease.campaign_version != "v2"
+        or lease.v2_private_scenario_deadline_seconds != 600
+    ):
+        raise ValueError("v2 scored qualification lease requires a scenario deadline")
+    argv.extend(
+        (
+            "--campaign-version",
+            "v2",
+            "--v2-private-scenario-deadline-seconds",
+            str(lease.v2_private_scenario_deadline_seconds),
+        )
+    )
+
+
 def _variant(lease: RuntimeLease, treatment: str) -> str:
     return f"{lease.cache_lane}-pair{lease.pair_index}-{treatment}-{lease.agentic_set}"
 
@@ -235,6 +259,8 @@ def main(
     )
     if advance.kind in {"stage_completed", "campaign_passed"}:
         return 0
+    if advance.kind == "campaign_scored_complete":
+        return 3
     return 2 if advance.kind == "restart_required" else 1
 
 

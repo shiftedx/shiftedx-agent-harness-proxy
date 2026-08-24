@@ -26,6 +26,7 @@ def _config(tmp_path) -> QualificationObserverConfig:
         host="127.0.0.1",
         port=18092,
         instance_sha256=hashlib.sha256(b"observer-instance").hexdigest(),
+        timeout_seconds=60.0,
     )
 
 
@@ -149,7 +150,11 @@ async def test_observer_forwards_only_authorization_and_keeps_chat_payload_out_o
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://observer") as client:
             chat = await client.post(
                 "/v1/chat/completions",
-                headers={"Authorization": "Bearer private-forwarded-token", "X-Unsafe": "do-not-forward"},
+                headers={
+                    "Authorization": "Bearer private-forwarded-token",
+                    "X-Unsafe": "do-not-forward",
+                    "X-Request-ID": "shiftedx-qualification-observer-test",
+                },
                 json={"model": "model", "messages": [{"role": "user", "content": "private prompt"}]},
             )
             models = await client.get("/v1/models", headers={"Authorization": "Bearer private-forwarded-token"})
@@ -165,6 +170,8 @@ async def test_observer_forwards_only_authorization_and_keeps_chat_payload_out_o
     assert "private model output" not in serialized
     assert "private_diagnostic" not in serialized
     row = json.loads(serialized)
+    assert row["correlation_id_sha256"] == hashlib.sha256(b"shiftedx-qualification-observer-test").hexdigest()
+    assert "shiftedx-qualification-observer-test" not in serialized
     assert row["response"]["status_code"] == 200
     assert row["response"]["cache"]["request_session_bank_bypass"] is True
 
@@ -187,12 +194,14 @@ async def test_observer_records_null_response_evidence_before_transport_error(tm
             with pytest.raises(httpx.ConnectError):
                 await client.post(
                     "/v1/chat/completions",
+                    headers={"X-Request-ID": "shiftedx-qualification-failure"},
                     json={"model": "model", "messages": [{"role": "user", "content": "private"}]},
                 )
         await app.state.client.aclose()
 
     row = json.loads(config.ledger.read_text(encoding="utf-8"))
     assert row["response"] == {"status_code": None, "cache": None}
+    assert row["correlation_id_sha256"] == hashlib.sha256(b"shiftedx-qualification-failure").hexdigest()
     assert "private transport detail" not in config.ledger.read_text(encoding="utf-8")
 
 
@@ -219,12 +228,14 @@ async def test_observer_records_one_null_response_before_cancellation(tmp_path) 
             with pytest.raises(asyncio.CancelledError):
                 await client.post(
                     "/v1/chat/completions",
+                    headers={"X-Request-ID": "shiftedx-qualification-cancel"},
                     json={"model": "model", "messages": [{"role": "user", "content": "private"}]},
                 )
 
     rows = [json.loads(line) for line in config.ledger.read_text(encoding="utf-8").splitlines()]
     assert len(rows) == 1
     assert rows[0]["response"] == {"status_code": None, "cache": None}
+    assert rows[0]["correlation_id_sha256"] == hashlib.sha256(b"shiftedx-qualification-cancel").hexdigest()
 
 
 def test_observer_import_is_configuration_isolated_until_explicit_load(monkeypatch) -> None:
@@ -233,6 +244,7 @@ def test_observer_import_is_configuration_isolated_until_explicit_load(monkeypat
     monkeypatch.delenv("QUALIFICATION_OBSERVER_HOST", raising=False)
     monkeypatch.delenv("QUALIFICATION_OBSERVER_PORT", raising=False)
     monkeypatch.delenv("QUALIFICATION_OBSERVER_INSTANCE_SHA256", raising=False)
+    monkeypatch.delenv("QUALIFICATION_OBSERVER_TIMEOUT_SECONDS", raising=False)
 
     with pytest.raises(QualificationObserverConfigurationError, match="configuration_invalid"):
         load_observer_config()
@@ -253,6 +265,7 @@ def test_observer_import_is_configuration_isolated_until_explicit_load(monkeypat
         {"QUALIFICATION_OBSERVER_HOST": "0.0." + "0.0"},
         {"QUALIFICATION_OBSERVER_PORT": "0"},
         {"QUALIFICATION_OBSERVER_INSTANCE_SHA256": "not-a-hash"},
+        {"QUALIFICATION_OBSERVER_TIMEOUT_SECONDS": "0"},
     ],
 )
 def test_observer_rejects_noncanonical_private_wiring(tmp_path, override) -> None:
@@ -263,6 +276,7 @@ def test_observer_rejects_noncanonical_private_wiring(tmp_path, override) -> Non
         "QUALIFICATION_OBSERVER_HOST": "127.0.0.1",
         "QUALIFICATION_OBSERVER_PORT": "18092",
         "QUALIFICATION_OBSERVER_INSTANCE_SHA256": "a" * 64,
+        "QUALIFICATION_OBSERVER_TIMEOUT_SECONDS": "60",
         **override,
     }
 
@@ -282,6 +296,7 @@ def test_observer_never_reuses_or_overwrites_a_ledger(tmp_path) -> None:
                 "QUALIFICATION_OBSERVER_HOST": config.host,
                 "QUALIFICATION_OBSERVER_PORT": str(config.port),
                 "QUALIFICATION_OBSERVER_INSTANCE_SHA256": config.instance_sha256,
+                "QUALIFICATION_OBSERVER_TIMEOUT_SECONDS": str(config.timeout_seconds),
             }
         )
 

@@ -20,6 +20,7 @@ class SchemaContract:
     keys: tuple[str, ...] | None
     types: dict[str, str]
     strict_primitive_object: bool = False
+    enforce_failed_execution_claim: bool = False
 
 
 @dataclass(frozen=True)
@@ -132,10 +133,14 @@ def response_schema_contract(response_format: Any) -> SchemaContract:
         if type_name not in _PRIMITIVE_TYPES:
             return SchemaContract(None, {})
         types[key] = type_name
+    strict = _is_strict_primitive_object_schema(wrapper, schema, properties)
     return SchemaContract(
         tuple(properties),
         types,
-        _is_strict_primitive_object_schema(wrapper, schema, properties),
+        strict,
+        strict
+        and wrapper.get("name") == "shiftedx_recovery_result_v1"
+        and types.get("failed_executions") == "integer",
     )
 
 
@@ -203,6 +208,7 @@ def reconstruct(
         available_tools=available_tools,
         required_json_keys=contract.keys,
         required_json_types=contract.types,
+        enforce_failed_execution_claim=contract.enforce_failed_execution_claim,
         require_receipt=require_receipt,
         roles=roles,
     )

@@ -15,7 +15,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .cache_policy import CacheCapabilityMode, cache_namespace_field_names
 from .core import HARNESS_PROFILE, ToolRoles
-from .fast_path import FastPathMode
 from .provider_capabilities import ToolResponseCapabilityMode
 
 _HTTP_BEARER_TOKEN = re.compile(r"[A-Za-z0-9\-._~+/]+={0,}")
@@ -45,6 +44,7 @@ class Settings(BaseSettings):
     mutation_tools: str | None = None
     verification_tools: str | None = None
     investigation_tools: str | None = None
+    denied_tools: str | None = None
     max_internal_retries: int = Field(default=4, ge=0, le=20)
     max_upstream_calls: int = Field(default=7, ge=1, le=25)
     upstream_timeout_seconds: float = Field(default=120.0, gt=0, le=3600)
@@ -65,7 +65,6 @@ class Settings(BaseSettings):
     telemetry_enabled: bool = False
     metrics_enabled: bool = True
     allow_harness_opt_out: bool = False
-    intervention_fast_path_mode: FastPathMode = "disabled"
     log_level: str = "INFO"
     cors_allow_origins: str | None = None
     require_receipt_when_tools_present: bool = True
@@ -131,10 +130,6 @@ class Settings(BaseSettings):
             raise ValueError(
                 "TRUSTED_POLICY_EXTENSION_API_KEYS must not include the ordinary PROXY_API_KEY"
             )
-        if self.intervention_fast_path_mode == "enabled":
-            raise ValueError(
-                "INTERVENTION_FAST_PATH_MODE=enabled requires an immutable signed promotion authority"
-            )
         return self
 
     @field_validator("log_level")
@@ -160,6 +155,10 @@ class Settings(BaseSettings):
     def cache_namespace_fields(self) -> frozenset[str]:
         """Return the process-fixed normalized client namespace denylist."""
         return cache_namespace_field_names(self.upstream_cache_namespace_fields)
+
+    def denied_tool_names(self) -> frozenset[str]:
+        """Return the process-fixed tool names that the harness must withhold."""
+        return frozenset(_csv(self.denied_tools)) if self.denied_tools is not None else frozenset()
 
     def principal_budget_key(self, credential: str) -> str:
         """Return an opaque, process-derived budget key without retaining the credential."""

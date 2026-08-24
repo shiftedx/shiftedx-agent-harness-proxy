@@ -7,7 +7,9 @@ does not retain request bodies, credentials, model output, or endpoint data.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -41,6 +43,7 @@ class QualificationObserverConfig:
     host: str
     port: int
     instance_sha256: str
+    timeout_seconds: float
 
 
 @dataclass
@@ -58,10 +61,11 @@ def load_observer_config(env: Mapping[str, str] | None = None) -> QualificationO
     host = source.get("QUALIFICATION_OBSERVER_HOST", "")
     port = _port(source.get("QUALIFICATION_OBSERVER_PORT", ""))
     instance_sha256 = source.get("QUALIFICATION_OBSERVER_INSTANCE_SHA256", "")
+    timeout_seconds = _timeout_seconds(source.get("QUALIFICATION_OBSERVER_TIMEOUT_SECONDS", ""))
     if not ledger_value:
         raise QualificationObserverConfigurationError("qualification_observer_configuration_invalid")
     ledger = Path(ledger_value)
-    config = QualificationObserverConfig(upstream_url, ledger, host, port, instance_sha256)
+    config = QualificationObserverConfig(upstream_url, ledger, host, port, instance_sha256, timeout_seconds)
     _validate_observer_config(config)
     return config
 
@@ -75,7 +79,7 @@ def create_observer_app(config: QualificationObserverConfig) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        app.state.client = httpx.AsyncClient(timeout=httpx.Timeout(600.0), trust_env=False)
+        app.state.client = httpx.AsyncClient(timeout=httpx.Timeout(config.timeout_seconds), trust_env=False)
         try:
             yield
         finally:
@@ -90,6 +94,7 @@ def create_observer_app(config: QualificationObserverConfig) -> FastAPI:
 
     @app.post("/v1/chat/completions")
     async def chat(request: Request) -> Response:
+        correlation_id_sha256 = _correlation_id_sha256(request)
         try:
             payload = await request.json()
         except Exception:
@@ -103,7 +108,13 @@ def create_observer_app(config: QualificationObserverConfig) -> FastAPI:
                 headers=_forwarded_headers(request),
             )
         except BaseException:
-            _append_observation(state, payload, status_code=None, response_payload=None)
+            _append_observation(
+                state,
+                payload,
+                status_code=None,
+                response_payload=None,
+                correlation_id_sha256=correlation_id_sha256,
+            )
             raise
         try:
             response_payload: Any = response.json()
@@ -114,6 +125,7 @@ def create_observer_app(config: QualificationObserverConfig) -> FastAPI:
             payload,
             status_code=response.status_code,
             response_payload=response_payload,
+            correlation_id_sha256=correlation_id_sha256,
         )
         return Response(
             response.content,
@@ -162,12 +174,14 @@ def _append_observation(
     *,
     status_code: int | None,
     response_payload: Any,
+    correlation_id_sha256: str | None = None,
 ) -> None:
     record = model_boundary_record(
         payload,
         sequence=state.next_sequence,
         status_code=status_code,
         response=response_payload,
+        correlation_id_sha256=correlation_id_sha256,
     ).to_dict()
     serialized = (json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
     descriptor: int | None = None
@@ -247,6 +261,9 @@ def _validate_observer_config(config: QualificationObserverConfig) -> None:
         or isinstance(config.port, bool)
         or not 1 <= config.port <= 65535
         or _SHA256.fullmatch(config.instance_sha256) is None
+        or not isinstance(config.timeout_seconds, float)
+        or not math.isfinite(config.timeout_seconds)
+        or config.timeout_seconds <= 0
     ):
         raise QualificationObserverConfigurationError("qualification_observer_configuration_invalid")
     try:
@@ -272,9 +289,24 @@ def _port(value: str) -> int:
     return port
 
 
+def _timeout_seconds(value: str) -> float:
+    try:
+        timeout = float(value)
+    except ValueError as error:
+        raise QualificationObserverConfigurationError("qualification_observer_configuration_invalid") from error
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise QualificationObserverConfigurationError("qualification_observer_configuration_invalid")
+    return timeout
+
+
 def _forwarded_headers(request: Request) -> dict[str, str]:
     authorization = request.headers.get("authorization")
     return {"authorization": authorization} if authorization is not None else {}
+
+
+def _correlation_id_sha256(request: Request) -> str | None:
+    correlation_id = request.headers.get("x-request-id")
+    return None if correlation_id is None else hashlib.sha256(correlation_id.encode("utf-8")).hexdigest()
 
 
 if __name__ == "__main__":

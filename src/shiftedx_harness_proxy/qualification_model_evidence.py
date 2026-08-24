@@ -33,6 +33,12 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 
 EvidenceStage: TypeAlias = Literal["preflight", "score-direct", "score-proxy"]
 CacheLane: TypeAlias = Literal["preflight", "cold", "warm-prefix"]
+SamplerProfile: TypeAlias = Literal["corrected-parity-v1", "historical-aeon-v1", "ornith-productization-v1"]
+_SAMPLER_CACHE_FLAGS: dict[SamplerProfile, str] = {
+    "corrected-parity-v1": "--ssd-session-cache=off",
+    "historical-aeon-v1": "--ssd-session-cache=off",
+    "ornith-productization-v1": "--ssd-session-cache=on",
+}
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _HTTP_SAFE_TOKEN = re.compile(r"^[A-Za-z0-9\-._~+/=]{1,8192}$")
@@ -226,6 +232,7 @@ class ModelEvidenceContract:
     health_contract_sha256: str
     settings_contract_sha256: str
     cache_lane: CacheLane
+    sampler_profile: SamplerProfile = "corrected-parity-v1"
 
 
 @dataclass(frozen=True)
@@ -771,6 +778,7 @@ def _validate_contract(contract: ModelEvidenceContract) -> _ValidatedContract:
             or _SHA256.fullmatch(contract.health_contract_sha256) is None
             or _SHA256.fullmatch(contract.settings_contract_sha256) is None
             or contract.cache_lane not in {"preflight", "cold", "warm-prefix"}
+            or contract.sampler_profile not in _SAMPLER_CACHE_FLAGS
             or not _is_loopback_host(contract.host)
             or not _positive_port(contract.port)
         ):
@@ -796,7 +804,11 @@ def _validate_contract(contract: ModelEvidenceContract) -> _ValidatedContract:
             "health_contract_sha256": contract.health_contract_sha256,
             "settings_contract_sha256": contract.settings_contract_sha256,
         }
-        safe_contract = {**safe_identity, "cache_lane": contract.cache_lane}
+        safe_contract = {
+            **safe_identity,
+            "cache_lane": contract.cache_lane,
+            "sampler_profile": contract.sampler_profile,
+        }
         return _ValidatedContract(
             contract_sha256=_canonical_sha256(safe_contract),
             identity_sha256=_canonical_sha256(safe_identity),
@@ -849,7 +861,7 @@ def _validate_launch_semantics(contract: ModelEvidenceContract) -> None:
     expected = {
         f"--host={contract.host}",
         f"--port={contract.port}",
-        "--ssd-session-cache=off",
+        _SAMPLER_CACHE_FLAGS.get(contract.sampler_profile),
     }
     if not expected.issubset(set(flags)):
         raise ModelEvidenceFailure("model_contract_invalid")

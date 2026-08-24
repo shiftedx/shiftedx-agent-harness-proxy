@@ -6,10 +6,12 @@ import hashlib
 import importlib.util
 import io
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
+import time
 import types
 from dataclasses import replace
 from email.message import Message
@@ -35,6 +37,7 @@ from shiftedx_harness_proxy.qualification_reconciliation import (
     ReconciliationFailure,
     read_request_accounting_ledger,
 )
+from shiftedx_harness_proxy.qualification_timing import finalize_timing_evidence
 
 _RUN_MANIFEST_SHA256 = "1" * 64
 
@@ -545,6 +548,86 @@ def test_phase_planner_splits_tools_and_terminal_schema(monkeypatch):
     assert payload["max_tokens"] == 1024
 
 
+def test_phase_planner_skips_acquisition_for_none_with_tools_and_strict_schema(monkeypatch):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    payload = runner.request_payload(scenario, model="model", proxy_policy=False)
+    payload["messages"] += [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "synthetic tool completed"},
+    ]
+    payload["tool_choice"] = "none"
+
+    assert runner.PhasePlanner().phases_for(payload) == ("finalization",)
+
+
+@pytest.mark.parametrize(
+    "messages",
+    (
+        [],
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}],
+            }
+        ],
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "error: failed"},
+        ],
+    ),
+)
+def test_phase_planner_keeps_unsafe_none_with_tools_in_acquisition(monkeypatch, messages):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    payload = runner.request_payload(scenario, model="model", proxy_policy=False)
+    payload["messages"] += messages
+    payload["tool_choice"] = "none"
+
+    assert runner.PhasePlanner().phases_for(payload) == ("acquisition", "finalization")
+
+
+def test_direct_compatibility_client_dispatches_safe_none_continuation_to_finalization(monkeypatch):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    payload = runner.request_payload(scenario, model="model", proxy_policy=False)
+    payload["messages"] += [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "synthetic tool completed"},
+    ]
+    payload["tool_choice"] = "none"
+
+    class DirectModel:
+        def __init__(self):
+            self.payloads = []
+
+        def complete(self, request, *, stream=False):
+            assert stream is False
+            self.payloads.append(copy.deepcopy(request))
+            return {"content": '{"status":"passed"}', "tool_calls": []}
+
+    upstream = DirectModel()
+    client = runner.CompatibilityClient(upstream, arm="direct", scenario_order=[scenario.case_id], proxy_policy=False)
+    client.complete(payload)
+
+    assert len(upstream.payloads) == 1
+    assert "tools" not in upstream.payloads[0]
+    assert upstream.payloads[0]["response_format"] == payload["response_format"]
+
+
 @pytest.mark.parametrize("arm", ("direct", "proxy"))
 def test_preflight_post_tool_continuation_disables_additional_tool_calls_for_both_arms(monkeypatch, arm):
     runner = load_runner(monkeypatch)
@@ -588,41 +671,59 @@ def test_preflight_post_tool_continuation_disables_additional_tool_calls_for_bot
     }
 
 
-def test_historical_aeon_profile_binds_payload_fingerprint_prime_and_score_gate(monkeypatch):
-    """The known-good AEON sampler is a named, end-to-end qualification contract."""
-
+@pytest.mark.parametrize(
+    ("profile", "expected_sampler", "different_profile"),
+    [
+        (
+            "historical-aeon-v1",
+            {
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": 20,
+                "thinking": {"enabled": True},
+                "reasoning_effort": "medium",
+                "max_tokens": 1024,
+            },
+            "corrected-parity-v1",
+        ),
+        (
+            "ornith-productization-v1",
+            {
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": 20,
+                "thinking": {"enabled": True},
+                "reasoning_effort": "medium",
+                "max_tokens": 8192,
+            },
+            "historical-aeon-v1",
+        ),
+    ],
+)
+def test_named_sampler_profile_binds_payload_fingerprint_prime_and_score_gate(
+    monkeypatch, profile, expected_sampler, different_profile
+):
     runner = load_runner(monkeypatch)
     scenario = runner.scenario_set("expanded")[0]
     order = [scenario.case_id]
 
-    historical = runner.request_payload(
+    payload = runner.request_payload(
         scenario,
         model="model",
         proxy_policy=False,
-        sampler_profile="historical-aeon-v1",
+        sampler_profile=profile,
     )
-    corrected = runner.request_payload(scenario, model="model", proxy_policy=False)
     sampler_keys = ("temperature", "top_p", "top_k", "thinking", "reasoning_effort", "max_tokens")
-    assert {key: historical[key] for key in sampler_keys} == {
-        "temperature": 1.0,
-        "top_p": 0.95,
-        "top_k": 20,
-        "thinking": {"enabled": True},
-        "reasoning_effort": "medium",
-        "max_tokens": 1024,
-    }
-    historical_digest = runner.contract_fingerprints(historical, order, policy_delta={})["downstream"]["digest"]
-    corrected_digest = runner.contract_fingerprints(corrected, order, policy_delta={})["downstream"]["digest"]
-    assert historical_digest != corrected_digest
+    assert {key: payload[key] for key in sampler_keys} == expected_sampler
 
-    prime = runner.cache_prime_payload(scenario, model="model", arm="direct", sampler_profile="historical-aeon-v1")
-    first_scored = runner.PhasePlanner().plan(historical, phase="acquisition")
+    prime = runner.cache_prime_payload(scenario, model="model", arm="direct", sampler_profile=profile)
+    first_scored = runner.PhasePlanner().plan(payload, phase="acquisition")
     assert (
         runner.model_boundary_fingerprint(prime, scenario_order=order).digest
         == runner.model_boundary_fingerprint(first_scored, scenario_order=order).digest
     )
 
-    digests = runner._qualification_contract_digests("model", [scenario], order, "a" * 64, "historical-aeon-v1")
+    digests = runner._qualification_contract_digests("model", [scenario], order, "a" * 64, profile)
     expected = runner.qualification_contract_digest(
         [
             runner.request_payload(
@@ -630,7 +731,7 @@ def test_historical_aeon_profile_binds_payload_fingerprint_prime_and_score_gate(
                 model="model",
                 proxy_policy=False,
                 cache_mode="bypass",
-                sampler_profile="historical-aeon-v1",
+                sampler_profile=profile,
             )
         ],
         order,
@@ -638,12 +739,9 @@ def test_historical_aeon_profile_binds_payload_fingerprint_prime_and_score_gate(
         run_manifest_sha256="a" * 64,
     )
     assert digests["cold"]["direct"] == expected
-    assert (
-        digests["cold"]["direct"]
-        != runner._qualification_contract_digests("model", [scenario], order, "a" * 64, "corrected-parity-v1")["cold"][
-            "direct"
-        ]
-    )
+    assert digests["cold"]["direct"] != runner._qualification_contract_digests(
+        "model", [scenario], order, "a" * 64, different_profile
+    )["cold"]["direct"]
 
 
 def test_contract_fingerprint_reports_accidental_sampler_mismatch(monkeypatch):
@@ -1219,8 +1317,88 @@ def test_proxy_request_accounting_is_exactly_once_after_post_response_validation
     assert accounting.records[0].blocked_stall_count == 2
 
 
+def test_proxy_request_correlation_never_attributes_a_late_observer_row_to_the_next_turn(
+    monkeypatch, tmp_path
+):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    observer_path = tmp_path / "observer.jsonl"
+    payload = runner.request_payload(scenario, model="model", proxy_policy=True)
+    observed = runner.PhasePlanner().plan(payload, phase="acquisition")
+    observed["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
+    correlations = ("a" * 64, "b" * 64)
+
+    class DelayedProxy:
+        def __init__(self):
+            self.calls = 0
+            self.correlation_id_sha256 = None
+
+        def prepare_qualification_request(self):
+            self.correlation_id_sha256 = correlations[self.calls]
+            return self.correlation_id_sha256
+
+        def qualification_correlation_id_sha256(self):
+            return self.correlation_id_sha256
+
+        def qualification_request_outcome(self):
+            return "deadline" if self.calls == 1 else "succeeded"
+
+        def complete(self, _payload, *, stream=False):
+            assert stream is False
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError("first request timed out")
+            _append_observer_record(
+                runner,
+                observer_path,
+                observed,
+                1,
+                status_code=None,
+                correlation_id_sha256=correlations[0],
+            )
+            _append_observer_record(
+                runner,
+                observer_path,
+                observed,
+                2,
+                correlation_id_sha256=correlations[1],
+            )
+            return {
+                "content": "",
+                "tool_calls": [],
+                runner.PROXY_RESPONSE_ACCOUNTING: {
+                    "upstream_calls": 1,
+                    "corrections": 0,
+                    "blocked_duplicates": 0,
+                    "blocked_stalls": 0,
+                },
+            }
+
+    accounting = runner.ProxyRequestAccounting()
+    observer = runner.ModelBoundaryObserverCursor(observer_path, [scenario.case_id])
+    client = runner.CompatibilityClient(
+        DelayedProxy(),
+        arm="proxy",
+        scenario_order=[scenario.case_id],
+        proxy_policy=True,
+        observer=observer,
+        request_accounting=accounting,
+    )
+
+    with pytest.raises(TimeoutError, match="first request timed out"):
+        client.complete(payload)
+    client.complete(payload)
+
+    assert [record.attempt_count for record in accounting.records] == [0, 1]
+    assert [len(records) for records in observer.record_turns] == [0, 1]
+    assert observer.record_turns[1][0].correlation_id_sha256 == correlations[1]
+    with pytest.raises(runner.PreflightFailure, match="unconsumed records"):
+        observer.require_drained()
+
+
 def test_proxy_http_client_projects_only_exact_safe_telemetry_headers(monkeypatch) -> None:
     runner = load_runner(monkeypatch)
+    requests = []
     headers = Message()
     headers["X-Shiftedx-Upstream-Calls"] = "3"
     headers["X-Shiftedx-Corrections"] = "1"
@@ -1244,11 +1422,15 @@ def test_proxy_http_client_projects_only_exact_safe_telemetry_headers(monkeypatc
         def geturl(self):
             return "http://proxy.invalid/v1/chat/completions"
 
-    monkeypatch.setattr(runner._NO_PROXY_OPENER, "open", lambda *_args, **_kwargs: Response())
+    def open_request(request, **_kwargs):
+        requests.append(request)
+        return Response()
+
+    monkeypatch.setattr(runner._NO_PROXY_OPENER, "open", open_request)
     client = runner.ProjectionAwareOpenAIClient("http://proxy.invalid/v1")
     client.capture_proxy_accounting = True
     client.timeout_s = 1.0
-    client._request = lambda _payload: SimpleNamespace(full_url="http://proxy.invalid/v1/chat/completions")
+    client._request = lambda _payload: runner.urllib.request.Request("http://proxy.invalid/v1/chat/completions")
 
     response = client.complete({"model": "model"})
 
@@ -1259,6 +1441,9 @@ def test_proxy_http_client_projects_only_exact_safe_telemetry_headers(monkeypatc
         "blocked_stalls": 0,
     }
     assert "must-not-survive" not in json.dumps(response)
+    correlation_id = requests[0].get_header("X-request-id")
+    assert correlation_id.startswith("shiftedx-qualification-")
+    assert client.qualification_correlation_id_sha256() == hashlib.sha256(correlation_id.encode()).hexdigest()
 
 
 @pytest.mark.parametrize("mutation", ["missing", "duplicate", "nonnumeric", "negative", "leading-zero"])
@@ -1327,7 +1512,7 @@ def test_proxy_http_client_accepts_canonical_zero_header_local_projection(monkey
     client = runner.ProjectionAwareOpenAIClient("http://proxy.invalid/v1")
     client.capture_proxy_accounting = True
     client.timeout_s = 1.0
-    client._request = lambda _payload: SimpleNamespace(full_url="http://proxy.invalid/v1/chat/completions")
+    client._request = lambda _payload: runner.urllib.request.Request("http://proxy.invalid/v1/chat/completions")
 
     response = client.complete({"model": "model"})
 
@@ -1365,7 +1550,7 @@ def test_proxy_http_client_rejects_oversized_or_redirected_responses(monkeypatch
     client = runner.ProjectionAwareOpenAIClient("http://proxy.invalid/v1")
     client.capture_proxy_accounting = True
     client.timeout_s = 1.0
-    client._request = lambda _payload: SimpleNamespace(full_url="http://proxy.invalid/v1/chat/completions")
+    client._request = lambda _payload: runner.urllib.request.Request("http://proxy.invalid/v1/chat/completions")
     monkeypatch.setattr(runner._NO_PROXY_OPENER, "open", lambda *_args, **_kwargs: Response(redirected=True))
     with pytest.raises(runner.PreflightFailure, match="final URL differed"):
         client.complete({"model": "model"})
@@ -1397,7 +1582,7 @@ def test_proxy_http_client_suppresses_private_malformed_body_and_transport_cause
     client = runner.ProjectionAwareOpenAIClient("http://proxy.invalid/v1")
     client.capture_proxy_accounting = True
     client.timeout_s = 1.0
-    client._request = lambda _payload: SimpleNamespace(full_url="http://proxy.invalid/v1/chat/completions")
+    client._request = lambda _payload: runner.urllib.request.Request("http://proxy.invalid/v1/chat/completions")
     monkeypatch.setattr(runner._NO_PROXY_OPENER, "open", lambda *_args, **_kwargs: MalformedResponse())
 
     with pytest.raises(runner.PreflightFailure) as malformed:
@@ -1419,20 +1604,28 @@ def test_proxy_http_client_suppresses_private_malformed_body_and_transport_cause
     assert private_marker not in str(transport.value)
 
 
-def test_proxy_http_504_is_body_free_and_classified_as_deadline(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("body", "outcome"),
+    [
+        (b'{"error":{"code":"request_deadline_exceeded"}}', "deadline"),
+        (b'{"error":{"code":"upstream_http_error"}}', "failed"),
+        (b"private malformed response body and credential", "failed"),
+    ],
+)
+def test_proxy_http_504_is_body_free_and_uses_the_safe_error_code_for_outcome(monkeypatch, body, outcome) -> None:
     runner = load_runner(monkeypatch)
     failure = runner.urllib.error.HTTPError(
         "http://proxy.invalid/v1/chat/completions",
         504,
         "private reason",
         Message(),
-        io.BytesIO(b"private response body and credential"),
+        io.BytesIO(body),
     )
     monkeypatch.setattr(runner._NO_PROXY_OPENER, "open", lambda *_args, **_kwargs: (_ for _ in ()).throw(failure))
     client = runner.ProjectionAwareOpenAIClient("http://proxy.invalid/v1")
     client.capture_proxy_accounting = True
     client.timeout_s = 1.0
-    client._request = lambda _payload: SimpleNamespace(full_url="http://proxy.invalid/v1/chat/completions")
+    client._request = lambda _payload: runner.urllib.request.Request("http://proxy.invalid/v1/chat/completions")
 
     with pytest.raises(runner.ProxyHTTPFailure) as raised:
         client.complete({"model": "model"})
@@ -1440,9 +1633,10 @@ def test_proxy_http_504_is_body_free_and_classified_as_deadline(monkeypatch) -> 
     assert raised.value.status_code == 504
     assert raised.value.__cause__ is None
     assert "private" not in str(raised.value)
+    assert client.qualification_request_outcome() == outcome
     accounting = runner.ProxyRequestAccounting()
     accounting.record_failure((), raised.value)
-    assert accounting.records[0].outcome == "deadline"
+    assert accounting.records[0].outcome == outcome
 
 
 def test_proxy_request_ledger_is_exact_private_atomic_and_no_clobber(monkeypatch, tmp_path) -> None:
@@ -1765,6 +1959,9 @@ def test_provisional_client_timing_records_safe_matching_digests_and_terminal_ou
             _append_observer_record(runner, observer_path, observed, 1)
             raise TimeoutError("private deadline")
 
+        def qualification_correlation_id_sha256(self):
+            return "c" * 64
+
     clock = iter((100, 180))
     monkeypatch.setattr(runner.time, "perf_counter_ns", lambda: next(clock))
     ledger = runner.ProvisionalClientTimingLedger(cache_lane="warm-prefix")
@@ -1792,6 +1989,7 @@ def test_provisional_client_timing_records_safe_matching_digests_and_terminal_ou
             observer_record_count=1,
             direct_attempt_wall_ns=(),
             downstream_request_sha256=runner.downstream_request_sha256(direct_payload),
+            correlation_id_sha256="c" * 64,
         ),
     )
     output = tmp_path / "provisional.jsonl"
@@ -1803,6 +2001,42 @@ def test_provisional_client_timing_records_safe_matching_digests_and_terminal_ou
     assert output.stat().st_mode & 0o777 == 0o600
     with pytest.raises(runner.ProvisionalTimingLedgerFailure, match="provisional_request_ledger_exists"):
         runner.write_provisional_client_timing_ledger(output, ledger.records)
+
+
+def test_proxy_evidence_uses_observed_http_outcome_after_client_validation_failure(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    observer_path = tmp_path / "observer.jsonl"
+    payload = runner.request_payload(scenario, model="model", proxy_policy=True)
+    observed = runner.PhasePlanner().plan(payload, phase="acquisition")
+    observed["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
+
+    class Proxy:
+        def complete(self, _payload, *, stream=False):
+            assert stream is False
+            _append_observer_record(runner, observer_path, observed, 1)
+            raise runner.PreflightFailure("post-response validation failed")
+
+        def qualification_request_outcome(self):
+            return "succeeded"
+
+    accounting = runner.ProxyRequestAccounting()
+    ledger = runner.ProvisionalClientTimingLedger(cache_lane="cold")
+    client = runner.CompatibilityClient(
+        Proxy(),
+        arm="proxy",
+        scenario_order=[scenario.case_id],
+        proxy_policy=True,
+        observer=runner.ModelBoundaryObserverCursor(observer_path, [scenario.case_id]),
+        request_accounting=accounting,
+        provisional_timing=ledger,
+    )
+
+    with pytest.raises(runner.PreflightFailure, match="post-response validation failed"):
+        client.complete(payload)
+
+    assert accounting.records[0].outcome == "succeeded"
+    assert ledger.records[0].outcome == "succeeded"
 
 
 def test_provisional_client_timing_records_success_failure_and_cancellation_in_invocation_order(monkeypatch):
@@ -1887,6 +2121,85 @@ def test_provisional_direct_timing_uses_the_attempt_slice_for_a_two_phase_logica
     assert ledger.records[0].direct_attempt_wall_ns == (10, 10)
 
 
+def test_provisional_direct_timing_uses_global_attempt_ranges_across_client_instances(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    payload = runner._preflight_payload(scenario, model="model", proxy_policy=False, no_tools=True)
+
+    class Direct:
+        def complete(self, _payload, *, stream=False):
+            assert stream is False
+            return {"content": '{"status":"passed"}', "tool_calls": []}
+
+    ledger = runner.ProvisionalClientTimingLedger(cache_lane="cold")
+    clients = [
+        runner.CompatibilityClient(
+            Direct(),
+            arm="direct",
+            scenario_order=[scenario.case_id],
+            proxy_policy=False,
+            provisional_timing=ledger,
+        )
+        for _ in range(2)
+    ]
+    for client in clients:
+        client.complete(payload)
+
+    assert [(record.observer_sequence_start, record.observer_sequence_end) for record in ledger.records] == [
+        (1, 1),
+        (2, 2),
+    ]
+    attempt_ledger = tmp_path / "direct-attempts.jsonl"
+    runner.write_model_boundary_attempt_ledger(
+        attempt_ledger,
+        [record for client in clients for record in client.attempt_records],
+    )
+    globally_resequenced = [json.loads(line) for line in attempt_ledger.read_text(encoding="utf-8").splitlines()]
+    assert [record["sequence"] for record in globally_resequenced] == [1, 2]
+
+    private_parent = tmp_path / "private"
+    private_parent.mkdir(mode=0o700)
+    private_parent.chmod(0o700)
+    provisional = private_parent / "direct-provisional.jsonl"
+    timing = tmp_path / "direct-timing.jsonl"
+    runner.write_provisional_client_timing_ledger(provisional, ledger.records)
+    rows = finalize_timing_evidence(
+        arm="direct",
+        cache_lane="cold",
+        provisional_client_path=provisional,
+        timing_path=timing,
+        observer_records=globally_resequenced,
+    )
+
+    assert [row["sequence"] for row in rows] == [1, 2]
+    assert [
+        (record.observer_sequence_start, record.observer_sequence_end) for record in ledger.records
+    ] == [(1, 1), (2, 2)]
+    assert len(timing.read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_provisional_direct_timing_rejects_a_noncontiguous_local_attempt_slice(monkeypatch):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+    payload = runner._preflight_payload(scenario, model="model", proxy_policy=False, no_tools=True)
+    response = {"content": '{"status":"passed"}', "tool_calls": []}
+    first = runner.model_boundary_record(payload, sequence=1, status_code=200, response=response)
+    third = replace(first, sequence=3)
+    ledger = runner.ProvisionalClientTimingLedger(cache_lane="cold")
+
+    with pytest.raises(runner.ProvisionalTimingLedgerFailure, match="provisional_direct_attempt_slice_invalid"):
+        ledger.append(
+            pair_ordinal=ledger.begin(),
+            arm="direct",
+            client_wall_ns=2,
+            outcome="succeeded",
+            observer_records=(first, third),
+            direct_attempt_wall_ns=(1, 1),
+            downstream_request_sha256=runner.downstream_request_sha256(payload),
+            correlation_id_sha256=None,
+        )
+
+
 def test_provisional_timing_writer_requires_a_private_existing_parent_and_safe_bounded_rows(monkeypatch, tmp_path):
     runner = load_runner(monkeypatch)
     private_parent = tmp_path / "private"
@@ -1903,6 +2216,7 @@ def test_provisional_timing_writer_requires_a_private_existing_parent_and_safe_b
         observer_record_count=0,
         direct_attempt_wall_ns=(),
         downstream_request_sha256="a" * 64,
+        correlation_id_sha256=None,
     )
 
     with pytest.raises(runner.ProvisionalTimingLedgerFailure, match="provisional_request_ledger_parent_invalid"):
@@ -2007,6 +2321,280 @@ def test_scored_direct_run_writes_actual_attempt_ledger_atomically(monkeypatch, 
     assert [len(row["direct_attempt_wall_ns"]) for row in provisional_rows] == [1, 1]
 
 
+def _scored_direct_argv(
+    *,
+    output,
+    preflight,
+    source_commit,
+    image_digest,
+    runtime_attestation,
+    preflight_outcome,
+    attempts,
+    provisional,
+    campaign_version: str | None = None,
+    v2_private_scenario_deadline_seconds: str | None = None,
+):
+    argv = [
+        "run_paired_agentic_trial.py",
+        "--base-url",
+        "http://model.invalid/v1",
+        "--model",
+        "model",
+        "--output",
+        str(output),
+        "--variant",
+        "direct",
+        "--preflight-ledger",
+        str(preflight),
+        "--candidate-source-commit",
+        source_commit,
+        "--candidate-image-digest",
+        image_digest,
+        "--run-manifest-sha256",
+        _RUN_MANIFEST_SHA256,
+        "--runtime-attestation",
+        str(runtime_attestation),
+        "--preflight-runtime-outcome",
+        str(preflight_outcome),
+        "--direct-model-attempt-ledger",
+        str(attempts),
+        "--direct-provisional-request-ledger",
+        str(provisional),
+    ]
+    if campaign_version is not None:
+        argv.extend(["--campaign-version", campaign_version])
+    if v2_private_scenario_deadline_seconds is not None:
+        argv.extend(
+            [
+                "--v2-private-scenario-deadline-seconds",
+                v2_private_scenario_deadline_seconds,
+            ]
+        )
+    return argv
+
+
+@pytest.mark.parametrize(
+    ("campaign_version", "deadline", "mode", "message"),
+    [
+        ("v1", "600", (), "requires --campaign-version v2"),
+        ("v2", None, (), "scored v2 requires"),
+        ("v2", "600", ("--paired-preflight",), "valid only for scored"),
+        ("v2", "600", ("--cache-prime-only",), "valid only for scored"),
+    ],
+)
+def test_campaign_version_deadline_contract_rejects_invalid_modes_before_action(
+    monkeypatch, capsys, tmp_path, campaign_version, deadline, mode, message
+):
+    runner = load_runner(monkeypatch)
+    argv = [
+        "run_paired_agentic_trial.py",
+        "--model",
+        "model",
+        "--output",
+        str(tmp_path / "unused.jsonl"),
+        "--variant",
+        "direct",
+        "--campaign-version",
+        campaign_version,
+        *mode,
+    ]
+    if deadline is not None:
+        argv.extend(["--v2-private-scenario-deadline-seconds", deadline])
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(
+        runner,
+        "scenario_set",
+        lambda _agentic_set: (_ for _ in ()).throw(AssertionError("runner action must not start")),
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        runner.main()
+
+    assert message in capsys.readouterr().err
+
+
+def _scored_direct_prerequisites(runner, tmp_path):
+    source_commit = _source_commit()
+    image_digest = "sha256:" + "0" * 64
+    preflight = tmp_path / "preflight.jsonl"
+    runtime_attestation = _write_passing_preflight(runner, preflight, source_commit, image_digest)
+    preflight_outcome, _direct_outcome = _write_passing_scored_prerequisites(
+        tmp_path,
+        preflight,
+        runtime_attestation,
+    )
+    return source_commit, image_digest, preflight, runtime_attestation, preflight_outcome
+
+
+def test_v2_private_scenario_deadline_retains_expiry_and_continues_later_case(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    source_commit, image_digest, preflight, runtime_attestation, preflight_outcome = _scored_direct_prerequisites(
+        runner, tmp_path
+    )
+    output = tmp_path / "scored.jsonl"
+    attempts = tmp_path / "attempts.jsonl"
+    provisional = tmp_path / "provisional.jsonl"
+    started_cases: list[str] = []
+    clients = []
+
+    class DirectClient:
+        def __init__(self, *_args, **_kwargs):
+            self.calls = 0
+            clients.append(self)
+
+        def complete(self, _payload, *, stream=False):
+            self.calls += 1
+            raise AssertionError("scenario deadline must reject this timeout-less upstream before a call")
+
+    def run_cases(*, client, model, output_path, case_id, **_kwargs):
+        started_cases.append(case_id)
+        if case_id == "case-1":
+            scenario = next(item for item in runner.scenario_set("expanded") if item.case_id == case_id)
+            client.complete(runner.request_payload(scenario, model=model, proxy_policy=False))
+        with output_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"case_id": case_id, "passed": True}) + "\n")
+        return [{"case_id": case_id}]
+
+    runner.ProjectionAwareOpenAIClient = DirectClient
+    runner.run_agentic_cases = run_cases
+    monkeypatch.setattr(
+        runner.asyncio,
+        "to_thread",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("background worker is forbidden")),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        _scored_direct_argv(
+            output=output,
+            preflight=preflight,
+            source_commit=source_commit,
+            image_digest=image_digest,
+            runtime_attestation=runtime_attestation,
+            preflight_outcome=preflight_outcome,
+            attempts=attempts,
+            provisional=provisional,
+            campaign_version="v2",
+            v2_private_scenario_deadline_seconds="0.01",
+        ),
+    )
+
+    runner.main()
+
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert [row["case_id"] for row in rows] == ["case-1", "case-2"]
+    assert rows[0]["passed"] is False
+    assert rows[0]["response"] == {"client_error": {"type": "TimeoutError", "http_status": None}}
+    assert math.isfinite(rows[0]["telemetry"]["wall_s"])
+    assert rows[0]["telemetry"]["wall_s"] > 0
+    assert rows[1]["passed"] is True
+    assert started_cases == ["case-1", "case-2"]
+    assert len(clients) == 1
+    assert clients[0].calls == 0
+    serialized = output.read_text(encoding="utf-8")
+    assert "private prompt marker" not in serialized
+    assert "case-1" not in rows[0]["error"]
+
+
+def test_v2_private_scenario_deadline_caps_and_restores_each_upstream_turn(monkeypatch):
+    runner = load_runner(monkeypatch)
+    scenario = runner.scenario_set("expanded")[0]
+
+    class Upstream:
+        def __init__(self):
+            self.timeout_s = 600.0
+            self.timeouts: list[float] = []
+
+        def complete(self, _payload, *, stream=False):
+            assert stream is False
+            self.timeouts.append(self.timeout_s)
+            return _cache_response()
+
+    upstream = Upstream()
+    client = runner.CompatibilityClient(
+        upstream,
+        arm="direct",
+        scenario_order=[scenario.case_id],
+        proxy_policy=False,
+        scenario_deadline_monotonic=time.monotonic() + 1.0,
+    )
+
+    client.complete(runner.request_payload(scenario, model="model", proxy_policy=False))
+
+    assert len(upstream.timeouts) == 2
+    assert all(0 < timeout < 1.0 for timeout in upstream.timeouts)
+    assert upstream.timeout_s == 600.0
+
+
+def test_absent_v2_private_scenario_deadline_preserves_sync_runner_path(monkeypatch, tmp_path):
+    runner = load_runner(monkeypatch)
+    source_commit, image_digest, preflight, runtime_attestation, preflight_outcome = _scored_direct_prerequisites(
+        runner, tmp_path
+    )
+    output = tmp_path / "scored.jsonl"
+    attempts = tmp_path / "attempts.jsonl"
+    provisional = tmp_path / "provisional.jsonl"
+
+    class DirectClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    def run_cases(*, output_path, case_id, **_kwargs):
+        with output_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"case_id": case_id, "passed": True}) + "\n")
+        return [{"case_id": case_id}]
+
+    runner.ProjectionAwareOpenAIClient = DirectClient
+    runner.run_agentic_cases = run_cases
+    monkeypatch.setattr(
+        runner.asyncio,
+        "to_thread",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected")),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        _scored_direct_argv(
+            output=output,
+            preflight=preflight,
+            source_commit=source_commit,
+            image_digest=image_digest,
+            runtime_attestation=runtime_attestation,
+            preflight_outcome=preflight_outcome,
+            attempts=attempts,
+            provisional=provisional,
+        ),
+    )
+
+    runner.main()
+
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert [row["passed"] for row in rows] == [True, True]
+
+
+@pytest.mark.parametrize("invalid", ("0", "-1", "nan", "inf", "not-a-number"))
+def test_v2_private_scenario_deadline_rejects_nonpositive_or_nonfinite_values(monkeypatch, tmp_path, invalid):
+    runner = load_runner(monkeypatch)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_paired_agentic_trial.py",
+            "--model",
+            "model",
+            "--output",
+            str(tmp_path / "unused.jsonl"),
+            "--variant",
+            "direct",
+            "--v2-private-scenario-deadline-seconds",
+            invalid,
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        runner.main()
+
+
 def _cache_response(*, content="", tool_calls=None, bypass=False):
     prompt_tokens = 11
     cached_tokens = 0 if bypass else 5
@@ -2054,11 +2642,7 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
                 observed_payloads = (
                     (planner.plan(payload, phase="acquisition"),)
                     if payload.get("tools") and (should_call_tool or not finalization_requested)
-                    else (
-                        planner.plan(payload, phase="acquisition"),
-                        planner.plan(payload, phase="acquisition"),
-                        planner.plan(payload, phase="finalization"),
-                    )
+                    else (planner.plan(payload, phase="finalization"),)
                     if payload.get("tools")
                     else (payload,)
                 )
@@ -2086,7 +2670,7 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
             if self.is_proxy:
                 response[runner.PROXY_RESPONSE_ACCOUNTING] = {
                     "upstream_calls": len(observed_payloads),
-                    "corrections": int(finalization_requested),
+                    "corrections": 0,
                     "blocked_duplicates": 0,
                     "blocked_stalls": 0,
                 }
@@ -2125,9 +2709,8 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
 
     assert '"status":"passed"' in args.output.read_text()
     direct_attempts = read_model_boundary_observer_records(args.direct_model_attempt_ledger)
-    assert [record.sequence for record in direct_attempts] == [1, 2, 3, 4]
+    assert [record.sequence for record in direct_attempts] == [1, 2, 3]
     assert [record.fields["compatibility"]["phase"] for record in direct_attempts] == [
-        "acquisition",
         "acquisition",
         "finalization",
         "finalization",
@@ -2136,8 +2719,6 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
     assert all(record.cache.request_session_bank_bypass for record in direct_attempts if record.cache)
     proxy_attempts = read_model_boundary_observer_records(observer)
     assert [record.fields["compatibility"]["phase"] for record in proxy_attempts] == [
-        "acquisition",
-        "acquisition",
         "acquisition",
         "finalization",
         "finalization",
@@ -2150,15 +2731,15 @@ def test_end_to_end_fake_paired_proxy_preflight_passes(monkeypatch, tmp_path):
         "direct": 1,
         "proxy": 1,
     }
-    assert tool_records["proxy"]["proxy_phase_counts"] == {"acquisition": 3, "finalization": 1}
-    assert tool_records["proxy"]["proxy_correction_count"] == 1
+    assert tool_records["proxy"]["proxy_phase_counts"] == {"acquisition": 1, "finalization": 1}
+    assert tool_records["proxy"]["proxy_correction_count"] == 0
     proxy_requests = read_request_accounting_ledger(args.proxy_request_ledger)
     assert [record.phase_counts for record in proxy_requests] == [
         {"acquisition": 1, "finalization": 0},
-        {"acquisition": 2, "finalization": 1},
+        {"acquisition": 0, "finalization": 1},
         {"acquisition": 0, "finalization": 1},
     ]
-    assert [record.correction_count for record in proxy_requests] == [0, 1, 0]
+    assert [record.correction_count for record in proxy_requests] == [0, 0, 0]
 
 
 def test_stale_proxy_observer_ledger_is_rejected_without_overwriting_it(monkeypatch, tmp_path):
@@ -3053,13 +3634,27 @@ def test_scored_proxy_rows_use_actual_observer_fingerprints_and_failures_keep_sa
     class ObservingProxy:
         def __init__(self, *_args, **_kwargs):
             self.sequence = 0
+            self.correlation_id_sha256 = None
+
+        def prepare_qualification_request(self):
+            self.correlation_id_sha256 = hashlib.sha256(f"request-{self.sequence + 1}".encode()).hexdigest()
+            return self.correlation_id_sha256
+
+        def qualification_correlation_id_sha256(self):
+            return self.correlation_id_sha256
 
         def complete(self, payload, *, stream=False):
             assert stream is False
             observed = planner.plan(payload, phase="acquisition")
             observed["messages"][0]["content"] += HARNESS_SYSTEM_SUFFIX
             self.sequence += 1
-            _append_observer_record(runner, observer_path, observed, self.sequence)
+            _append_observer_record(
+                runner,
+                observer_path,
+                observed,
+                self.sequence,
+                correlation_id_sha256=self.correlation_id_sha256,
+            )
             return {
                 "content": "",
                 "tool_calls": [{"id": f"call-{self.sequence}"}],
@@ -3171,6 +3766,7 @@ def test_scored_proxy_local_projection_keeps_successful_rows_without_observer_re
 
     def complete(self, _payload, *, stream=False):
         assert stream is False
+        self._pending_qualification_correlation_id = None
         response = self._normalize({LOCAL_PROJECTION_EXTENSION: local_projection_accounting()}, wall_s=0.1, ttft_s=None)
         response[runner.PROXY_RESPONSE_ACCOUNTING] = {
             "upstream_calls": 0,
@@ -3489,7 +4085,16 @@ def _suffix_pair_observations(runner, proxy_system_mutation):
     ]
 
 
-def _append_observer_record(runner, path, payload, sequence, *, cache=True, status_code=200):
+def _append_observer_record(
+    runner,
+    path,
+    payload,
+    sequence,
+    *,
+    cache=True,
+    status_code=200,
+    correlation_id_sha256=None,
+):
     fingerprint = runner.model_boundary_fingerprint(payload)
     bypass = fingerprint.fields["cache_mode_policy"] == "bypass"
     with path.open("a", encoding="utf-8") as handle:
@@ -3500,6 +4105,11 @@ def _append_observer_record(runner, path, payload, sequence, *, cache=True, stat
                     "sequence": sequence,
                     "digest": fingerprint.digest,
                     "fields": fingerprint.fields,
+                    **(
+                        {"correlation_id_sha256": correlation_id_sha256}
+                        if correlation_id_sha256 is not None
+                        else {}
+                    ),
                     "response": {
                         "status_code": status_code,
                         "cache": {

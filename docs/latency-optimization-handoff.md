@@ -235,22 +235,6 @@ Treat cache hit rate as a mechanism metric. The outcome gate remains wall time a
 compatible-prefix reuse or reports a categorical lack of improvement; cold/warm evidence remains
 strict and non-overlapping.
 
-### 5. Add a server-controlled intervention fast path
-
-Use a Sol medium design agent first, then a Terra medium implementation agent.
-
-Define eligibility from trusted server configuration and parsed request/state—not an ordinary
-client opt-out. Candidate fast paths include requests with no tools, no receipt requirement, no
-terminal schema, and no mutation/verification policy work. Preserve authentication, admission,
-deadlines, request limits, upstream isolation, stable errors, and aggregate accounting.
-
-Run shadow classification before enabling it. Every bypassed request must have the same downstream
-contract and model-boundary payload as the normal path, excluding only the exact versioned harness
-mutation declared by the policy. Requests outside the proven class use the full harness.
-
-**Done:** exact positive/negative eligibility tests pass, untrusted clients cannot select the path,
-shadow comparison shows contract parity, and the matched pass-through latency gate is measurable.
-
 ## Integration gates
 
 Merge instrumentation first. Merge each optimization independently after two-axis review. After

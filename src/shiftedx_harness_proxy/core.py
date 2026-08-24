@@ -19,8 +19,10 @@ HARNESS_PROFILE = "shiftedx-harness-v1"
 HARNESS_SYSTEM_SUFFIX = (
     "\n\nMaintain receipt-grounded work state. After failure, change the action or arguments. Never "
     "repeat an identical call in an unchanged state epoch. Successful reads do not resolve failed "
-    "checks. Verify after mutation. Trust structured status over incidental words. Return the exact "
-    "requested format without fences."
+    "checks. Verify after mutation. Only downstream-visible assistant tool-call IDs paired with "
+    "client-supplied role=tool results count as executed. A shiftedx_harness blocked result is a "
+    "proxy decision, not a client execution. Trust structured status over incidental words. Return "
+    "the exact requested format without fences."
 )
 DEFAULT_MUTATION_TOOLS = frozenset(
     {"apply_patch", "edit_file", "str_replace_editor", "write_file"}
@@ -174,6 +176,7 @@ class AgentHarness:
     available_tools: set[str] = field(default_factory=set)
     required_json_keys: tuple[str, ...] | None = None
     required_json_types: dict[str, str] = field(default_factory=dict)
+    enforce_failed_execution_claim: bool = False
     require_receipt: bool = True
     roles: ToolRoles = field(default_factory=ToolRoles)
     epoch: int = 0
@@ -278,6 +281,8 @@ class AgentHarness:
         return json.dumps(
             {
                 "shiftedx_harness": "duplicate_call_blocked",
+                "execution_status": "blocked_not_executed",
+                "fact": "This proposed call was blocked by the proxy and did not reach the client executor.",
                 "prior_receipt": prior.receipt_id,
                 "instruction": (
                     "The prior successful receipt is sufficient. Return the required final answer now."
@@ -326,6 +331,26 @@ class AgentHarness:
             return f"Failed receipts remain unresolved for: {tools}. Recover and verify before finishing."
         if self.pending_verification:
             return "State changed after the last verification; run a verification tool before finishing."
+        try:
+            structured = json.loads(content.strip())
+        except json.JSONDecodeError:
+            structured = None
+        if (
+            self.enforce_failed_execution_claim
+            and isinstance(structured, dict)
+            and "failed_executions" in structured
+        ):
+            expected_failures = sum(receipt.status == "failure" for receipt in self.receipts)
+            claimed_failures = structured["failed_executions"]
+            if (
+                isinstance(claimed_failures, bool)
+                or not isinstance(claimed_failures, int)
+                or claimed_failures != expected_failures
+            ):
+                return (
+                    f"The final JSON key failed_executions must be {expected_failures}, matching "
+                    "failed client-visible tool receipts."
+                )
         if self.required_json_keys is None:
             return None
         return bare_json_issue(content, self.required_json_keys, self.required_json_types)

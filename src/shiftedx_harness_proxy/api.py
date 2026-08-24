@@ -3,20 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
 import re
 import time
 import uuid
-from collections.abc import AsyncIterator, Coroutine
-from contextlib import asynccontextmanager, suppress
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from starlette.requests import ClientDisconnect
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -24,7 +25,6 @@ from .admission import AdmissionController, BoundedUpstream
 from .cache_policy import ServerCacheNamespace
 from .config import Settings
 from .errors import ProxyError
-from .fast_path import FastPathObserver
 from .provider_capabilities import CapabilityPhase
 from .qualification_timing import (
     PrivateTimingSink,
@@ -131,7 +131,8 @@ class _TimingCaptureMiddleware:
         if scope["type"] != "http" or scope.get("path") != "/v1/chat/completions":
             await self.app(scope, receive, send)
             return
-        capture, token = begin_request_timing()
+        correlation_id = _set_correlation_id(Request(scope))
+        capture, token = begin_request_timing(correlation_id)
         sequence = self.sink.allocate_sequence()
         status_code: int | None = None
 
@@ -163,20 +164,81 @@ class _TimingCaptureMiddleware:
                 end_request_timing(token)
 
 
+_ReplayOutcome = Literal["succeeded", "cancelled", "deadline", "failed"]
+_REPLAY_EOF_SEND_GRACE_SECONDS = 0.1
+
+
+class _ReplayStreamingResponse(StreamingResponse):
+    """Keep replay delivery within the request's admission and deadline bounds."""
+
+    def __init__(
+        self,
+        content: AsyncIterator[bytes],
+        *,
+        deadline_at: float,
+        observe_outcome: Callable[[_ReplayOutcome], None],
+        release_admission: Callable[[], Awaitable[None]],
+        headers: dict[str, str],
+    ) -> None:
+        super().__init__(content, headers=headers, media_type="text/event-stream")
+        self._deadline_at = deadline_at
+        self._observe_outcome = observe_outcome
+        self._release_admission = release_admission
+        self._outcome_recorded = False
+        self._admission_released = False
+
+    def _record_outcome(self, outcome: _ReplayOutcome) -> None:
+        if not self._outcome_recorded:
+            self._observe_outcome(outcome)
+            self._outcome_recorded = True
+
+    async def _release_once(self) -> None:
+        if not self._admission_released:
+            self._admission_released = True
+            await self._release_admission()
+
+    async def stream_response(self, send: Send) -> None:
+        try:
+            async with asyncio.timeout_at(self._deadline_at):
+                await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
+                async for chunk in self.body_iterator:
+                    await send({"type": "http.response.body", "body": chunk, "more_body": True})
+                await send({"type": "http.response.body", "body": b"", "more_body": False})
+        except TimeoutError:
+            self._record_outcome("deadline")
+            await self._release_once()
+            with suppress(TimeoutError, OSError):
+                await asyncio.wait_for(
+                    send({"type": "http.response.body", "body": b"", "more_body": False}),
+                    timeout=_REPLAY_EOF_SEND_GRACE_SECONDS,
+                )
+            return
+        except asyncio.CancelledError:
+            self._record_outcome("cancelled")
+            raise
+        except OSError:
+            self._record_outcome("cancelled")
+            raise
+        except BaseException:
+            self._record_outcome("failed")
+            raise
+        else:
+            self._record_outcome("succeeded")
+        finally:
+            await self._release_once()
+
+
 def create_app(
     settings: Settings,
     upstream: Upstream | None = None,
     *,
     timing_sink: PrivateTimingSink | None = None,
-    fast_path_observer: FastPathObserver | None = None,
 ) -> FastAPI:
-    if settings.intervention_fast_path_mode == "shadow" and fast_path_observer is None:
-        raise ValueError("intervention_fast_path_shadow_observer_required")
     base_transport = upstream or HttpxUpstream(settings)
     admission = AdmissionController(settings)
     counters = Counters()
     transport = BoundedUpstream(base_transport, admission, attempt_observer=counters.observe_upstream_attempt)
-    service = ChatService(settings, transport, fast_path_observer=fast_path_observer)
+    service = ChatService(settings, transport)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -218,6 +280,12 @@ def create_app(
                 else "failed"
             )
             timing.begin_response_finalize()
+        corrections, blocked_duplicates, blocked_stalls = getattr(
+            request.state, "intervention_counts", (0, 0, 0)
+        )
+        counters.correction_turns += corrections
+        counters.blocked_duplicates += blocked_duplicates
+        counters.blocked_stalls += blocked_stalls
         counters.errors += 1
         if exc.code in {
             "receipt_override_denied",
@@ -234,7 +302,11 @@ def create_app(
         if exc.code == "downstream_disconnected":
             counters.cancellations += 1
         correlation_id = getattr(request.state, "correlation_id", None) or _new_correlation_id(request)
-        LOGGER.warning("proxy_request_failed code=%s correlation_id=%s", exc.code, correlation_id)
+        LOGGER.warning(
+            "proxy_request_failed code=%s correlation_id_sha256=%s",
+            exc.code,
+            hashlib.sha256(correlation_id.encode("utf-8")).hexdigest(),
+        )
         headers = {"X-Request-ID": correlation_id, **exc.headers}
         return JSONResponse(
             status_code=exc.status_code,
@@ -285,12 +357,14 @@ def create_app(
 
     @app.post("/v1/chat/completions")
     async def chat(request: Request) -> Response:
+        request.state.intervention_counts = [0, 0, 0]
         correlation_id = _set_correlation_id(request)
         principal = _authenticate(request, settings)
         deadline_at = _deadline_at(settings)
         try:
-            async with asyncio.timeout_at(deadline_at):
-                async with admission.admit(principal.budget_key):
+            async with AsyncExitStack() as admission_stack:
+                async with asyncio.timeout_at(deadline_at):
+                    await admission_stack.enter_async_context(admission.admit(principal.budget_key))
                     counters.observe_admitted_request()
                     payload = await _timed_read_payload(request, settings)
                     payload, replay_options = prepare_replay_request(payload)
@@ -316,26 +390,53 @@ def create_app(
                             policy_extensions_allowed=principal.policy_extensions_allowed,
                             trusted_policy_extension_used=opt_out,
                             server_cache_namespace=principal.server_cache_namespace,
+                            intervention_counts=request.state.intervention_counts,
                         ),
                     )
                     headers = _telemetry_headers(result, settings)
                     headers["X-Request-ID"] = correlation_id
+                    timing = current_request_timing()
+                    response: Response
                     if replay_options is not None:
-                        replay = replay_completion(result.body, replay_options)
+                        replay = replay_completion(
+                            result.body,
+                            replay_options,
+                            max_bytes=settings.max_upstream_response_bytes,
+                        )
+
+                        def observe_replay_outcome(outcome: _ReplayOutcome) -> None:
+                            if outcome == "succeeded":
+                                counters.stream_replays += 1
+                            elif outcome == "cancelled":
+                                counters.cancellations += 1
+                            elif outcome == "deadline":
+                                counters.deadline_expiries += 1
+                                counters.errors += 1
+                            else:
+                                counters.errors += 1
+                            if timing is not None:
+                                timing.classify(outcome)
+
                         headers["Cache-Control"] = "no-cache"
                         headers["X-Shiftedx-Stream-Mode"] = "validate-then-replay"
-                        response = Response(replay, headers=headers, media_type="text/event-stream")
                     else:
                         response = JSONResponse(result.body, headers=headers)
                     _ensure_before_deadline(deadline_at)
-                    if replay_options is not None:
-                        counters.stream_replays += 1
-                    timing = current_request_timing()
-                    if timing is not None:
+                    if replay_options is None and timing is not None:
                         timing.classify("succeeded")
+                    if timing is not None:
                         timing.begin_response_finalize()
                     counters.observe(result)
-                    return response
+                    request.state.intervention_counts[:] = [0, 0, 0]
+                if replay_options is not None:
+                    response = _ReplayStreamingResponse(
+                        _replay_stream(replay),
+                        deadline_at=deadline_at,
+                        observe_outcome=observe_replay_outcome,
+                        release_admission=admission_stack.pop_all().aclose,
+                        headers=headers,
+                    )
+                return response
         except TimeoutError as exc:
             timing = current_request_timing()
             if timing is not None:
@@ -343,12 +444,23 @@ def create_app(
             raise ProxyError(504, "request_deadline_exceeded", "The request exceeded its total time limit.") from exc
         except asyncio.CancelledError:
             counters.cancellations += 1
+            corrections, blocked_duplicates, blocked_stalls = request.state.intervention_counts
+            counters.correction_turns += corrections
+            counters.blocked_duplicates += blocked_duplicates
+            counters.blocked_stalls += blocked_stalls
             timing = current_request_timing()
             if timing is not None:
                 timing.classify("cancelled")
             raise
 
     return app
+
+
+async def _replay_stream(
+    replay: tuple[bytes, ...],
+) -> AsyncIterator[bytes]:
+    for event in replay:
+        yield event
 
 
 @dataclass(frozen=True)
@@ -389,6 +501,9 @@ def _new_correlation_id(request: Request) -> str:
 
 
 def _set_correlation_id(request: Request) -> str:
+    existing = getattr(request.state, "correlation_id", None)
+    if isinstance(existing, str) and _SAFE_CORRELATION_ID.fullmatch(existing):
+        return existing
     correlation_id = _new_correlation_id(request)
     request.state.correlation_id = correlation_id
     return correlation_id

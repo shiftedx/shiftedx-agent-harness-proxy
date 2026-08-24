@@ -650,6 +650,43 @@ def test_warm_prime_retry_and_local_projection_reconcile_without_counting_prime_
     }
 
 
+@pytest.mark.parametrize(("finalizations", "retries"), [(1, 0), (2, 1)])
+def test_acquisition_to_finalization_counts_only_repeated_finalization_as_a_retry(
+    tmp_path: Path, finalizations: int, retries: int
+) -> None:
+    attempt_count = 1 + finalizations
+    after = replace(
+        _ZERO_METRICS,
+        downstream_requests=1,
+        upstream_calls=attempt_count,
+        phase_acquisition=1,
+        phase_finalization=finalizations,
+    )
+    session = ProxyReconciliationSession.begin(_identity(), FakeMetricsReader(_ZERO_METRICS, after))
+    observers = [_observer(1)] + [_observer(index, "finalization") for index in range(2, attempt_count + 1)]
+
+    result = session.complete(
+        _context(),
+        observers,
+        [
+            _request(
+                1,
+                start=1,
+                end=attempt_count,
+                attempts=attempt_count,
+                successful=attempt_count,
+                acquisition=1,
+                finalization=finalizations,
+                retries=retries,
+            )
+        ],
+        ModelOperationSummary(requests_completed_delta=attempt_count, prime_count=0),
+        tmp_path / "reconciliation.json",
+    )
+
+    assert result.status == "passed"
+
+
 @pytest.mark.parametrize(
     ("metric", "value", "check", "category"),
     [
@@ -769,13 +806,77 @@ def test_after_metrics_exception_retains_categorical_artifact_without_exception_
         {"pair_index": 4},
     ],
 )
-def test_begin_rejects_invalid_identity_categorically_without_reading_metrics(changes: dict[str, object]) -> None:
+def test_v1_begin_rejects_invalid_identity_categorically_without_reading_metrics(changes: dict[str, object]) -> None:
     reader = FakeMetricsReader(_ZERO_METRICS)
 
     with pytest.raises(ReconciliationFailure, match="^reconciliation_context_invalid$") as raised:
         ProxyReconciliationSession.begin(_identity(**changes), reader)
 
     assert str(raised.value) == "reconciliation_context_invalid"
+    assert len(reader._snapshots) == 1
+
+
+def test_v2_reconciliation_accepts_eighth_slot_and_fourth_pair_without_schema_change(tmp_path: Path) -> None:
+    after = replace(_ZERO_METRICS, downstream_requests=1, upstream_calls=1, phase_acquisition=1)
+    context = _context(slot_ordinal=8, cache_lane="warm-prefix", pair_index=4)
+    session = ProxyReconciliationSession.begin(
+        _identity(slot_ordinal=8, cache_lane="warm-prefix", pair_index=4),
+        FakeMetricsReader(_ZERO_METRICS, after),
+        campaign_version="v2",
+    )
+    artifact = tmp_path / "reconciliation.json"
+
+    result = session.complete(
+        context,
+        [_observer(1)],
+        [_request(1, start=1, end=1, attempts=1, successful=1, acquisition=1)],
+        ModelOperationSummary(requests_completed_delta=2, prime_count=1),
+        artifact,
+    )
+
+    assert result.status == "passed"
+    with pytest.raises(ReconciliationFailure, match="^reconciliation_artifact_invalid$"):
+        load_passed_proxy_reconciliation(artifact, context=context)
+    assert load_passed_proxy_reconciliation(artifact, context=context, campaign_version="v2").context == context
+    assert "campaign_version" not in json.loads(artifact.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"slot_ordinal": 1, "cache_lane": "warm-prefix", "pair_index": 1},
+        {"slot_ordinal": 4, "cache_lane": "cold", "pair_index": 3},
+        {"slot_ordinal": 5, "cache_lane": "cold", "pair_index": 1},
+        {"slot_ordinal": 8, "cache_lane": "warm-prefix", "pair_index": 3},
+    ],
+)
+def test_v2_begin_rejects_noncanonical_slot_lane_pair_topology(changes: dict[str, object]) -> None:
+    reader = FakeMetricsReader(_ZERO_METRICS)
+
+    with pytest.raises(ReconciliationFailure, match="^reconciliation_context_invalid$"):
+        ProxyReconciliationSession.begin(_identity(**changes), reader, campaign_version="v2")
+
+    assert len(reader._snapshots) == 1
+
+
+@pytest.mark.parametrize(
+    ("changes", "campaign_version"),
+    [
+        ({"slot_ordinal": 9}, "v2"),
+        ({"pair_index": 5}, "v2"),
+        ({}, "v3"),
+    ],
+)
+def test_v2_begin_rejects_out_of_range_or_unknown_campaign_version(
+    changes: dict[str, object], campaign_version: str
+) -> None:
+    reader = FakeMetricsReader(_ZERO_METRICS)
+
+    with pytest.raises(ReconciliationFailure, match="^reconciliation_context_invalid$"):
+        ProxyReconciliationSession.begin(
+            _identity(**changes), reader, campaign_version=campaign_version  # type: ignore[arg-type]
+        )
+
     assert len(reader._snapshots) == 1
 
 

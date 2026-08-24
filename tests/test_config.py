@@ -60,6 +60,11 @@ def test_yaml_roles_load_and_environment_style_values_override(tmp_path: Path) -
     assert roles.investigation == {"inspect"}
 
 
+def test_denied_tool_names_are_process_fixed_csv_configuration() -> None:
+    settings = Settings(upstream_base_url="http://model/v1", denied_tools="apply_patch, deploy ,apply_patch")
+    assert settings.denied_tool_names() == {"apply_patch", "deploy"}
+
+
 def test_policy_extension_capabilities_are_explicit_server_configuration() -> None:
     settings = Settings(
         upstream_base_url="http://model/v1",
@@ -101,17 +106,6 @@ def test_tool_response_capability_mode_is_process_fixed_and_rejects_invalid_valu
             upstream_base_url="http://model/v1",
             upstream_tool_response_capability_mode="unsupported-provider-mode",
         )
-
-
-def test_intervention_fast_path_is_process_fixed_and_cannot_be_enabled_without_promotion_authority() -> None:
-    assert Settings(upstream_base_url="http://model/v1").intervention_fast_path_mode == "disabled"
-    assert (
-        Settings(upstream_base_url="http://model/v1", intervention_fast_path_mode="shadow")
-        .intervention_fast_path_mode
-        == "shadow"
-    )
-    with pytest.raises(ValidationError, match="immutable signed promotion authority"):
-        Settings(upstream_base_url="http://model/v1", intervention_fast_path_mode="enabled")
 
 
 @pytest.mark.parametrize(
