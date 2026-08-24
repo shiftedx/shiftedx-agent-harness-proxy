@@ -76,7 +76,7 @@ jobs:
              and .release_candidate.platforms == ["linux/amd64", "linux/arm64"]
              and .release_candidate.sbom == "embedded Buildx SBOM attestations in the OCI archive"' \
             "$manifest" >/dev/null
-          test "$(jq -r '.containerimage.digest' "$metadata")" = "$EXPECTED_DIGEST"
+          test "$(jq -r '."containerimage.digest"' "$metadata")" = "$EXPECTED_DIGEST"
           printf '%s\n' "archive=$archive" >> "$GITHUB_OUTPUT"
           printf '%s\n' "manifest=$manifest" >> "$GITHUB_OUTPUT"
           printf '%s\n' "metadata=$metadata" >> "$GITHUB_OUTPUT"
