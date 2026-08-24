@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib.util
 import json
@@ -193,6 +194,37 @@ async def test_observer_records_null_response_evidence_before_transport_error(tm
     row = json.loads(config.ledger.read_text(encoding="utf-8"))
     assert row["response"] == {"status_code": None, "cache": None}
     assert "private transport detail" not in config.ledger.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_observer_records_one_null_response_before_cancellation(tmp_path) -> None:
+    config = _config(tmp_path)
+    app = create_observer_app(config)
+
+    class CancelledClient:
+        async def post(self, *args, **kwargs):
+            del args, kwargs
+            raise asyncio.CancelledError
+
+        async def aclose(self) -> None:
+            return None
+
+    async with app.router.lifespan_context(app):
+        await app.state.client.aclose()
+        app.state.client = CancelledClient()
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=True),
+            base_url="http://observer",
+        ) as client:
+            with pytest.raises(asyncio.CancelledError):
+                await client.post(
+                    "/v1/chat/completions",
+                    json={"model": "model", "messages": [{"role": "user", "content": "private"}]},
+                )
+
+    rows = [json.loads(line) for line in config.ledger.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["response"] == {"status_code": None, "cache": None}
 
 
 def test_observer_import_is_configuration_isolated_until_explicit_load(monkeypatch) -> None:

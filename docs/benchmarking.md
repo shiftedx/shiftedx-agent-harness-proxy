@@ -144,8 +144,8 @@ uses `"schema_version": "1.0"` and exactly these keys:
       "runtime_executable": "/absolute/private/path/mtplx-runtime",
       "runtime_executable_sha256": "0101010101010101010101010101010101010101010101010101010101010101",
       "mtplx_distribution_root": "/absolute/private/path/site-packages",
-      "mtplx_record": "/absolute/private/path/site-packages/mtplx-2.7.1.dist-info/RECORD",
-      "mtplx_version": "2.7.1",
+      "mtplx_record": "/absolute/private/path/site-packages/mtplx-2.9.0.dist-info/RECORD",
+      "mtplx_version": "2.9.0",
       "launch_command_sha256": "0202020202020202020202020202020202020202020202020202020202020202",
       "required_launch_flags": [
         "--host=127.0.0.1",
@@ -236,7 +236,8 @@ than weakening the observer bind.
 
 The full `model` object is a private identity contract, not an assertion supplied by the runner.
 It binds the staged model revision, mode-`600` identity and inspect artifacts, non-symlink runtime
-executable and hash, the pinned `mtplx==2.7.1` distribution `RECORD`, complete launch argv hash,
+executable and hash, an exact supported MTPLX distribution (`2.7.1` retained baseline or latest
+`2.9.0`) and its `RECORD`, complete launch argv hash,
 and every reviewed semantic launch flag. It also binds safe projections of `/health` and
 `/v1/mtplx/settings`. Produce their two manifest hashes with
 `model_endpoint_contract_hashes(health, settings)` from

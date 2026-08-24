@@ -7,6 +7,7 @@ import hmac
 import json
 import logging
 import re
+import time
 import uuid
 from collections.abc import AsyncIterator, Coroutine
 from contextlib import asynccontextmanager, suppress
@@ -17,12 +18,20 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from starlette.requests import ClientDisconnect
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .admission import AdmissionController, BoundedUpstream
 from .cache_policy import ServerCacheNamespace
 from .config import Settings
 from .errors import ProxyError
+from .fast_path import FastPathObserver
 from .provider_capabilities import CapabilityPhase
+from .qualification_timing import (
+    PrivateTimingSink,
+    begin_request_timing,
+    current_request_timing,
+    end_request_timing,
+)
 from .service import ChatResult, ChatService
 from .transport import HttpxUpstream, Upstream
 
@@ -108,12 +117,63 @@ class Counters:
         ) + "".join(f"# TYPE {key} gauge\n{key} {value}\n" for key, value in gauges.items())
 
 
-def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
+class _TimingCaptureMiddleware:
+    """Capture only qualification-injected Chat Completions timing evidence."""
+
+    def __init__(self, app: ASGIApp, *, sink: PrivateTimingSink) -> None:
+        self.app = app
+        self.sink = sink
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("path") != "/v1/chat/completions":
+            await self.app(scope, receive, send)
+            return
+        capture, token = begin_request_timing()
+        sequence = self.sink.allocate_sequence()
+        status_code: int | None = None
+
+        async def timed_send(message: Message) -> None:
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status = message.get("status")
+                status_code = status if isinstance(status, int) else None
+            if message["type"] == "http.response.body" and not message.get("more_body", False):
+                capture.begin_response_finalize()
+                try:
+                    await send(message)
+                finally:
+                    capture.finish_response_finalize()
+                return
+            await send(message)
+
+        try:
+            await self.app(scope, receive, timed_send)
+        except BaseException as exc:
+            capture.classify("cancelled" if isinstance(exc, asyncio.CancelledError) else "failed")
+            raise
+        finally:
+            if capture.outcome is None:
+                capture.classify("succeeded" if status_code is not None and 200 <= status_code < 300 else "failed")
+            try:
+                self.sink.append(capture.capture(), sequence=sequence)
+            finally:
+                end_request_timing(token)
+
+
+def create_app(
+    settings: Settings,
+    upstream: Upstream | None = None,
+    *,
+    timing_sink: PrivateTimingSink | None = None,
+    fast_path_observer: FastPathObserver | None = None,
+) -> FastAPI:
+    if settings.intervention_fast_path_mode == "shadow" and fast_path_observer is None:
+        raise ValueError("intervention_fast_path_shadow_observer_required")
     base_transport = upstream or HttpxUpstream(settings)
     admission = AdmissionController(settings)
     counters = Counters()
     transport = BoundedUpstream(base_transport, admission, attempt_observer=counters.observe_upstream_attempt)
-    service = ChatService(settings, transport)
+    service = ChatService(settings, transport, fast_path_observer=fast_path_observer)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -132,6 +192,8 @@ def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
     app.state.upstream = transport
     app.state.admission = admission
     app.state.counters = counters
+    if timing_sink is not None:
+        app.add_middleware(_TimingCaptureMiddleware, sink=timing_sink)
 
     if origins := settings.allowed_origins():
         app.add_middleware(
@@ -143,6 +205,16 @@ def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
 
     @app.exception_handler(ProxyError)
     async def proxy_error_handler(request: Request, exc: ProxyError) -> JSONResponse:
+        timing = current_request_timing()
+        if timing is not None:
+            timing.classify(
+                "deadline"
+                if exc.code == "request_deadline_exceeded"
+                else "cancelled"
+                if exc.code == "downstream_disconnected"
+                else "failed"
+            )
+            timing.begin_response_finalize()
         counters.errors += 1
         if exc.code in {
             "receipt_override_denied",
@@ -217,7 +289,7 @@ def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
             async with asyncio.timeout_at(deadline_at):
                 async with admission.admit(principal.budget_key):
                     counters.observe_admitted_request()
-                    payload = await _read_payload(request, settings)
+                    payload = await _timed_read_payload(request, settings)
                     harness_header = request.headers.get("x-shiftedx-harness")
                     if harness_header is not None and harness_header.strip().lower() != "off":
                         raise ProxyError(400, "invalid_harness_opt_out", "X-Shiftedx-Harness supports only off.")
@@ -232,7 +304,8 @@ def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
                         )
                     result = await _complete_while_connected(
                         request,
-                        service.complete(
+                        _timed_complete(
+                            service,
                             payload,
                             _forwarded_request_headers(request, correlation_id),
                             harness_enabled=not opt_out,
@@ -245,12 +318,22 @@ def create_app(settings: Settings, upstream: Upstream | None = None) -> FastAPI:
                     headers["X-Request-ID"] = correlation_id
                     response = JSONResponse(result.body, headers=headers)
                     _ensure_before_deadline(deadline_at)
+                    timing = current_request_timing()
+                    if timing is not None:
+                        timing.classify("succeeded")
+                        timing.begin_response_finalize()
                     counters.observe(result)
                     return response
         except TimeoutError as exc:
+            timing = current_request_timing()
+            if timing is not None:
+                timing.classify("deadline")
             raise ProxyError(504, "request_deadline_exceeded", "The request exceeded its total time limit.") from exc
         except asyncio.CancelledError:
             counters.cancellations += 1
+            timing = current_request_timing()
+            if timing is not None:
+                timing.classify("cancelled")
             raise
 
     return app
@@ -340,6 +423,31 @@ async def _read_payload(request: Request, settings: Settings) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ProxyError(400, "invalid_json", "Request body must be a JSON object.")
     return payload
+
+
+async def _timed_read_payload(request: Request, settings: Settings) -> dict[str, Any]:
+    started_ns = time.perf_counter_ns()
+    try:
+        return await _read_payload(request, settings)
+    finally:
+        timing = current_request_timing()
+        if timing is not None:
+            timing.record_body_read(time.perf_counter_ns() - started_ns)
+
+
+async def _timed_complete(
+    service: ChatService,
+    payload: dict[str, Any],
+    request_headers: dict[str, str],
+    **kwargs: Any,
+) -> ChatResult:
+    started_ns = time.perf_counter_ns()
+    try:
+        return await service.complete(payload, request_headers, **kwargs)
+    finally:
+        timing = current_request_timing()
+        if timing is not None:
+            timing.record_service_wall(time.perf_counter_ns() - started_ns)
 
 
 async def _complete_while_connected(

@@ -759,6 +759,7 @@ def model_boundary_fingerprint(payload: JsonObject, *, scenario_order: list[str]
         "phase": _observed_model_boundary_phase(payload),
     }
     fields["declared_policy_deltas"] = _observed_harness_policy_delta(payload)
+    fields["cache_prefix"] = _cache_prefix_identity(fields)
     if scenario_order is not None:
         fields.update(_model_boundary_context(scenario_order))
     return SafeFingerprint("model_facing_observed", _sha256(fields), fields)
@@ -956,6 +957,9 @@ def _safe_model_boundary_fields(fields: dict[str, Any]) -> bool:
         },
     ):
         return False
+    cache_prefix = fields["cache_prefix"]
+    if not isinstance(cache_prefix, dict) or cache_prefix != _cache_prefix_identity(fields):
+        return False
     policy_delta = fields["declared_policy_deltas"]
     return policy_delta in ({}, _expected_harness_policy_delta(), {"harness_system_suffix_sha256": "invalid"})
 
@@ -1075,6 +1079,7 @@ def _model_boundary_field_keys() -> tuple[str, ...]:
         "cache_mode_policy",
         "compatibility",
         "declared_policy_deltas",
+        "cache_prefix",
     )
 
 
@@ -1083,6 +1088,33 @@ def _cache_mode_policy(payload: JsonObject) -> Literal["bypass"] | None:
     if isinstance(metadata, dict) and metadata.get("cache_mode") == "bypass":
         return "bypass"
     return None
+
+
+def _cache_prefix_identity(fields: dict[str, Any]) -> dict[str, Any]:
+    """Return the safe, request-side identity of a server-cache-compatible prefix.
+
+    This is deliberately an identity candidate, not a cache-hit assertion: only
+    MTPLX response statistics establish hit/miss or cached-token observations.
+    Receipt, tool-result, user-turn, and transcript values are excluded so the
+    private evidence can group stable prefix material without retaining it.
+    """
+    compatibility = fields["compatibility"]
+    assert isinstance(compatibility, dict)
+    identity = {
+        "version": "compatible-prefix-v1",
+        "template_sha256": fields["base_system_prompt_sha256"],
+        "system_prompt_sha256": fields["system_prompt_sha256"],
+        "model_id_sha256": fields["model_id_sha256"],
+        "tool_schema_sha256": fields["tool_schema_sha256"],
+        "tool_choice_policy": copy.deepcopy(fields["tool_choice_policy"]),
+        "terminal_schema_sha256": fields["terminal_schema_sha256"],
+        "sampler": copy.deepcopy(fields["sampler"]),
+        "reasoning": copy.deepcopy(fields["reasoning"]),
+        "token_budget": fields["token_budget"],
+        "phase": compatibility["phase"],
+        "cache_mode_policy": fields["cache_mode_policy"],
+    }
+    return {"digest": _sha256(identity), **identity}
 
 
 def _system_prompt(payload: JsonObject) -> Any:
@@ -1212,7 +1244,7 @@ def contract_mismatches(left: SafeFingerprint, right: SafeFingerprint) -> list[s
                 and not allowed_harness_system_delta
             ):
                 mismatches.append(key)
-        elif key == "system_prompt_sha256" and allowed_harness_system_delta:
+        elif key in {"system_prompt_sha256", "cache_prefix"} and allowed_harness_system_delta:
             continue
         elif left.fields.get(key) != right.fields.get(key):
             mismatches.append(key)
@@ -1281,9 +1313,7 @@ def assert_preflight(observations: list[PreflightObservation]) -> None:
         else:
             if len(direct.model_facing) != len(proxy.model_facing):
                 raise PreflightFailure("model-facing phase count differed")
-            for direct_fingerprint, proxy_fingerprint in zip(
-                direct.model_facing, proxy.model_facing, strict=True
-            ):
+            for direct_fingerprint, proxy_fingerprint in zip(direct.model_facing, proxy.model_facing, strict=True):
                 mismatch = contract_mismatches(direct_fingerprint, proxy_fingerprint)
                 if mismatch:
                     raise PreflightFailure(f"model-facing contract mismatch: {', '.join(mismatch)}")
@@ -1301,18 +1331,12 @@ def _assert_tool_phase_order(observation: PreflightObservation) -> dict[str, int
         compatibility = fingerprint.fields.get("compatibility")
         phase = compatibility.get("phase") if isinstance(compatibility, dict) else None
         phases.append(phase)
-    if (
-        len(phases) < 2
-        or phases[-1] != "finalization"
-        or any(phase != "acquisition" for phase in phases[:-1])
-    ):
+    if len(phases) < 2 or phases[-1] != "finalization" or any(phase != "acquisition" for phase in phases[:-1]):
         raise PreflightFailure(f"{observation.arm} model-facing tool phase behavior differed")
     return {"acquisition": len(phases) - 1, "finalization": 1}
 
 
-def _assert_proxy_run_expansion(
-    direct: tuple[SafeFingerprint, ...], proxy: tuple[SafeFingerprint, ...]
-) -> int:
+def _assert_proxy_run_expansion(direct: tuple[SafeFingerprint, ...], proxy: tuple[SafeFingerprint, ...]) -> int:
     """Require proxy attempts to be the direct sequence plus contiguous exact repeats."""
 
     proxy_index = 0
@@ -1699,10 +1723,11 @@ def _atomic_write_jsonl(output: Path, records: list[dict[str, Any]]) -> None:
         raise PreflightFailure("refusing to overwrite an existing preflight ledger")
     temporary: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=output.parent, delete=False) as handle:
+        payload = "".join(_canonical(record) + "\n" for record in records).encode("utf-8")
+        with tempfile.NamedTemporaryFile("wb", dir=output.parent, delete=False) as handle:
             temporary = Path(handle.name)
             os.fchmod(handle.fileno(), 0o600)
-            handle.write("".join(_canonical(record) + "\n" for record in records))
+            _write_all(handle.fileno(), payload)
             handle.flush()
             os.fsync(handle.fileno())
         try:
@@ -1713,6 +1738,15 @@ def _atomic_write_jsonl(output: Path, records: list[dict[str, Any]]) -> None:
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise OSError("private evidence partial write")
+        offset += written
 
 
 def _matches_primitive(value: Any, expected: Any) -> bool:

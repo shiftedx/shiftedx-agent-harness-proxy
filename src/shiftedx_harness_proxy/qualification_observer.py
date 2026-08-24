@@ -102,7 +102,7 @@ def create_observer_app(config: QualificationObserverConfig) -> FastAPI:
                 json=payload,
                 headers=_forwarded_headers(request),
             )
-        except Exception:
+        except BaseException:
             _append_observation(state, payload, status_code=None, response_payload=None)
             raise
         try:
@@ -215,7 +215,10 @@ def _create_fresh_ledger(path: Path) -> None:
 def _write_all(descriptor: int, data: bytes) -> None:
     written = 0
     while written < len(data):
-        written += os.write(descriptor, data[written:])
+        count = os.write(descriptor, data[written:])
+        if count <= 0:
+            raise OSError("private evidence partial write")
+        written += count
 
 
 def _safe_http_url(value: str) -> str:

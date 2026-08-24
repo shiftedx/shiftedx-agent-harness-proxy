@@ -19,7 +19,7 @@ import uuid
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import Any, NamedTuple, TypeAlias
 
 from shiftedx_bench.agentic import run_agentic_cases, scenario_set
 from shiftedx_bench.api import OpenAIClient
@@ -72,10 +72,15 @@ _PREFLIGHT_FINALIZATION_PROMPT = (
 )
 _HTTP_STATUS = re.compile(r"\bHTTP ([1-5][0-9]{2})\b")
 _CANONICAL_COUNTER = re.compile(r"^(?:0|[1-9][0-9]{0,19})$")
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 _MAX_PROXY_RESPONSE_BYTES = 16 * 1024 * 1024
+_MAX_PROVISIONAL_TIMING_ROWS = 10_000
+_MAX_PROVISIONAL_TIMING_ROW_BYTES = 1024
+_MAX_PROVISIONAL_TIMING_PAYLOAD_BYTES = 1024 * 1024
 PROXY_RESPONSE_ACCOUNTING = "_shiftedx_qualification_proxy_accounting"
 ProxyRequestRecord: TypeAlias = RequestAccountingRecord
 SamplerProfile: TypeAlias = str
+ProvisionalRequestOutcome: TypeAlias = RequestOutcome
 
 _SAMPLER_PROFILES: dict[SamplerProfile, dict[str, Any]] = {
     "corrected-parity-v1": {
@@ -115,6 +120,243 @@ class ProxyHTTPFailure(RuntimeError):
     def __init__(self, status_code: int) -> None:
         self.status_code = status_code
         super().__init__(f"proxy HTTP {status_code}")
+
+
+class ProvisionalTimingLedgerFailure(ValueError):
+    """The runner's private provisional timing evidence is unsafe or malformed."""
+
+
+class ProvisionalClientTimingRecord(NamedTuple):
+    """One hash-only runner-clock sample, deliberately unbound to final timing evidence."""
+
+    pair_ordinal: int
+    arm: str
+    cache_lane: str
+    client_wall_ns: int
+    outcome: ProvisionalRequestOutcome
+    observer_sequence_start: int | None
+    observer_sequence_end: int | None
+    observer_record_count: int
+    direct_attempt_wall_ns: tuple[int, ...]
+    downstream_request_sha256: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "pair_ordinal": self.pair_ordinal,
+            "arm": self.arm,
+            "cache_lane": self.cache_lane,
+            "client_wall_ns": self.client_wall_ns,
+            "outcome": self.outcome,
+            "observer_sequence_start": self.observer_sequence_start,
+            "observer_sequence_end": self.observer_sequence_end,
+            "observer_record_count": self.observer_record_count,
+            "direct_attempt_wall_ns": list(self.direct_attempt_wall_ns),
+            "downstream_request_sha256": self.downstream_request_sha256,
+        }
+
+
+class ProvisionalClientTimingLedger:
+    """Assign one runner-global ordinal to each logical CompatibilityClient invocation."""
+
+    def __init__(self, *, cache_lane: str) -> None:
+        if cache_lane not in {"cold", "warm-prefix"}:
+            raise ValueError("provisional timing cache lane is invalid")
+        self.cache_lane = cache_lane
+        self._next_pair_ordinal = 1
+        self._records: list[ProvisionalClientTimingRecord] = []
+
+    @property
+    def records(self) -> tuple[ProvisionalClientTimingRecord, ...]:
+        return tuple(self._records)
+
+    def begin(self) -> int:
+        pair_ordinal = self._next_pair_ordinal
+        self._next_pair_ordinal += 1
+        return pair_ordinal
+
+    def append(
+        self,
+        *,
+        pair_ordinal: int,
+        arm: str,
+        client_wall_ns: int,
+        outcome: ProvisionalRequestOutcome,
+        observer_records: tuple[ModelBoundaryRecord, ...],
+        direct_attempt_wall_ns: tuple[int, ...],
+        downstream_request_sha256: str,
+    ) -> None:
+        if arm not in {"direct", "proxy"}:
+            raise ValueError("provisional timing arm is invalid")
+        if client_wall_ns < 0:
+            raise ValueError("provisional client wall time is invalid")
+        self._records.append(
+            ProvisionalClientTimingRecord(
+                pair_ordinal=pair_ordinal,
+                arm=arm,
+                cache_lane=self.cache_lane,
+                client_wall_ns=client_wall_ns,
+                outcome=outcome,
+                observer_sequence_start=observer_records[0].sequence if observer_records else None,
+                observer_sequence_end=observer_records[-1].sequence if observer_records else None,
+                observer_record_count=len(observer_records),
+                direct_attempt_wall_ns=direct_attempt_wall_ns,
+                downstream_request_sha256=downstream_request_sha256,
+            )
+        )
+
+
+def downstream_request_sha256(payload: dict[str, Any]) -> str:
+    """Hash a canonical downstream request while removing only the declared proxy policy extension."""
+    normalized = copy.deepcopy(payload)
+    normalized.pop("x-shiftedx-require-receipt", None)
+    try:
+        encoded = json.dumps(
+            normalized,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise PreflightFailure("downstream request cannot be canonically hashed") from error
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _provisional_outcome(error: BaseException | None) -> ProvisionalRequestOutcome:
+    if error is None:
+        return "succeeded"
+    if isinstance(error, asyncio.CancelledError):
+        return "cancelled"
+    if (
+        isinstance(error, ProxyHTTPFailure)
+        and error.status_code == 504
+        or isinstance(error, TimeoutError)
+        or isinstance(error, urllib.error.URLError)
+        and isinstance(error.reason, TimeoutError)
+    ):
+        return "deadline"
+    return "failed"
+
+
+def write_provisional_client_timing_ledger(
+    path: Path, records: tuple[ProvisionalClientTimingRecord, ...]
+) -> None:
+    """Create private runner evidence exactly once; this ledger is not final timing evidence."""
+    _validate_provisional_timing_parent(path)
+    try:
+        if path.is_symlink() or path.exists():
+            raise ProvisionalTimingLedgerFailure("provisional_request_ledger_exists")
+    except ProvisionalTimingLedgerFailure:
+        raise
+    except OSError:
+        raise ProvisionalTimingLedgerFailure("provisional_request_ledger_write_failed") from None
+    if not isinstance(records, tuple):
+        raise ProvisionalTimingLedgerFailure("provisional_request_ledger_invalid")
+    if len(records) > _MAX_PROVISIONAL_TIMING_ROWS:
+        raise ProvisionalTimingLedgerFailure("provisional_request_ledger_invalid")
+    expected_ordinals = list(range(1, len(records) + 1))
+    if [record.pair_ordinal for record in records] != expected_ordinals:
+        raise ProvisionalTimingLedgerFailure("provisional_request_ledger_duplicate_or_invalid_ordinal")
+    encoded_rows: list[bytes] = []
+    for record in records:
+        if (
+            record.arm not in {"direct", "proxy"}
+            or record.cache_lane not in {"cold", "warm-prefix"}
+            or record.outcome not in {"succeeded", "failed", "deadline", "cancelled"}
+            or type(record.pair_ordinal) is not int
+            or type(record.client_wall_ns) is not int
+            or record.client_wall_ns < 0
+            or type(record.observer_record_count) is not int
+            or record.observer_record_count < 0
+            or _SHA256_HEX.fullmatch(record.downstream_request_sha256) is None
+        ):
+            raise ProvisionalTimingLedgerFailure("provisional_request_ledger_invalid")
+        has_observer_range = record.observer_sequence_start is not None or record.observer_sequence_end is not None
+        if has_observer_range != (record.observer_record_count > 0):
+            raise ProvisionalTimingLedgerFailure("provisional_request_ledger_invalid")
+        if (
+            record.observer_record_count > 0
+            and (
+                record.observer_sequence_start is None
+                or record.observer_sequence_end is None
+                or record.observer_sequence_start > record.observer_sequence_end
+            )
+        ):
+            raise ProvisionalTimingLedgerFailure("provisional_request_ledger_invalid")
+        if (
+            record.observer_record_count > 0
+            and (
+                type(record.observer_sequence_start) is not int
+                or type(record.observer_sequence_end) is not int
+            )
+        ):
+            raise ProvisionalTimingLedgerFailure("provisional_request_ledger_invalid")
+        if (
+            not isinstance(record.direct_attempt_wall_ns, tuple)
+            or any(type(duration) is not int or duration < 0 for duration in record.direct_attempt_wall_ns)
+            or (record.arm == "direct" and len(record.direct_attempt_wall_ns) != record.observer_record_count)
+            or (record.arm == "proxy" and record.direct_attempt_wall_ns)
+        ):
+            raise ProvisionalTimingLedgerFailure("provisional_request_ledger_invalid")
+        try:
+            encoded = (
+                json.dumps(
+                    record.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+                ).encode("utf-8")
+                + b"\n"
+            )
+        except (TypeError, ValueError):
+            raise ProvisionalTimingLedgerFailure("provisional_request_ledger_invalid") from None
+        if len(encoded) > _MAX_PROVISIONAL_TIMING_ROW_BYTES:
+            raise ProvisionalTimingLedgerFailure("provisional_request_ledger_invalid")
+        encoded_rows.append(encoded)
+    payload = b"".join(encoded_rows)
+    if len(payload) > _MAX_PROVISIONAL_TIMING_PAYLOAD_BYTES:
+        raise ProvisionalTimingLedgerFailure("provisional_request_ledger_invalid")
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        os.fchmod(descriptor, 0o600)
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+    except FileExistsError as error:
+        raise ProvisionalTimingLedgerFailure("provisional_request_ledger_exists") from error
+    except OSError:
+        raise ProvisionalTimingLedgerFailure("provisional_request_ledger_write_failed") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _validate_provisional_timing_parent(path: Path) -> None:
+    if not path.is_absolute():
+        raise ProvisionalTimingLedgerFailure("provisional_request_ledger_parent_invalid")
+    descriptor: int | None = None
+    try:
+        parent = path.parent
+        listed = parent.lstat()
+        if parent.is_symlink() or not stat.S_ISDIR(listed.st_mode) or stat.S_IMODE(listed.st_mode) != 0o700:
+            raise OSError
+        descriptor = os.open(
+            parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or stat.S_IMODE(opened.st_mode) != 0o700
+            or (opened.st_dev, opened.st_ino) != (listed.st_dev, listed.st_ino)
+        ):
+            raise OSError
+    except OSError:
+        raise ProvisionalTimingLedgerFailure("provisional_request_ledger_parent_invalid") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 class ProjectionAwareOpenAIClient(OpenAIClient):
@@ -371,6 +613,7 @@ class ProxyRequestAccounting:
                 blocked_duplicate_count=blocked_duplicates,
                 blocked_stall_count=blocked_stalls,
                 correction_count=corrections,
+                avoided_immediate_upstream_calls=int(local_projection),
             )
         )
 
@@ -400,6 +643,7 @@ class CompatibilityClient:
         observer: ModelBoundaryObserverCursor | None = None,
         require_cache_evidence: bool = False,
         request_accounting: ProxyRequestAccounting | None = None,
+        provisional_timing: ProvisionalClientTimingLedger | None = None,
     ) -> None:
         self.upstream = upstream
         self.arm = arm
@@ -408,12 +652,14 @@ class CompatibilityClient:
         self.observer = observer
         self.require_cache_evidence = require_cache_evidence
         self.request_accounting = request_accounting
+        self.provisional_timing = provisional_timing
         self.planner = PhasePlanner()
         self.calls: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
         self.downstream_payloads: list[dict[str, Any]] = []
         self._direct_model_payloads: list[tuple[str, dict[str, Any]]] = []
         self._proxy_model_turns: list[tuple[SafeFingerprint, ...]] = []
         self._direct_attempt_records: list[ModelBoundaryRecord] = []
+        self._direct_attempt_wall_ns: list[int] = []
 
     @property
     def attempt_records(self) -> tuple[ModelBoundaryRecord, ...]:
@@ -425,23 +671,56 @@ class CompatibilityClient:
 
     def complete(self, payload: dict[str, Any], *, stream: bool = False) -> dict[str, Any]:
         del stream  # Qualification is intentionally non-streaming.
-        self.downstream_payloads.append(copy.deepcopy(payload))
-        phases = self.planner.phases_for(payload)
-        if self.arm == "proxy":
-            return self._complete_proxy(payload, phases)
-        if phases == ("terminal",):
-            return self._complete_direct("terminal", payload)
-        response = self._complete_direct("acquisition", self.planner.plan(payload, phase="acquisition"))
-        if response.get("tool_calls"):
-            return response
-        return self._complete_direct("finalization", self.planner.plan(payload, phase="finalization"))
+        pair_ordinal = self.provisional_timing.begin() if self.provisional_timing is not None else None
+        started_ns = time.perf_counter_ns() if self.provisional_timing is not None else None
+        prior_turn_count = len(self.observer.record_turns) if self.observer is not None else 0
+        prior_direct_attempt_count = len(self._direct_attempt_records)
+        error: BaseException | None = None
+        try:
+            self.downstream_payloads.append(copy.deepcopy(payload))
+            phases = self.planner.phases_for(payload)
+            if self.arm == "proxy":
+                return self._complete_proxy(payload, phases)
+            if phases == ("terminal",):
+                return self._complete_direct("terminal", payload)
+            response = self._complete_direct("acquisition", self.planner.plan(payload, phase="acquisition"))
+            if response.get("tool_calls"):
+                return response
+            return self._complete_direct("finalization", self.planner.plan(payload, phase="finalization"))
+        except BaseException as caught:
+            error = caught
+            raise
+        finally:
+            if self.provisional_timing is not None:
+                assert pair_ordinal is not None
+                assert started_ns is not None
+                observer_records = (
+                    self.observer.record_turns[-1]
+                    if self.observer is not None and len(self.observer.record_turns) > prior_turn_count
+                    else ()
+                )
+                if self.arm == "direct":
+                    observer_records = tuple(self._direct_attempt_records[prior_direct_attempt_count:])
+                    direct_attempt_wall_ns = tuple(self._direct_attempt_wall_ns[prior_direct_attempt_count:])
+                else:
+                    direct_attempt_wall_ns = ()
+                self.provisional_timing.append(
+                    pair_ordinal=pair_ordinal,
+                    arm=self.arm,
+                    client_wall_ns=time.perf_counter_ns() - started_ns,
+                    outcome=_provisional_outcome(error),
+                    observer_records=observer_records,
+                    direct_attempt_wall_ns=direct_attempt_wall_ns,
+                    downstream_request_sha256=downstream_request_sha256(payload),
+                )
 
     def _complete_direct(self, phase: str, payload: dict[str, Any]) -> dict[str, Any]:
         self._direct_model_payloads.append((phase, copy.deepcopy(payload)))
         sequence = len(self._direct_attempt_records) + 1
+        started_ns = time.perf_counter_ns()
         try:
             response = self.upstream.complete(payload, stream=False)
-        except Exception:
+        except BaseException:
             self._direct_attempt_records.append(
                 model_boundary_record(
                     payload,
@@ -451,12 +730,9 @@ class CompatibilityClient:
                 )
             )
             raise
-        record = model_boundary_record(
-            payload,
-            sequence=sequence,
-            status_code=200,
-            response=response,
-        )
+        finally:
+            self._direct_attempt_wall_ns.append(time.perf_counter_ns() - started_ns)
+        record = model_boundary_record(payload, sequence=sequence, status_code=200, response=response)
         self._direct_attempt_records.append(record)
         if not isinstance(response, dict):
             raise PreflightFailure("preflight_response_malformed")
@@ -812,19 +1088,27 @@ def _atomic_replace_jsonl(output: Path, rows: list[dict[str, Any]]) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=output.parent, delete=False) as handle:
+        payload = "".join(
+            json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n" for item in rows
+        ).encode("utf-8")
+        with tempfile.NamedTemporaryFile("wb", dir=output.parent, delete=False) as handle:
             temporary = Path(handle.name)
-            handle.write(
-                "".join(
-                    json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n" for item in rows
-                )
-            )
+            _write_all(handle.fileno(), payload)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, output)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise OSError("private evidence partial write")
+        offset += written
 
 
 def response_format(case_id: str, keys: tuple[str, ...] | None, types: dict[str, str]) -> dict[str, Any]:
@@ -900,6 +1184,16 @@ def main() -> None:
         help="Fresh safe per-downstream-call accounting ledger for proxy reconciliation.",
     )
     parser.add_argument(
+        "--proxy-provisional-request-ledger",
+        type=Path,
+        help="Fresh private hash-only runner timing evidence for the scored proxy arm; never final timing evidence.",
+    )
+    parser.add_argument(
+        "--direct-provisional-request-ledger",
+        type=Path,
+        help="Fresh private hash-only runner timing evidence for the scored direct arm; never final timing evidence.",
+    )
+    parser.add_argument(
         "--runtime-attestation",
         type=Path,
         help="Supervisor-issued allowlisted runtime evidence bound to this exact qualification invocation.",
@@ -973,12 +1267,18 @@ def main() -> None:
         raise SystemExit("scored proxy mode requires --proxy-observer-ledger")
     if args.proxy_policy and args.proxy_request_ledger is None:
         raise SystemExit("scored proxy mode requires --proxy-request-ledger")
+    if args.proxy_policy and args.proxy_provisional_request_ledger is None:
+        raise SystemExit("scored proxy mode requires --proxy-provisional-request-ledger")
     if args.proxy_policy:
         _require_fresh_proxy_request_path(args.proxy_request_ledger)
+        _require_fresh_provisional_timing_path(args.proxy_provisional_request_ledger)
     if not args.proxy_policy and args.direct_model_attempt_ledger is None:
         raise SystemExit("scored direct mode requires --direct-model-attempt-ledger")
+    if not args.proxy_policy and args.direct_provisional_request_ledger is None:
+        raise SystemExit("scored direct mode requires --direct-provisional-request-ledger")
     if not args.proxy_policy:
         _require_fresh_attempt_path(args.direct_model_attempt_ledger)
+        _require_fresh_provisional_timing_path(args.direct_provisional_request_ledger)
     try:
         validate_run_manifest_sha256(args.run_manifest_sha256)
     except PreflightFailure as error:
@@ -1024,79 +1324,89 @@ def main() -> None:
     run_id = args.run_id or str(uuid.uuid4())
     direct_attempt_records: list[ModelBoundaryRecord] = []
     proxy_request_accounting = ProxyRequestAccounting() if args.proxy_policy else None
-    for scenario in selected:
-        overrides: dict[str, Any] = {
-            **_sampler_profile(args.sampler_profile),
-            "response_format": response_format(
-                scenario.case_id,
-                scenario.final_keys,
-                scenario.final_types,
-            ),
-        }
-        if args.proxy_policy:
-            overrides["x-shiftedx-require-receipt"] = scenario.require_receipt
-        if args.cache_mode == "bypass":
-            overrides["metadata"] = {"cache_mode": "bypass"}
-        started = time.perf_counter()
-        planned_client: CompatibilityClient | None = None
-        try:
-            planned_client = CompatibilityClient(
-                client,
-                arm="proxy" if args.proxy_policy else "direct",
-                scenario_order=[item.case_id for item in selected],
-                proxy_policy=args.proxy_policy,
-                observer=observer,
-                require_cache_evidence=True,
-                request_accounting=proxy_request_accounting,
-            )
-            rows = run_agentic_cases(
-                client=planned_client,
-                model=args.model,
-                output_path=args.output,
-                request_overrides=overrides,
-                variant_label=args.variant,
-                run_id=run_id,
-                control_profile="baseline",
-                agentic_set=args.agentic_set,
-                case_id=scenario.case_id,
-            )
-            if observer is not None:
-                observer.require_drained()
-            annotate_scored_rows(
-                args.output,
-                planned_client,
-                {str(row["case_id"]) for row in rows},
-            )
-        except asyncio.CancelledError:
-            if proxy_request_accounting is not None:
-                write_request_accounting_ledger(
-                    args.proxy_request_ledger,
-                    proxy_request_accounting.records,
-                )
-            raise
-        except Exception as error:  # The failed case is evidence; later cases must still run.
-            append_failure(
-                args.output,
-                failure_row(
-                    scenario=scenario,
-                    error=error,
-                    run_id=run_id,
-                    variant=args.variant,
-                    agentic_set=args.agentic_set,
-                    model=args.model,
+    provisional_timing = ProvisionalClientTimingLedger(
+        cache_lane="cold" if args.cache_mode == "bypass" else "warm-prefix"
+    )
+    provisional_timing_path = (
+        args.proxy_provisional_request_ledger if args.proxy_policy else args.direct_provisional_request_ledger
+    )
+    try:
+        for scenario in selected:
+            overrides: dict[str, Any] = {
+                **_sampler_profile(args.sampler_profile),
+                "response_format": response_format(
+                    scenario.case_id,
+                    scenario.final_keys,
+                    scenario.final_types,
+                ),
+            }
+            if args.proxy_policy:
+                overrides["x-shiftedx-require-receipt"] = scenario.require_receipt
+            if args.cache_mode == "bypass":
+                overrides["metadata"] = {"cache_mode": "bypass"}
+            started = time.perf_counter()
+            planned_client: CompatibilityClient | None = None
+            try:
+                planned_client = CompatibilityClient(
+                    client,
+                    arm="proxy" if args.proxy_policy else "direct",
                     scenario_order=[item.case_id for item in selected],
                     proxy_policy=args.proxy_policy,
-                    wall_s=time.perf_counter() - started,
-                    cache_mode=args.cache_mode,
-                    sampler_profile=args.sampler_profile,
-                    actual_contract_fingerprints=(
-                        planned_client.actual_contract_fingerprints() if planned_client is not None else None
+                    observer=observer,
+                    require_cache_evidence=True,
+                    request_accounting=proxy_request_accounting,
+                    provisional_timing=provisional_timing,
+                )
+                rows = run_agentic_cases(
+                    client=planned_client,
+                    model=args.model,
+                    output_path=args.output,
+                    request_overrides=overrides,
+                    variant_label=args.variant,
+                    run_id=run_id,
+                    control_profile="baseline",
+                    agentic_set=args.agentic_set,
+                    case_id=scenario.case_id,
+                )
+                if observer is not None:
+                    observer.require_drained()
+                annotate_scored_rows(
+                    args.output,
+                    planned_client,
+                    {str(row["case_id"]) for row in rows},
+                )
+            except asyncio.CancelledError:
+                if proxy_request_accounting is not None:
+                    write_request_accounting_ledger(
+                        args.proxy_request_ledger,
+                        proxy_request_accounting.records,
+                    )
+                raise
+            except Exception as error:  # The failed case is evidence; later cases must still run.
+                append_failure(
+                    args.output,
+                    failure_row(
+                        scenario=scenario,
+                        error=error,
+                        run_id=run_id,
+                        variant=args.variant,
+                        agentic_set=args.agentic_set,
+                        model=args.model,
+                        scenario_order=[item.case_id for item in selected],
+                        proxy_policy=args.proxy_policy,
+                        wall_s=time.perf_counter() - started,
+                        cache_mode=args.cache_mode,
+                        sampler_profile=args.sampler_profile,
+                        actual_contract_fingerprints=(
+                            planned_client.actual_contract_fingerprints() if planned_client is not None else None
+                        ),
                     ),
-                ),
-            )
-        finally:
-            if planned_client is not None and not args.proxy_policy:
-                direct_attempt_records.extend(planned_client.attempt_records)
+                )
+            finally:
+                if planned_client is not None and not args.proxy_policy:
+                    direct_attempt_records.extend(planned_client.attempt_records)
+    finally:
+        write_provisional_client_timing_ledger(provisional_timing_path, provisional_timing.records)
     if not args.proxy_policy:
         write_model_boundary_attempt_ledger(
             args.direct_model_attempt_ledger,
@@ -1141,6 +1451,11 @@ def _require_fresh_attempt_path(path: Path) -> None:
 def _require_fresh_proxy_request_path(path: Path) -> None:
     if path.exists() or path.is_symlink():
         raise SystemExit("refusing to overwrite an existing proxy request ledger")
+
+
+def _require_fresh_provisional_timing_path(path: Path) -> None:
+    if path.exists() or path.is_symlink():
+        raise SystemExit("refusing to overwrite an existing provisional request ledger")
 
 
 def _read_key(path: Path | None) -> str | None:
@@ -1267,8 +1582,7 @@ def _run_paired_preflight(args: argparse.Namespace, selected: list[Any]) -> None
                     tool_observation = replace(
                         tool_observation,
                         proxy_correction_count=sum(
-                            record.correction_count
-                            for record in proxy_request_accounting.records[tool_request_start:]
+                            record.correction_count for record in proxy_request_accounting.records[tool_request_start:]
                         ),
                     )
                 observations.append(tool_observation)

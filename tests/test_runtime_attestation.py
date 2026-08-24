@@ -79,6 +79,7 @@ def test_preflight_writer_rejects_flat_cache_lane_contract_digests_before_creati
 
     assert not output.exists()
 
+
 @pytest.mark.parametrize(
     "stats_override",
     [
@@ -418,6 +419,7 @@ def test_scored_proxy_outcome_requires_a_matching_passed_reconciliation_artifact
         model_evidence_sha256=hashlib.sha256(evidence.read_bytes()).hexdigest(),
         observer_ledger_sha256="1" * 64,
         request_ledger_sha256="2" * 64,
+        timing_ledger_sha256="3" * 64,
     )
     zero = _metrics_snapshot()
     after = MetricsSnapshot(**{**zero.to_dict(), "downstream_requests": 1, "upstream_calls": 1, "phase_acquisition": 1})

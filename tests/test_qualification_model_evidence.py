@@ -233,7 +233,7 @@ def _private(path: Path, value: bytes) -> Path:
     return path
 
 
-def _contract(tmp_path: Path, *, lane: str = "cold") -> ModelEvidenceContract:
+def _contract(tmp_path: Path, *, lane: str = "cold", mtplx_version: str = "2.7.1") -> ModelEvidenceContract:
     tmp_path.mkdir(parents=True, exist_ok=True)
     tmp_path.chmod(0o700)
     stage = tmp_path / "private-stage"
@@ -245,19 +245,19 @@ def _contract(tmp_path: Path, *, lane: str = "cold") -> ModelEvidenceContract:
     executable.chmod(0o700)
     package = tmp_path / "package"
     package.mkdir()
-    metadata_dir = package / "mtplx-2.7.1.dist-info"
+    metadata_dir = package / f"mtplx-{mtplx_version}.dist-info"
     metadata_dir.mkdir()
     metadata = metadata_dir / "METADATA"
-    metadata.write_text("Name: mtplx\nVersion: 2.7.1\n\n", encoding="utf-8")
+    metadata.write_text(f"Name: mtplx\nVersion: {mtplx_version}\n\n", encoding="utf-8")
     record = metadata_dir / "RECORD"
     module = package / "mtplx.py"
-    module.write_bytes(b"version = '2.7.1'\n")
+    module.write_text(f"version = '{mtplx_version}'\n", encoding="utf-8")
     record.write_text(
         "\n".join(
             (
                 _record_row(package, module),
                 _record_row(package, metadata),
-                "mtplx-2.7.1.dist-info/RECORD,,",
+                f"mtplx-{mtplx_version}.dist-info/RECORD,,",
                 "",
             )
         ),
@@ -275,7 +275,7 @@ def _contract(tmp_path: Path, *, lane: str = "cold") -> ModelEvidenceContract:
         runtime_executable_sha256=_file_digest(executable),
         mtplx_distribution_root=package,
         mtplx_record=record,
-        mtplx_version="2.7.1",
+        mtplx_version=mtplx_version,
         launch_command_sha256="b" * 64,
         required_launch_flags=("--host=127.0.0.1", "--port=8999", "--ssd-session-cache=off"),
         host="127.0.0.1",
@@ -327,7 +327,7 @@ def _distribution_digest(contract: ModelEvidenceContract) -> str:
     return _sha256(
         {
             "name": "mtplx",
-            "version": "2.7.1",
+            "version": contract.mtplx_version,
             "files": sorted(rows),
             "ignored_record_entries": sorted(ignored),
         }
@@ -450,14 +450,21 @@ def test_cold_session_writes_only_safe_hash_evidence(tmp_path: Path) -> None:
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
 
 
+def test_latest_mtplx_distribution_is_supported_without_loosening_identity_checks(tmp_path: Path) -> None:
+    contract = _contract(tmp_path, mtplx_version="2.9.0")
+    session, _, _, output, _ = _begin(tmp_path, contract=contract)
+
+    session.complete([_attempt()])
+
+    assert json.loads(output.read_text(encoding="utf-8"))["status"] == "passed"
+
+
 def test_preflight_successful_attempts_are_bypass_only_and_cannot_seed_a_warm_lane(tmp_path: Path) -> None:
     """A warm campaign's preflight is still an isolated, non-storing cache bypass."""
 
     contract = _contract(tmp_path, lane="preflight")
     probe = _probe_for(contract, before_requests=0, after_requests=1)
-    session, _contract_value, _probe_value, output, _credential = _begin(
-        tmp_path, contract=contract, probe=probe
-    )
+    session, _contract_value, _probe_value, output, _credential = _begin(tmp_path, contract=contract, probe=probe)
 
     with pytest.raises(ModelEvidenceFailure, match="model_cache_preflight_invalid"):
         session.complete([_attempt(request_session_bank_bypass=False)])
@@ -466,9 +473,7 @@ def test_preflight_successful_attempts_are_bypass_only_and_cannot_seed_a_warm_la
 
 
 @pytest.mark.parametrize("lane", ["cold", "warm-prefix"])
-def test_scored_cache_evidence_requires_a_fresh_model_request_window_before_action(
-    tmp_path: Path, lane: str
-) -> None:
+def test_scored_cache_evidence_requires_a_fresh_model_request_window_before_action(tmp_path: Path, lane: str) -> None:
     """Cold and warm scored treatments cannot inherit an already-used MTPLX process."""
 
     contract = _contract(tmp_path, lane=lane)
@@ -964,9 +969,7 @@ def test_warm_prefix_rejects_an_ssd_hit_even_when_the_prime_digest_matches(tmp_p
 
     contract = _contract(tmp_path, lane="warm-prefix")
     probe = _probe_for(contract, before_requests=0, after_requests=2)
-    session, _contract_value, _probe_value, output, _credential = _begin(
-        tmp_path, contract=contract, probe=probe
-    )
+    session, _contract_value, _probe_value, output, _credential = _begin(tmp_path, contract=contract, probe=probe)
     digest = "a" * 64
     ssd_hit = _attempt(
         digest=digest,

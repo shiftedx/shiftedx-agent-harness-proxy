@@ -72,6 +72,15 @@ from .qualification_reconciliation import (
     ReconciliationFailure,
     ReconciliationIdentity,
     read_request_accounting_ledger,
+    request_accounting_record_payload,
+)
+from .qualification_timing import (
+    TIMING_EVIDENCE_MAX_BYTES,
+    TimingFailure,
+    finalize_timing_evidence,
+    read_timing_ledger,
+    reserve_timing_capture_ledger,
+    verify_timing_ledger_linkage,
 )
 
 RuntimeStage = Literal["preflight", "score-direct", "score-proxy"]
@@ -231,9 +240,7 @@ def _is_trusted_host_tool(path: Path) -> bool:
     return stat.S_ISREG(status.st_mode) and os.access(path, os.X_OK)
 
 
-def _safe_http_response(
-    url: str, *, headers: dict[str, str] | None, timeout: float
-) -> tuple[int, bytes | None]:
+def _safe_http_response(url: str, *, headers: dict[str, str] | None, timeout: float) -> tuple[int, bytes | None]:
     """Issue one bounded, exact-URL request without proxy or redirect credential replay."""
 
     request = Request(url, headers=headers or {})  # noqa: S310 - callers validate private runtime URLs
@@ -284,9 +291,7 @@ class RuntimeCommandRunner(Protocol):
         self, url: str, *, headers: dict[str, str] | None = None, timeout: float = 5.0
     ) -> tuple[int, dict[str, Any] | None]: ...
 
-    def loopback_listener_state(
-        self, host: str, port: int, *, timeout: float = 1.0
-    ) -> LoopbackListenerState: ...
+    def loopback_listener_state(self, host: str, port: int, *, timeout: float = 1.0) -> LoopbackListenerState: ...
 
 
 class _ContainerMetricsReader:
@@ -454,9 +459,7 @@ class SubprocessRuntimeCommandRunner:
             return status, None
         return status, document if isinstance(document, dict) else None
 
-    def loopback_listener_state(
-        self, host: str, port: int, *, timeout: float = 1.0
-    ) -> LoopbackListenerState:
+    def loopback_listener_state(self, host: str, port: int, *, timeout: float = 1.0) -> LoopbackListenerState:
         """Distinguish a refused loopback connection from all ambiguous failures."""
 
         try:
@@ -550,6 +553,12 @@ class RuntimeLease:
     preflight_ledger: Path
     output_ledger: Path
     attestation_path: Path | None
+    proxy_timing_ledger: Path | None = None
+    direct_timing_ledger: Path | None = None
+    proxy_raw_timing_capture: Path | None = None
+    proxy_provisional_request_ledger: Path | None = None
+    direct_provisional_request_ledger: Path | None = None
+    proxy_request_accounting_provisional_ledger: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -704,11 +713,7 @@ def _stage_binding(
         raise QualificationRuntimeFailure("runtime_campaign_request_invalid")
     if stage == "preflight":
         expected = CampaignSlot(0, "preflight", 0, f"{spec.campaign.campaign_id}-preflight")
-        if (
-            stage_request.sequence != 1
-            or request_slot != expected
-            or private_run_dir.name != "00-preflight-pair0"
-        ):
+        if stage_request.sequence != 1 or request_slot != expected or private_run_dir.name != "00-preflight-pair0":
             raise QualificationRuntimeFailure("runtime_campaign_request_invalid")
         return _StageBinding(
             spec.campaign.campaign_id_sha256,
@@ -725,8 +730,7 @@ def _stage_binding(
         request_slot.cache_lane != expected_slot.cache_lane
         or request_slot.pair_index != expected_slot.pair_index
         or request_slot.run_id != expected_slot.run_id
-        or private_run_dir.name
-        != f"{request_slot.ordinal:02d}-{request_slot.cache_lane}-pair{request_slot.pair_index}"
+        or private_run_dir.name != f"{request_slot.ordinal:02d}-{request_slot.cache_lane}-pair{request_slot.pair_index}"
     ):
         raise QualificationRuntimeFailure("runtime_campaign_request_invalid")
     expected_sequence = 2 + (request_slot.ordinal - 1) * 2 + (0 if stage == "score-direct" else 1)
@@ -768,9 +772,11 @@ def supervise_qualification_runtime(
     observer: ManagedProcess | None = None
     container_id: str | None = None
     volume_name: str | None = None
+    timing_volume_name: str | None = None
     initializer_name: str | None = None
     proxy_name: str | None = None
     volume_attempted = False
+    timing_volume_attempted = False
     initializer_attempted = False
     proxy_attempted = False
     spec: _RuntimeSpec | None = None
@@ -795,9 +801,7 @@ def supervise_qualification_runtime(
             _validate_prior_outcome(binding.preflight_run_dir, "preflight", spec, attestation_path, binding)
             _validate_credentials(spec.credentials, upstream_authenticated=spec.model.upstream_authenticated)
             model_session = _begin_model_evidence(runner, spec, stage, private_run_dir, binding)
-            _require_distinct_scored_model_instance(
-                binding.preflight_run_dir, spec, stage, model_session, binding
-            )
+            _require_distinct_scored_model_instance(binding.preflight_run_dir, spec, stage, model_session, binding)
             if _attestation_model_identity(attestation_path) != model_session.model_identity_sha256:
                 raise QualificationRuntimeFailure("runtime_model_identity_mismatch")
             lease = _direct_lease(spec, stage, private_run_dir, attestation_path, model_session, binding)
@@ -810,6 +814,11 @@ def supervise_qualification_runtime(
                 # result with a consequent missing/incomplete attempt ledger.
                 if action_exit_code == 0:
                     raise
+            try:
+                _finalize_direct_timing(private_run_dir, binding)
+            except QualificationRuntimeFailure:
+                if action_exit_code == 0:
+                    raise
             if action_exit_code == 0:
                 _require_complete_output(lease.output_ledger, stage, spec)
                 status = "passed"
@@ -818,9 +827,7 @@ def supervise_qualification_runtime(
         else:
             if stage == "score-proxy":
                 preflight_attestation = _validate_existing_preflight_attestation(binding.preflight_run_dir, spec)
-                _validate_prior_outcome(
-                    binding.preflight_run_dir, "preflight", spec, preflight_attestation, binding
-                )
+                _validate_prior_outcome(binding.preflight_run_dir, "preflight", spec, preflight_attestation, binding)
                 _validate_prior_outcome(private_run_dir, "score-direct", spec, preflight_attestation, binding)
             _validate_credentials(spec.credentials, upstream_authenticated=spec.model.upstream_authenticated)
             model_session = _begin_model_evidence(runner, spec, stage, private_run_dir, binding)
@@ -830,20 +837,24 @@ def supervise_qualification_runtime(
             ):
                 raise QualificationRuntimeFailure("runtime_model_identity_mismatch")
             if stage == "score-proxy":
-                _require_distinct_scored_model_instance(
-                    private_run_dir, spec, stage, model_session, binding
-                )
+                _require_distinct_scored_model_instance(private_run_dir, spec, stage, model_session, binding)
             _assert_port_available(spec.proxy.host, spec.proxy.port, "proxy_port_unavailable")
             _assert_port_available(spec.observer.host, spec.observer.port, "observer_port_unavailable")
             instance = _instance_token(spec.manifest_sha256, stage)
             _assert_no_stale_owned_resources(runner, spec.manifest_sha256)
             image_id = _inspect_exact_image(runner, spec.image)
             volume_name = _volume_name(instance)
+            timing_volume_name = _timing_volume_name(instance) if stage == "score-proxy" else None
             initializer_name = _initializer_name(instance, stage)
             proxy_name = _container_name(instance, stage)
             _validate_credentials(spec.credentials, upstream_authenticated=spec.model.upstream_authenticated)
             volume_attempted = True
             _create_volume(runner, volume_name, spec.manifest_sha256, instance, stage)
+            if timing_volume_name is not None:
+                reserve_timing_capture_ledger(_proxy_raw_timing_capture_path(private_run_dir))
+                timing_volume_attempted = True
+                _create_timing_volume(runner, timing_volume_name, spec.manifest_sha256, instance, stage)
+                _initialize_timing_capture(runner, spec, timing_volume_name, instance, stage)
             _validate_credentials(spec.credentials, upstream_authenticated=spec.model.upstream_authenticated)
             initializer_attempted = True
             _initialize_secrets(runner, spec, volume_name, initializer_name, instance, stage)
@@ -853,19 +864,22 @@ def supervise_qualification_runtime(
             _wait_for_observer(runner, spec.observer, observer_identity)
             _validate_fresh_observer_ledger(observer_ledger)
             proxy_attempted = True
-            container_id = _launch_proxy(runner, spec, volume_name, proxy_name, instance, stage)
+            container_id = _launch_proxy(runner, spec, volume_name, timing_volume_name, proxy_name, instance, stage)
             _verify_proxy(
                 runner,
                 spec,
                 image_id=image_id,
                 container_id=container_id,
                 volume_name=volume_name,
+                timing_volume_name=timing_volume_name,
                 instance=instance,
                 stage=stage,
             )
             _wait_for_proxy(runner, spec.proxy)
             _verify_proxy_auth_and_metrics(runner, container_id, spec)
-            _ensure_live(observer, runner, container_id, spec, image_id, volume_name, instance, stage)
+            _ensure_live(
+                observer, runner, container_id, spec, image_id, volume_name, timing_volume_name, instance, stage
+            )
             attestation_path = _attestation_path(private_run_dir, stage)
             _write_attestation(attestation_path, spec, stage, instance, image_id, model_session)
             lease = _proxy_lease(
@@ -877,7 +891,9 @@ def supervise_qualification_runtime(
                 )
             _validate_credentials(spec.credentials, upstream_authenticated=spec.model.upstream_authenticated)
             action_exit_code = _invoke_action(action, lease)
-            _ensure_live(observer, runner, container_id, spec, image_id, volume_name, instance, stage)
+            _ensure_live(
+                observer, runner, container_id, spec, image_id, volume_name, timing_volume_name, instance, stage
+            )
             model_summary: ModelOperationSummary | None = None
             try:
                 model_summary = _complete_model_evidence(model_session, spec, stage, private_run_dir, binding)
@@ -886,6 +902,15 @@ def supervise_qualification_runtime(
                 # artifact without replacing a known child failure category.
                 if action_exit_code == 0:
                     raise
+            if stage == "score-proxy" and timing_volume_name is not None and container_id is not None:
+                try:
+                    _extract_proxy_timing_capture(runner, container_id, _proxy_raw_timing_capture_path(private_run_dir))
+                    _finalize_proxy_timing(private_run_dir, binding)
+                except QualificationRuntimeFailure:
+                    # A failed child retains any valid raw capture but its
+                    # terminal action category remains authoritative.
+                    if action_exit_code == 0:
+                        raise
             if stage == "score-proxy" and reconciliation_session is not None and model_summary is not None:
                 try:
                     proxy_reconciliation_sha256 = _complete_proxy_reconciliation(
@@ -905,9 +930,7 @@ def supervise_qualification_runtime(
                         raise
             if action_exit_code == 0:
                 if stage == "score-proxy" and (
-                    reconciliation_session is None
-                    or model_summary is None
-                    or proxy_reconciliation_sha256 is None
+                    reconciliation_session is None or model_summary is None or proxy_reconciliation_sha256 is None
                 ):
                     raise QualificationRuntimeFailure("runtime_reconciliation_invalid")
                 _require_complete_output(lease.output_ledger, stage, spec)
@@ -932,9 +955,11 @@ def supervise_qualification_runtime(
             proxy_name,
             initializer_name,
             volume_name,
+            timing_volume_name,
             proxy_attempted=proxy_attempted,
             initializer_attempted=initializer_attempted,
             volume_attempted=volume_attempted,
+            timing_volume_attempted=timing_volume_attempted,
             spec_manifest_sha256=spec.manifest_sha256 if spec is not None else None,
             instance=instance,
             stage=stage,
@@ -1034,9 +1059,11 @@ class QualificationCampaignStageRunner:
             return StageInspection("absent", None)
         reserved = _reserved_stage_paths(request.private_run_dir, request.stage, binding)
         if not (request.outcome_path.exists() or request.outcome_path.is_symlink()):
-            return StageInspection("partial", None) if any(
-                path.exists() or path.is_symlink() for path in reserved
-            ) else StageInspection("absent", None)
+            return (
+                StageInspection("partial", None)
+                if any(path.exists() or path.is_symlink() for path in reserved)
+                else StageInspection("absent", None)
+            )
         result = _inspect_durable_stage_outcome(request, spec, binding)
         return StageInspection("complete", result) if result is not None else StageInspection("partial", None)
 
@@ -1116,9 +1143,7 @@ def _model_readiness_state(
     raise QualificationRuntimeFailure("model_listener_probe_failed")
 
 
-def _reserved_stage_paths(
-    private_run_dir: Path, stage: RuntimeStage, binding: _StageBinding
-) -> tuple[Path, ...]:
+def _reserved_stage_paths(private_run_dir: Path, stage: RuntimeStage, binding: _StageBinding) -> tuple[Path, ...]:
     paths: list[Path] = [
         _outcome_path(private_run_dir, stage),
         _scored_ledger_path(private_run_dir, stage),
@@ -1139,13 +1164,23 @@ def _reserved_stage_paths(
             )
         )
     if stage == "score-proxy":
-        paths.append(_proxy_reconciliation_path(private_run_dir))
+        paths.extend(
+            (
+                _proxy_timing_ledger_path(private_run_dir, stage),
+                _proxy_raw_timing_capture_path(private_run_dir),
+                _proxy_provisional_request_ledger_path(private_run_dir),
+                _proxy_request_accounting_provisional_ledger_path(private_run_dir),
+                _proxy_reconciliation_path(private_run_dir),
+            )
+        )
+    if stage == "score-direct":
+        paths.extend(
+            (_direct_timing_ledger_path(private_run_dir), _direct_provisional_request_ledger_path(private_run_dir))
+        )
     return tuple(paths)
 
 
-def _stage_attestation_path(
-    private_run_dir: Path, stage: RuntimeStage, binding: _StageBinding
-) -> Path:
+def _stage_attestation_path(private_run_dir: Path, stage: RuntimeStage, binding: _StageBinding) -> Path:
     return (
         _attestation_path(private_run_dir, stage)
         if stage != "score-direct"
@@ -1179,11 +1214,14 @@ def _inspect_durable_stage_outcome(
     try:
         attestation_path = _stage_attestation_path(request.private_run_dir, request.stage, binding)
         model_identity_sha256 = _attestation_model_identity(attestation_path)
-        evidence_stage = cast(Literal["preflight", "score-direct", "score-proxy"], {
-            "preflight": "preflight",
-            "score-direct": "score-direct",
-            "score-proxy": "score-proxy",
-        }[request.stage])
+        evidence_stage = cast(
+            Literal["preflight", "score-direct", "score-proxy"],
+            {
+                "preflight": "preflight",
+                "score-direct": "score-direct",
+                "score-proxy": "score-proxy",
+            }[request.stage],
+        )
         model_evidence = load_model_evidence(
             _model_evidence_path(request.private_run_dir, request.stage),
             expected_stage=evidence_stage,
@@ -1198,13 +1236,9 @@ def _inspect_durable_stage_outcome(
             model_evidence=_model_evidence_path(request.private_run_dir, request.stage),
             model_identity_sha256=model_identity_sha256,
             output_ledger=_scored_ledger_path(request.private_run_dir, request.stage),
-            expected_output_record_count=(
-                5 if request.stage == "preflight" else spec.benchmark.scenario_count
-            ),
+            expected_output_record_count=(5 if request.stage == "preflight" else spec.benchmark.scenario_count),
             proxy_reconciliation=(
-                _proxy_reconciliation_path(request.private_run_dir)
-                if request.stage == "score-proxy"
-                else None
+                _proxy_reconciliation_path(request.private_run_dir) if request.stage == "score-proxy" else None
             ),
             campaign_id_sha256=binding.campaign_id_sha256,
             slot_ordinal=binding.slot_ordinal,
@@ -1812,6 +1846,78 @@ def _create_volume(
         raise QualificationRuntimeFailure("runtime_volume_create_failed")
 
 
+def _create_timing_volume(
+    runner: RuntimeCommandRunner, volume_name: str, manifest_sha256: str, instance: str, stage: RuntimeStage
+) -> None:
+    result = runner.run(
+        (
+            "docker",
+            "volume",
+            "create",
+            "--label",
+            f"{_LABEL_PREFIX}.manifest={manifest_sha256}",
+            "--label",
+            f"{_LABEL_PREFIX}.instance={instance}",
+            "--label",
+            f"{_LABEL_PREFIX}.stage={_attestation_stage(stage)}",
+            "--label",
+            f"{_LABEL_PREFIX}.resource=timing-volume",
+            volume_name,
+        )
+    )
+    if result.returncode != 0:
+        raise QualificationRuntimeFailure("runtime_timing_volume_create_failed")
+
+
+def _initialize_timing_capture(
+    runner: RuntimeCommandRunner, spec: _RuntimeSpec, volume_name: str, instance: str, stage: RuntimeStage
+) -> None:
+    """Create the one fixed private sink file before the unprivileged proxy starts."""
+    result = runner.run(
+        (
+            "docker",
+            "run",
+            "--rm",
+            "--pull",
+            "never",
+            "--network",
+            "none",
+            "--read-only",
+            "--user",
+            "0:0",
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "CHOWN",
+            "--cap-add",
+            "DAC_OVERRIDE",
+            "--security-opt",
+            "no-new-privileges:true",
+            "--label",
+            f"{_LABEL_PREFIX}.manifest={spec.manifest_sha256}",
+            "--label",
+            f"{_LABEL_PREFIX}.instance={instance}",
+            "--label",
+            f"{_LABEL_PREFIX}.stage={_attestation_stage(stage)}",
+            "--label",
+            f"{_LABEL_PREFIX}.resource=timing-initializer",
+            "--mount",
+            f"type=volume,src={volume_name},dst=/target",
+            "--entrypoint",
+            "/bin/sh",
+            spec.image.reference,
+            "-ceu",
+            (
+                "umask 077; : > /target/capture.jsonl; chown 10001:10001 /target/capture.jsonl; "
+                "chmod 0600 /target/capture.jsonl; "
+                "test \"$(stat -c '%u:%g:%a' /target/capture.jsonl)\" = 10001:10001:600"
+            ),
+        )
+    )
+    if result.returncode != 0:
+        raise QualificationRuntimeFailure("runtime_timing_capture_initialize_failed")
+
+
 def _initialize_secrets(
     runner: RuntimeCommandRunner,
     spec: _RuntimeSpec,
@@ -1976,6 +2082,7 @@ def _launch_proxy(
     runner: RuntimeCommandRunner,
     spec: _RuntimeSpec,
     volume_name: str,
+    timing_volume_name: str | None,
     container_name: str,
     instance: str,
     stage: RuntimeStage,
@@ -2003,6 +2110,10 @@ def _launch_proxy(
         "LISTEN_HOST": _CONTAINER_LISTEN_HOST,
         "LISTEN_PORT": str(spec.proxy.container_port),
     }
+    if stage == "score-proxy":
+        if timing_volume_name is None:
+            raise QualificationRuntimeFailure("runtime_timing_capture_initialize_failed")
+        env_values["QUALIFICATION_TIMING_CAPTURE_PATH"] = "/run/qualification/capture.jsonl"
     argv: list[str] = [
         "docker",
         "run",
@@ -2040,6 +2151,8 @@ def _launch_proxy(
         "--label",
         f"{_LABEL_PREFIX}.resource=proxy",
     ]
+    if timing_volume_name is not None:
+        argv.extend(("--mount", f"type=volume,src={timing_volume_name},dst=/run/qualification"))
     for key, value in env_values.items():
         argv.extend(("--env", f"{key}={value}"))
     argv.append(spec.image.reference)
@@ -2057,6 +2170,7 @@ def _verify_proxy(
     image_id: str,
     container_id: str,
     volume_name: str,
+    timing_volume_name: str | None,
     instance: str,
     stage: RuntimeStage,
 ) -> None:
@@ -2096,8 +2210,21 @@ def _verify_proxy(
     )
     if not isinstance(expected_mount, dict) or expected_mount.get("RW") is not False:
         raise QualificationRuntimeFailure("runtime_inspect_drift")
+    timing_mounts = [
+        mount for mount in mounts if isinstance(mount, dict) and mount.get("Destination") == "/run/qualification"
+    ]
+    if stage == "score-proxy":
+        if (
+            timing_volume_name is None
+            or len(timing_mounts) != 1
+            or timing_mounts[0].get("Name") != timing_volume_name
+            or timing_mounts[0].get("RW") is not True
+        ):
+            raise QualificationRuntimeFailure("runtime_inspect_drift")
+    elif timing_mounts:
+        raise QualificationRuntimeFailure("runtime_inspect_drift")
     _verify_port_binding(host_config, spec.proxy)
-    _verify_proxy_environment(config.get("Env"), spec)
+    _verify_proxy_environment(config.get("Env"), spec, stage)
     volume_result = runner.run(("docker", "volume", "inspect", "--format", "{{json .}}", volume_name))
     if volume_result.returncode != 0:
         raise QualificationRuntimeFailure("runtime_inspect_drift")
@@ -2111,6 +2238,17 @@ def _verify_proxy(
         }.items()
     ):
         raise QualificationRuntimeFailure("runtime_inspect_drift")
+    if timing_volume_name is not None:
+        timing_result = runner.run(("docker", "volume", "inspect", "--format", "{{json .}}", timing_volume_name))
+        if timing_result.returncode != 0:
+            raise QualificationRuntimeFailure("runtime_inspect_drift")
+        timing_volume = _parse_command_json(timing_result.stdout, "runtime_inspect_drift")
+        timing_labels = timing_volume.get("Labels")
+        if not isinstance(timing_labels, dict) or any(
+            timing_labels.get(key) != value
+            for key, value in {**expected_labels, f"{_LABEL_PREFIX}.resource": "timing-volume"}.items()
+        ):
+            raise QualificationRuntimeFailure("runtime_inspect_drift")
 
 
 def _verify_resources(config: dict[str, Any], host_config: dict[str, Any], proxy: _ProxySpec) -> None:
@@ -2146,7 +2284,7 @@ def _verify_port_binding(host_config: dict[str, Any], proxy: _ProxySpec) -> None
         raise QualificationRuntimeFailure("runtime_inspect_drift")
 
 
-def _verify_proxy_environment(value: Any, spec: _RuntimeSpec) -> None:
+def _verify_proxy_environment(value: Any, spec: _RuntimeSpec, stage: RuntimeStage) -> None:
     if not isinstance(value, list) or any(not isinstance(item, str) or "=" not in item for item in value):
         raise QualificationRuntimeFailure("runtime_inspect_drift")
     environment = dict(item.split("=", 1) for item in value)
@@ -2164,6 +2302,11 @@ def _verify_proxy_environment(value: Any, spec: _RuntimeSpec) -> None:
         "METRICS_ENABLED": "true",
     }
     if any(environment.get(key) != item for key, item in expected.items()):
+        raise QualificationRuntimeFailure("runtime_inspect_drift")
+    if stage == "score-proxy":
+        if environment.get("QUALIFICATION_TIMING_CAPTURE_PATH") != "/run/qualification/capture.jsonl":
+            raise QualificationRuntimeFailure("runtime_inspect_drift")
+    elif "QUALIFICATION_TIMING_CAPTURE_PATH" in environment:
         raise QualificationRuntimeFailure("runtime_inspect_drift")
 
 
@@ -2250,6 +2393,7 @@ def _ensure_live(
     spec: _RuntimeSpec,
     image_id: str,
     volume_name: str,
+    timing_volume_name: str | None,
     instance: str,
     stage: RuntimeStage,
 ) -> None:
@@ -2261,6 +2405,7 @@ def _ensure_live(
         image_id=image_id,
         container_id=container_id,
         volume_name=volume_name,
+        timing_volume_name=timing_volume_name,
         instance=instance,
         stage=stage,
     )
@@ -2344,6 +2489,14 @@ def _proxy_lease(
         preflight_ledger=_scored_ledger_path(binding.preflight_run_dir, "preflight"),
         output_ledger=_scored_ledger_path(private_run_dir, stage),
         attestation_path=attestation_path,
+        proxy_timing_ledger=_proxy_timing_ledger_path(private_run_dir, stage) if stage == "score-proxy" else None,
+        proxy_raw_timing_capture=_proxy_raw_timing_capture_path(private_run_dir) if stage == "score-proxy" else None,
+        proxy_provisional_request_ledger=(
+            _proxy_provisional_request_ledger_path(private_run_dir) if stage == "score-proxy" else None
+        ),
+        proxy_request_accounting_provisional_ledger=(
+            _proxy_request_accounting_provisional_ledger_path(private_run_dir) if stage == "score-proxy" else None
+        ),
     )
 
 
@@ -2387,12 +2540,14 @@ def _direct_lease(
         preflight_ledger=_scored_ledger_path(binding.preflight_run_dir, "preflight"),
         output_ledger=_scored_ledger_path(private_run_dir, stage),
         attestation_path=attestation_path,
+        direct_timing_ledger=_direct_timing_ledger_path(private_run_dir) if stage == "score-direct" else None,
+        direct_provisional_request_ledger=(
+            _direct_provisional_request_ledger_path(private_run_dir) if stage == "score-direct" else None
+        ),
     )
 
 
-def _model_evidence_contract(
-    spec: _RuntimeSpec, stage: RuntimeStage, binding: _StageBinding
-) -> ModelEvidenceContract:
+def _model_evidence_contract(spec: _RuntimeSpec, stage: RuntimeStage, binding: _StageBinding) -> ModelEvidenceContract:
     """Construct C1's private contract from the strict manifest without exposing it."""
 
     parsed = urlsplit(spec.model.upstream_url)
@@ -2593,9 +2748,7 @@ def _begin_proxy_reconciliation(
             slot_ordinal=binding.slot_ordinal,
             cache_lane=cache_lane,
             pair_index=binding.pair_index,
-            attestation_sha256=_private_file_sha256(
-                attestation_path, "runtime_reconciliation_invalid"
-            ),
+            attestation_sha256=_private_file_sha256(attestation_path, "runtime_reconciliation_invalid"),
         )
         return ProxyReconciliationSession.begin(
             identity,
@@ -2625,34 +2778,38 @@ def _complete_proxy_reconciliation(
     cache_lane = cast(Literal["cold", "warm-prefix"], binding.cache_lane)
     observer_path = _observer_ledger_path(private_run_dir, "score-proxy")
     request_path = _proxy_request_ledger_path(private_run_dir, "score-proxy")
+    timing_path = _proxy_timing_ledger_path(private_run_dir, "score-proxy")
     evidence_path = _model_evidence_path(private_run_dir, "score-proxy")
     try:
+        observer_records = read_model_boundary_observer_records(observer_path)
+        request_records = read_request_accounting_ledger(request_path)
+        timing_rows = read_timing_ledger(timing_path)
+        verify_timing_ledger_linkage(
+            timing_rows,
+            [request_accounting_record_payload(record) for record in request_records],
+            [record.to_dict() for record in observer_records],
+        )
         context = ReconciliationContext(
             run_manifest_sha256=spec.manifest_sha256,
             campaign_id_sha256=binding.campaign_id_sha256,
             slot_ordinal=binding.slot_ordinal,
             cache_lane=cache_lane,
             pair_index=binding.pair_index,
-            attestation_sha256=_private_file_sha256(
-                attestation_path, "runtime_reconciliation_invalid"
-            ),
-            model_evidence_sha256=_private_file_sha256(
-                evidence_path, "runtime_reconciliation_invalid"
-            ),
-            observer_ledger_sha256=_private_file_sha256(
-                observer_path, "runtime_reconciliation_invalid"
-            ),
-            request_ledger_sha256=_private_file_sha256(
-                request_path, "runtime_reconciliation_invalid"
-            ),
+            attestation_sha256=_private_file_sha256(attestation_path, "runtime_reconciliation_invalid"),
+            model_evidence_sha256=_private_file_sha256(evidence_path, "runtime_reconciliation_invalid"),
+            observer_ledger_sha256=_private_file_sha256(observer_path, "runtime_reconciliation_invalid"),
+            request_ledger_sha256=_private_file_sha256(request_path, "runtime_reconciliation_invalid"),
+            timing_ledger_sha256=_private_file_sha256(timing_path, "runtime_timing_ledger_invalid"),
         )
         result = session.complete(
             context,
-            read_model_boundary_observer_records(observer_path),
-            read_request_accounting_ledger(request_path),
+            observer_records,
+            request_records,
             model_summary,
             _proxy_reconciliation_path(private_run_dir),
         )
+    except TimingFailure:
+        raise QualificationRuntimeFailure("runtime_timing_ledger_invalid") from None
     except (ReconciliationFailure, QualificationRuntimeFailure) as error:
         raise QualificationRuntimeFailure(error.category) from None
     except PreflightFailure:
@@ -2660,6 +2817,111 @@ def _complete_proxy_reconciliation(
     if result.status != "passed" or _SHA256.fullmatch(result.file_sha256) is None:
         raise QualificationRuntimeFailure("runtime_reconciliation_invalid")
     return result.file_sha256
+
+
+def _finalize_direct_timing(private_run_dir: Path, binding: _StageBinding) -> None:
+    try:
+        observers = tuple(
+            record.to_dict()
+            for record in read_model_boundary_observer_records(
+                _direct_attempt_ledger_path_required(private_run_dir, "score-direct")
+            )
+        )
+        finalize_timing_evidence(
+            arm="direct",
+            cache_lane=cast(Literal["cold", "warm-prefix"], binding.cache_lane),
+            provisional_client_path=_direct_provisional_request_ledger_path(private_run_dir),
+            timing_path=_direct_timing_ledger_path(private_run_dir),
+            observer_records=observers,
+        )
+    except (TimingFailure, PreflightFailure, QualificationRuntimeFailure):
+        raise QualificationRuntimeFailure("runtime_timing_ledger_invalid") from None
+
+
+def _finalize_proxy_timing(private_run_dir: Path, binding: _StageBinding) -> None:
+    try:
+        observers = tuple(
+            record.to_dict()
+            for record in read_model_boundary_observer_records(_observer_ledger_path(private_run_dir, "score-proxy"))
+        )
+        finalize_timing_evidence(
+            arm="proxy",
+            cache_lane=cast(Literal["cold", "warm-prefix"], binding.cache_lane),
+            provisional_client_path=_proxy_provisional_request_ledger_path(private_run_dir),
+            provisional_request_path=_proxy_request_accounting_provisional_ledger_path(private_run_dir),
+            final_request_path=_proxy_request_ledger_path(private_run_dir, "score-proxy"),
+            raw_capture_path=_proxy_raw_timing_capture_path(private_run_dir),
+            timing_path=_proxy_timing_ledger_path(private_run_dir, "score-proxy"),
+            observer_records=observers,
+        )
+    except (TimingFailure, PreflightFailure, QualificationRuntimeFailure):
+        raise QualificationRuntimeFailure("runtime_timing_ledger_invalid") from None
+
+
+def _extract_proxy_timing_capture(runner: RuntimeCommandRunner, container_id: str, destination: Path) -> None:
+    """Copy only the fixed sink file into the supervisor-reserved host inode."""
+    # The destination is reserved empty immediately before launch.  A
+    # non-empty destination is an invariant violation, never an alternate
+    # source of evidence.
+    metadata = runner.run(
+        (
+            "docker",
+            "exec",
+            "--user",
+            "10001:10001",
+            container_id,
+            "stat",
+            "-c",
+            "%u:%g:%a:%s",
+            "/run/qualification/capture.jsonl",
+        )
+    )
+    expected_size = -1
+    try:
+        uid, gid, mode, size = metadata.stdout.strip().split(":")
+        expected_size = int(size)
+        valid_metadata = (
+            metadata.returncode == 0
+            and (uid, gid, mode) == ("10001", "10001", "600")
+            and 0 <= expected_size <= TIMING_EVIDENCE_MAX_BYTES
+        )
+    except (TypeError, ValueError):
+        valid_metadata = False
+    if not valid_metadata:
+        raise QualificationRuntimeFailure("runtime_timing_ledger_invalid")
+    result = runner.run(
+        ("docker", "exec", "--user", "10001:10001", container_id, "cat", "/run/qualification/capture.jsonl")
+    )
+    if result.returncode != 0:
+        raise QualificationRuntimeFailure("runtime_timing_ledger_invalid")
+    payload = result.stdout.encode("utf-8")
+    if len(payload) > TIMING_EVIDENCE_MAX_BYTES or len(payload) != expected_size:
+        raise QualificationRuntimeFailure("runtime_timing_ledger_invalid")
+    descriptor: int | None = None
+    try:
+        listed = destination.lstat()
+        if (
+            destination.is_symlink()
+            or not stat.S_ISREG(listed.st_mode)
+            or stat.S_IMODE(listed.st_mode) != 0o600
+            or listed.st_size != 0
+        ):
+            raise OSError
+        descriptor = os.open(destination, os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or (opened.st_dev, opened.st_ino) != (listed.st_dev, listed.st_ino)
+        ):
+            raise OSError
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+    except OSError:
+        raise QualificationRuntimeFailure("runtime_timing_ledger_invalid") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _write_attestation(
@@ -2815,16 +3077,18 @@ def _read_private_file(path: Path, category: str) -> bytes:
 def _atomic_write_no_clobber(path: Path, record: dict[str, Any]) -> None:
     if path.exists() or path.is_symlink():
         raise QualificationRuntimeFailure("runtime_evidence_exists")
-    payload = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    payload = (json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    descriptor: int | None = None
+    temporary: Path | None = None
     try:
         descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         temporary = Path(temporary_name)
         try:
             os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
+            _write_all(descriptor, payload)
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
             os.link(temporary, path)
             temporary.unlink()
             directory = os.open(path.parent, os.O_RDONLY)
@@ -2840,15 +3104,22 @@ def _atomic_write_no_clobber(path: Path, record: dict[str, Any]) -> None:
             raise
     except OSError as error:
         raise QualificationRuntimeFailure("runtime_evidence_write_failed") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
-def _validate_stage_evidence_absent(
-    private_run_dir: Path, stage: RuntimeStage, binding: _StageBinding
-) -> None:
-    if any(
-        path.exists() or path.is_symlink()
-        for path in _reserved_stage_paths(private_run_dir, stage, binding)
-    ):
+def _write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise OSError("private evidence partial write")
+        offset += written
+
+
+def _validate_stage_evidence_absent(private_run_dir: Path, stage: RuntimeStage, binding: _StageBinding) -> None:
+    if any(path.exists() or path.is_symlink() for path in _reserved_stage_paths(private_run_dir, stage, binding)):
         raise QualificationRuntimeFailure("runtime_evidence_exists")
 
 
@@ -2993,10 +3264,12 @@ def _cleanup_runtime(
     proxy_name: str | None,
     initializer_name: str | None,
     volume_name: str | None,
+    timing_volume_name: str | None,
     *,
     proxy_attempted: bool,
     initializer_attempted: bool,
     volume_attempted: bool,
+    timing_volume_attempted: bool,
     spec_manifest_sha256: str | None,
     instance: str | None,
     stage: RuntimeStage,
@@ -3042,6 +3315,13 @@ def _cleanup_runtime(
             failed = failed or _remove_owned_volume(runner, volume_name, spec_manifest_sha256, instance, stage)
         except Exception:
             failed = True
+    if timing_volume_name is not None and timing_volume_attempted:
+        try:
+            failed = failed or _remove_owned_volume(
+                runner, timing_volume_name, spec_manifest_sha256, instance, stage, resource="timing-volume"
+            )
+        except Exception:
+            failed = True
     return failed
 
 
@@ -3069,13 +3349,15 @@ def _remove_owned_volume(
     manifest_sha256: str | None,
     instance: str | None,
     stage: RuntimeStage,
+    *,
+    resource: Literal["secrets-volume", "timing-volume"] = "secrets-volume",
 ) -> bool:
     """Delete only the predeclared labelled secret volume, after both containers are resolved."""
 
     result = runner.run(("docker", "volume", "inspect", "--format", "{{json .Labels}}", volume_name))
     if result.returncode != 0:
         return not _resource_is_absent(result)
-    if not _owned_volume_labels(result.stdout, manifest_sha256, instance, stage):
+    if not _owned_volume_labels(result.stdout, manifest_sha256, instance, stage, resource=resource):
         return True
     return runner.run(("docker", "volume", "rm", volume_name)).returncode != 0
 
@@ -3120,7 +3402,12 @@ def _owned_container_labels(
 
 
 def _owned_volume_labels(
-    serialized: str, manifest_sha256: str | None, instance: str | None, stage: RuntimeStage
+    serialized: str,
+    manifest_sha256: str | None,
+    instance: str | None,
+    stage: RuntimeStage,
+    *,
+    resource: Literal["secrets-volume", "timing-volume"] = "secrets-volume",
 ) -> bool:
     if manifest_sha256 is None or instance is None:
         return False
@@ -3130,7 +3417,7 @@ def _owned_volume_labels(
         and value.get(f"{_LABEL_PREFIX}.manifest") == manifest_sha256
         and value.get(f"{_LABEL_PREFIX}.instance") == instance
         and value.get(f"{_LABEL_PREFIX}.stage") == _attestation_stage(stage)
-        and value.get(f"{_LABEL_PREFIX}.resource") == "secrets-volume"
+        and value.get(f"{_LABEL_PREFIX}.resource") == resource
     )
 
 
@@ -3248,6 +3535,34 @@ def _proxy_reconciliation_path(private_run_dir: Path) -> Path:
     return private_run_dir / "scored-proxy-reconciliation.json"
 
 
+def _proxy_timing_ledger_path(private_run_dir: Path, stage: RuntimeStage) -> Path:
+    """Return the final sink-bound timing ledger for the scored proxy only."""
+
+    if stage != "score-proxy":
+        raise QualificationRuntimeFailure("runtime_stage_invalid")
+    return private_run_dir / "scored-proxy-timing.jsonl"
+
+
+def _direct_timing_ledger_path(private_run_dir: Path) -> Path:
+    return private_run_dir / "scored-direct-timing.jsonl"
+
+
+def _proxy_raw_timing_capture_path(private_run_dir: Path) -> Path:
+    return private_run_dir / "scored-proxy-raw-timing-capture.jsonl"
+
+
+def _proxy_provisional_request_ledger_path(private_run_dir: Path) -> Path:
+    return private_run_dir / "scored-proxy-provisional-requests.jsonl"
+
+
+def _direct_provisional_request_ledger_path(private_run_dir: Path) -> Path:
+    return private_run_dir / "scored-direct-provisional-requests.jsonl"
+
+
+def _proxy_request_accounting_provisional_ledger_path(private_run_dir: Path) -> Path:
+    return private_run_dir / "scored-proxy-provisional-accounting.jsonl"
+
+
 def _direct_attempt_ledger_path(private_run_dir: Path, stage: RuntimeStage) -> Path | None:
     if stage == "preflight":
         return private_run_dir / "preflight-direct-model-boundary.jsonl"
@@ -3307,6 +3622,10 @@ def _observer_identity(manifest_sha256: str, instance: str) -> str:
 
 def _volume_name(instance: str) -> str:
     return f"shiftedx-qualification-secrets-{instance}"
+
+
+def _timing_volume_name(instance: str) -> str:
+    return f"shiftedx-qualification-timing-{instance}"
 
 
 def _initializer_name(instance: str, stage: RuntimeStage) -> str:

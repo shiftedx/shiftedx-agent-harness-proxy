@@ -38,6 +38,7 @@ _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _HTTP_SAFE_TOKEN = re.compile(r"^[A-Za-z0-9\-._~+/=]{1,8192}$")
 _FAILURE_CATEGORY = re.compile(r"^[a-z0-9_]+$")
 _SAFE_TEXT = re.compile(r"^[^\x00-\x1f\x7f]{1,512}$")
+_SUPPORTED_MTPLX_VERSIONS = frozenset({"2.7.1", "2.9.0"})
 _ATTEMPT_KEYS = frozenset(
     {
         "request_digest",
@@ -624,7 +625,7 @@ class SystemModelEvidenceProbe:
 
 
 def _project_mtplx_health(value: Mapping[str, Any]) -> dict[str, Any]:
-    """Reduce the raw 2.7.1 health object to its safe identity/accounting core."""
+    """Reduce a supported MTPLX health object to its safe identity/accounting core."""
 
     try:
         health = dict(value)
@@ -702,7 +703,7 @@ def _project_mtplx_models(value: Mapping[str, Any], public_model_id: str) -> dic
 
 
 def _project_mtplx_settings(value: Mapping[str, Any]) -> dict[str, Any]:
-    """Freeze the reviewed 2.7.1 safe settings surface and ignore raw extras."""
+    """Freeze the reviewed safe settings surface and ignore raw extras."""
 
     try:
         settings = dict(value)
@@ -762,7 +763,7 @@ def _validate_contract(contract: ModelEvidenceContract) -> _ValidatedContract:
             or _SAFE_TEXT.fullmatch(contract.public_model_id) is None
             or not _absolute_directory(contract.stage_path)
             or _REVISION.fullmatch(contract.stage_revision) is None
-            or contract.mtplx_version != "2.7.1"
+            or contract.mtplx_version not in _SUPPORTED_MTPLX_VERSIONS
             or _SHA256.fullmatch(contract.identity_ledger_sha256) is None
             or _SHA256.fullmatch(contract.inspect_artifact_sha256) is None
             or _SHA256.fullmatch(contract.runtime_executable_sha256) is None
@@ -924,12 +925,12 @@ def _distribution_aggregate(contract: ModelEvidenceContract) -> str:
         if len(metadata) != 1 or not verified:
             raise ModelEvidenceFailure("model_package_invalid")
         metadata_fields = _metadata_fields(metadata[0].decode("utf-8"))
-        if metadata_fields.get("Name") != "mtplx" or metadata_fields.get("Version") != "2.7.1":
+        if metadata_fields.get("Name") != "mtplx" or metadata_fields.get("Version") != contract.mtplx_version:
             raise ModelEvidenceFailure("model_package_invalid")
         return _canonical_sha256(
             {
                 "name": "mtplx",
-                "version": "2.7.1",
+                "version": contract.mtplx_version,
                 "files": sorted(verified),
                 "ignored_record_entries": sorted(ignored_external),
             }

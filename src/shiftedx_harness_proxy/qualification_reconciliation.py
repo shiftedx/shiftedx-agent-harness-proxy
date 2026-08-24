@@ -85,6 +85,7 @@ _REQUEST_RECORD_KEYS = frozenset(
         "correction_count",
         "blocked_duplicate_count",
         "blocked_stall_count",
+        "avoided_immediate_upstream_calls",
     }
 )
 _MAX_PRIVATE_LEDGER_BYTES = 1024 * 1024
@@ -131,6 +132,7 @@ class ReconciliationContext:
     model_evidence_sha256: str
     observer_ledger_sha256: str
     request_ledger_sha256: str
+    timing_ledger_sha256: str
 
 
 @dataclass(frozen=True)
@@ -179,6 +181,7 @@ class RequestAccountingRecord:
     blocked_duplicate_count: int
     blocked_stall_count: int
     correction_count: int = 0
+    avoided_immediate_upstream_calls: int = 0
 
 
 @dataclass(frozen=True)
@@ -237,8 +240,9 @@ def read_request_accounting_ledger(path: Path) -> tuple[RequestAccountingRecord,
                 blocked_duplicate_count=value["blocked_duplicate_count"],
                 blocked_stall_count=value["blocked_stall_count"],
                 correction_count=value["correction_count"],
+                avoided_immediate_upstream_calls=value["avoided_immediate_upstream_calls"],
             )
-            if not _valid_request_scalars(record):
+            if not _valid_request_ledger_scalars(record):
                 raise ValueError
             records.append(record)
         if not _request_sequences_match(records):
@@ -248,9 +252,7 @@ def read_request_accounting_ledger(path: Path) -> tuple[RequestAccountingRecord,
         raise ReconciliationFailure("reconciliation_request_ledger_invalid") from None
 
 
-def write_request_accounting_ledger(
-    path: Path, records: Sequence[RequestAccountingRecord]
-) -> None:
+def write_request_accounting_ledger(path: Path, records: Sequence[RequestAccountingRecord]) -> None:
     """Atomically retain the runner's exact payload-free request accounting ledger.
 
     This is deliberately the sole serialization seam for these records.  The
@@ -264,30 +266,11 @@ def write_request_accounting_ledger(
     if (
         len(values) > _MAX_REQUEST_RECORDS
         or not _request_sequences_match(values)
-        or not all(_valid_request_scalars(value) for value in values)
+        or not all(_valid_request_ledger_scalars(value) for value in values)
     ):
         raise ReconciliationFailure("reconciliation_request_ledger_invalid")
     payload = b"".join(
-        (
-            _canonical(
-                {
-                    "sequence": record.sequence,
-                    "outcome": record.outcome,
-                    "local_projection": record.local_projection,
-                    "attempt_sequence_start": record.attempt_sequence_start,
-                    "attempt_sequence_end": record.attempt_sequence_end,
-                    "attempt_count": record.attempt_count,
-                    "successful_attempt_count": record.successful_attempt_count,
-                    "phase_counts": dict(record.phase_counts),
-                    "retry_attempt_count": record.retry_attempt_count,
-                    "correction_count": record.correction_count,
-                    "blocked_duplicate_count": record.blocked_duplicate_count,
-                    "blocked_stall_count": record.blocked_stall_count,
-                }
-            ).encode("utf-8")
-            + b"\n"
-        )
-        for record in values
+        (_canonical(request_accounting_record_payload(record)).encode("utf-8") + b"\n") for record in values
     )
     if len(payload) > _MAX_PRIVATE_LEDGER_BYTES:
         raise ReconciliationFailure("reconciliation_request_ledger_invalid")
@@ -298,6 +281,30 @@ def write_request_accounting_ledger(
         parent_category="reconciliation_request_ledger_parent_invalid",
         write_category="reconciliation_request_ledger_write_failed",
     )
+
+
+def request_accounting_record_payload(record: RequestAccountingRecord) -> dict[str, object]:
+    """Return the exact canonical-safe row shape used by the private ledger.
+
+    Timing linkage hashes this mapping before reconciliation exists, so callers
+    can prove a row binding without parsing or retaining request payloads.
+    """
+
+    return {
+        "sequence": record.sequence,
+        "outcome": record.outcome,
+        "local_projection": record.local_projection,
+        "attempt_sequence_start": record.attempt_sequence_start,
+        "attempt_sequence_end": record.attempt_sequence_end,
+        "attempt_count": record.attempt_count,
+        "successful_attempt_count": record.successful_attempt_count,
+        "phase_counts": dict(record.phase_counts),
+        "retry_attempt_count": record.retry_attempt_count,
+        "correction_count": record.correction_count,
+        "blocked_duplicate_count": record.blocked_duplicate_count,
+        "blocked_stall_count": record.blocked_stall_count,
+        "avoided_immediate_upstream_calls": record.avoided_immediate_upstream_calls,
+    }
 
 
 def load_passed_proxy_reconciliation(
@@ -332,9 +339,7 @@ class ProxyReconciliationSession:
         self._completed = False
 
     @classmethod
-    def begin(
-        cls, identity: ReconciliationIdentity, metrics_reader: MetricsReader
-    ) -> ProxyReconciliationSession:
+    def begin(cls, identity: ReconciliationIdentity, metrics_reader: MetricsReader) -> ProxyReconciliationSession:
         """Validate immutable identity and require a fresh zero-counter proxy."""
 
         _validate_identity(identity)
@@ -468,6 +473,7 @@ def _validate_context(context: ReconciliationContext) -> None:
             context.model_evidence_sha256,
             context.observer_ledger_sha256,
             context.request_ledger_sha256,
+            context.timing_ledger_sha256,
         )
     ):
         raise ReconciliationFailure("reconciliation_context_invalid")
@@ -499,6 +505,7 @@ def _valid_passed_artifact(value: object, context: ReconciliationContext) -> boo
         "model_evidence_sha256",
         "observer_ledger_sha256",
         "request_ledger_sha256",
+        "timing_ledger_sha256",
         "before_metrics_sha256",
         "after_metrics_sha256",
         "deltas",
@@ -507,7 +514,7 @@ def _valid_passed_artifact(value: object, context: ReconciliationContext) -> boo
     }:
         return False
     if (
-        value.get("schema_version") != "1.0"
+        value.get("schema_version") != "2.0"
         or value.get("record_type") != "qualification_proxy_reconciliation"
         or value.get("status") != "passed"
         or value.get("failure_category") is not None
@@ -520,6 +527,7 @@ def _valid_passed_artifact(value: object, context: ReconciliationContext) -> boo
         or value.get("model_evidence_sha256") != context.model_evidence_sha256
         or value.get("observer_ledger_sha256") != context.observer_ledger_sha256
         or value.get("request_ledger_sha256") != context.request_ledger_sha256
+        or value.get("timing_ledger_sha256") != context.timing_ledger_sha256
         or not _sha256(value.get("before_metrics_sha256"))
         or not _sha256(value.get("after_metrics_sha256"))
     ):
@@ -554,6 +562,7 @@ def _artifact_context(value: object) -> ReconciliationContext | None:
             model_evidence_sha256=value["model_evidence_sha256"],
             observer_ledger_sha256=value["observer_ledger_sha256"],
             request_ledger_sha256=value["request_ledger_sha256"],
+            timing_ledger_sha256=value["timing_ledger_sha256"],
         )
         _validate_context(context)
     except (KeyError, ReconciliationFailure, TypeError):
@@ -628,12 +637,8 @@ def _derive(
     observers = tuple(observer_records)
     requests = tuple(request_records)
     phases = [cast(Mapping[str, object], item.fields).get("compatibility") for item in observers]
-    acquisition = sum(
-        1 for value in phases if isinstance(value, Mapping) and value.get("phase") == "acquisition"
-    )
-    finalization = sum(
-        1 for value in phases if isinstance(value, Mapping) and value.get("phase") == "finalization"
-    )
+    acquisition = sum(1 for value in phases if isinstance(value, Mapping) and value.get("phase") == "acquisition")
+    finalization = sum(1 for value in phases if isinstance(value, Mapping) and value.get("phase") == "finalization")
     succeeded_attempts = sum(
         1 for item in observers if isinstance(item.status_code, int) and 200 <= item.status_code < 300
     )
@@ -644,9 +649,11 @@ def _derive(
         "failed_attempt_count": len(observers) - succeeded_attempts,
         "acquisition_count": acquisition,
         "finalization_count": finalization,
-        "successful_corrections": sum(
-            item.correction_count for item in requests if item.outcome == "succeeded"
-        ),
+        # A failed/cancelled/deadline request may have already performed a
+        # correction or blocked unsafe calls.  Those are real proxy-side
+        # interventions and must reconcile rather than disappearing merely
+        # because no downstream response was ultimately released.
+        "successful_corrections": sum(item.correction_count for item in requests),
         "total_retry_attempts": sum(item.retry_attempt_count for item in requests),
         "local_projection_count": sum(item.local_projection for item in requests),
         "failed_request_count": sum(item.outcome == "failed" for item in requests),
@@ -707,33 +714,26 @@ def _checks(
         "downstream": deltas["downstream_requests"] == derived["request_count"],
         "upstream": deltas["upstream_calls"] == derived["attempt_count"],
         "corrections": deltas["correction_turns"] == derived["successful_corrections"]
-        and deltas["blocked_duplicates"]
-        == sum(record.blocked_duplicate_count for record in request_records if record.outcome == "succeeded")
-        and deltas["blocked_stalls"]
-        == sum(record.blocked_stall_count for record in request_records if record.outcome == "succeeded"),
+        and deltas["blocked_duplicates"] == sum(record.blocked_duplicate_count for record in request_records)
+        and deltas["blocked_stalls"] == sum(record.blocked_stall_count for record in request_records),
         "projections": deltas["receipt_projections"]
         == deltas["local_projection_upstream_calls_avoided"]
         == derived["local_projection_count"],
         "errors": deltas["errors"]
-        == derived["failed_request_count"]
-        + derived["cancelled_request_count"]
-        + derived["deadline_request_count"]
+        == derived["failed_request_count"] + derived["cancelled_request_count"] + derived["deadline_request_count"]
         and deltas["cancellations"] == derived["cancelled_request_count"]
         and deltas["deadline_expiries"] == derived["deadline_request_count"]
         and deltas["phase_schema_rejections"] == 0
         and deltas["admission_rejections"] == 0
         and deltas["rate_rejections"] == 0,
         "model_operations": derived["prime_count"] == (1 if context.cache_lane == "warm-prefix" else 0)
-        and derived["model_completed_delta"]
-        == derived["prime_count"] + derived["successful_attempt_count"],
+        and derived["model_completed_delta"] == derived["prime_count"] + derived["successful_attempt_count"],
     }
 
 
 def _request_sequences_match(request_records: Sequence[RequestAccountingRecord]) -> bool:
     return all(
-        type(record) is RequestAccountingRecord
-        and _positive_int(record.sequence)
-        and record.sequence == expected
+        type(record) is RequestAccountingRecord and _positive_int(record.sequence) and record.sequence == expected
         for expected, record in enumerate(request_records, start=1)
     )
 
@@ -757,6 +757,20 @@ def _attempt_partition_matches(
                 or record.successful_attempt_count != 0
                 or record.retry_attempt_count != 0
                 or record.correction_count != 0
+                or record.blocked_duplicate_count != 0
+                or record.blocked_stall_count != 0
+                or record.avoided_immediate_upstream_calls != 1
+                or any(record.phase_counts.values())
+            ):
+                return False
+            continue
+        if record.avoided_immediate_upstream_calls != 0:
+            return False
+        if record.attempt_count == 0:
+            if (
+                record.attempt_sequence_start is not None
+                or record.attempt_sequence_end is not None
+                or record.successful_attempt_count != 0
                 or any(record.phase_counts.values())
             ):
                 return False
@@ -797,7 +811,11 @@ def _valid_observer(record: ModelBoundaryRecord, expected_sequence: int) -> bool
     ):
         return False
     compatibility = record.fields.get("compatibility")
-    return isinstance(compatibility, Mapping) and compatibility.get("phase") in {"acquisition", "finalization"}
+    return isinstance(compatibility, Mapping) and compatibility.get("phase") in {
+        "acquisition",
+        "finalization",
+        "terminal",
+    }
 
 
 def _valid_request_scalars(record: object) -> bool:
@@ -814,14 +832,6 @@ def _valid_request_scalars(record: object) -> bool:
             and not _positive_int(record.attempt_sequence_start)
             or record.attempt_sequence_end is not None
             and not _positive_int(record.attempt_sequence_end)
-            or record.outcome != "succeeded"
-            and any(
-                (
-                    record.correction_count,
-                    record.blocked_duplicate_count,
-                    record.blocked_stall_count,
-                )
-            )
         )
         phase_values = tuple(record.phase_counts.values())
     except (AttributeError, TypeError):
@@ -835,9 +845,40 @@ def _valid_request_scalars(record: object) -> bool:
         record.correction_count,
         record.blocked_duplicate_count,
         record.blocked_stall_count,
+        record.avoided_immediate_upstream_calls,
         *phase_values,
     )
     return all(_nonnegative_int(value) for value in counts) and record.successful_attempt_count <= record.attempt_count
+
+
+def _valid_request_ledger_scalars(record: object) -> bool:
+    """Apply the stricter immutable-ledger contract without changing session errors.
+
+    The reconciliation session preserves its established distinction between a
+    malformed scalar record and an attempt-partition mismatch.  The standalone
+    reader/writer has no observer sequence to reconcile, so it must reject an
+    impossible Local Projection or unsupported avoided-call claim eagerly.
+    """
+
+    if not _valid_request_scalars(record):
+        return False
+    assert isinstance(record, RequestAccountingRecord)
+    phase_values = tuple(record.phase_counts.values())
+    if record.local_projection:
+        return (
+            record.outcome == "succeeded"
+            and record.attempt_sequence_start is None
+            and record.attempt_sequence_end is None
+            and record.attempt_count == 0
+            and record.successful_attempt_count == 0
+            and record.retry_attempt_count == 0
+            and record.correction_count == 0
+            and record.blocked_duplicate_count == 0
+            and record.blocked_stall_count == 0
+            and record.avoided_immediate_upstream_calls == 1
+            and not any(phase_values)
+        )
+    return record.avoided_immediate_upstream_calls == 0
 
 
 def _phase_counts_match(
@@ -852,6 +893,8 @@ def _phase_counts_match(
             return False
         if record.local_projection:
             selected: tuple[ModelBoundaryRecord, ...] = ()
+        elif record.attempt_count == 0:
+            selected = ()
         elif (
             not _positive_int(record.attempt_sequence_start)
             or not _positive_int(record.attempt_sequence_end)
@@ -859,22 +902,23 @@ def _phase_counts_match(
         ):
             return False
         else:
-            selected = observers[
-                cast(int, record.attempt_sequence_start) - 1 : cast(int, record.attempt_sequence_end)
-            ]
+            selected = observers[cast(int, record.attempt_sequence_start) - 1 : cast(int, record.attempt_sequence_end)]
         counts = {"acquisition": 0, "finalization": 0}
+        terminal_count = 0
         for observer in selected:
             compatibility = observer.fields.get("compatibility")
             phase = compatibility.get("phase") if isinstance(compatibility, Mapping) else None
-            if phase not in counts:
+            if phase == "terminal":
+                terminal_count += 1
+            elif phase not in counts:
                 return False
-            if phase == "acquisition":
+            elif phase == "acquisition":
                 counts["acquisition"] += 1
             else:
                 counts["finalization"] += 1
         if dict(record.phase_counts) != counts:
             return False
-        distinct_phases = sum(value > 0 for value in counts.values())
+        distinct_phases = sum(value > 0 for value in counts.values()) + int(terminal_count > 0)
         if record.retry_attempt_count != record.attempt_count - distinct_phases:
             return False
     return True
@@ -918,7 +962,7 @@ def _artifact_record(
     checks: Mapping[str, bool],
 ) -> dict[str, object]:
     return {
-        "schema_version": "1.0",
+        "schema_version": "2.0",
         "record_type": "qualification_proxy_reconciliation",
         "status": status,
         "failure_category": failure_category,
@@ -931,6 +975,7 @@ def _artifact_record(
         "model_evidence_sha256": context.model_evidence_sha256,
         "observer_ledger_sha256": context.observer_ledger_sha256,
         "request_ledger_sha256": context.request_ledger_sha256,
+        "timing_ledger_sha256": context.timing_ledger_sha256,
         "before_metrics_sha256": _canonical_sha256(before.to_dict()),
         "after_metrics_sha256": _canonical_sha256(after.to_dict()) if after is not None else None,
         "deltas": {key: deltas[key] for key in _METRIC_KEYS},
@@ -980,9 +1025,7 @@ def _atomic_write_private_payload(
             or stat.S_IMODE(parent_status.st_mode) != 0o700
         ):
             raise ReconciliationFailure(parent_category)
-        directory = os.open(
-            path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        )
+        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
         opened_parent = os.fstat(directory)
         if (opened_parent.st_dev, opened_parent.st_ino) != (parent_status.st_dev, parent_status.st_ino):
             raise ReconciliationFailure(parent_category)
@@ -1040,7 +1083,10 @@ def _atomic_write_private_payload(
 def _write_all(descriptor: int, payload: bytes) -> None:
     offset = 0
     while offset < len(payload):
-        offset += os.write(descriptor, payload[offset:])
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise OSError("private evidence partial write")
+        offset += written
 
 
 def _read_all(descriptor: int) -> bytes:

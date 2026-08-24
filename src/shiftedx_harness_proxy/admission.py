@@ -13,6 +13,7 @@ from typing import Any
 from .config import Settings
 from .errors import ProxyError
 from .provider_capabilities import CapabilityPhase, current_upstream_phase
+from .qualification_timing import begin_upstream_attempt, current_request_timing, end_upstream_attempt
 from .transport import Upstream
 
 _GLOBAL_BUDGET_KEY = "global"
@@ -63,6 +64,17 @@ class AdmissionController:
     @asynccontextmanager
     async def admit(self, principal_key: str | None) -> AsyncIterator[None]:
         """Acquire global and optional principal budgets before reading a body."""
+        started_ns = time.perf_counter_ns()
+        timing_recorded = False
+
+        def record_wait() -> None:
+            nonlocal timing_recorded
+            if not timing_recorded:
+                timing = current_request_timing()
+                if timing is not None:
+                    timing.record_admission_wait(time.perf_counter_ns() - started_ns)
+                timing_recorded = True
+
         self.queued += 1
         global_acquired = False
         principal: _PrincipalBudget | None = None
@@ -85,7 +97,11 @@ class AdmissionController:
             self.queued -= 1
             self.active += 1
             active = True
+            record_wait()
             yield
+        except BaseException:
+            record_wait()
+            raise
         finally:
             if not active:
                 self.queued -= 1
@@ -100,8 +116,9 @@ class AdmissionController:
             await self._prune_principals()
 
     @asynccontextmanager
-    async def upstream_slot(self) -> AsyncIterator[None]:
+    async def upstream_slot(self) -> AsyncIterator[int]:
         """Acquire one upstream connection/work slot for exactly one operation."""
+        started_ns = time.perf_counter_ns()
         try:
             await asyncio.wait_for(
                 self._upstream.acquire(), timeout=self.settings.concurrency_wait_seconds
@@ -115,7 +132,7 @@ class AdmissionController:
             ) from exc
         self.upstream_active += 1
         try:
-            yield
+            yield time.perf_counter_ns() - started_ns
         finally:
             self.upstream_active -= 1
             self._upstream.release()
@@ -197,17 +214,36 @@ class BoundedUpstream:
         self._attempt_observer = attempt_observer or _ignore_attempt
 
     async def chat(self, payload: dict[str, Any], request_headers: dict[str, str]) -> dict[str, Any]:
-        async with self._admission.upstream_slot():
+        async with self._admission.upstream_slot() as slot_wait_ns:
+            _attempt, token = begin_upstream_attempt(current_upstream_phase(), slot_wait_ns)
             self._attempt_observer(current_upstream_phase())
-            return await self._upstream.chat(payload, request_headers)
+            try:
+                result = await self._upstream.chat(payload, request_headers)
+            except BaseException as exc:
+                end_upstream_attempt(token, status="cancelled" if isinstance(exc, asyncio.CancelledError) else "failed")
+                raise
+            else:
+                end_upstream_attempt(token, status="succeeded")
+                return result
 
     async def models(self, request_headers: dict[str, str]) -> dict[str, Any]:
+        # Management probes still share the bounded connection/work pool, but
+        # only chat completions are model-attempt timing records.
         async with self._admission.upstream_slot():
             return await self._upstream.models(request_headers)
 
+    async def combined_tool_terminal_schema_supported(self) -> bool:
+        async with self._admission.upstream_slot():
+            return await self._upstream.combined_tool_terminal_schema_supported()
+
     async def ready(self) -> bool:
         async with self._admission.upstream_slot():
-            return await self._upstream.ready()
+            upstream_ready = await self._upstream.ready()
+        if not upstream_ready:
+            return False
+        if self._admission.settings.upstream_tool_response_capability_mode == "combined_v1":
+            return await self.combined_tool_terminal_schema_supported()
+        return True
 
     async def close(self) -> None:
         await self._upstream.close()

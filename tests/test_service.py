@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict
 
 from shiftedx_harness_proxy.config import Settings
 from shiftedx_harness_proxy.errors import ProxyError
+from shiftedx_harness_proxy.fast_path import InMemoryFastPathObserver
 from shiftedx_harness_proxy.service import ChatService
 
 
@@ -59,6 +60,9 @@ class ScriptedUpstream:
     async def models(self, request_headers: dict[str, str]) -> dict[str, Any]:
         return {"object": "list", "data": []}
 
+    async def combined_tool_terminal_schema_supported(self) -> bool:
+        return False
+
     async def ready(self) -> bool:
         return True
 
@@ -92,6 +96,116 @@ def strict_schema() -> dict[str, Any]:
             },
         },
     }
+
+
+class CombinedScriptedUpstream(ScriptedUpstream):
+    def __init__(self, responses: list[dict[str, Any]], *, supported: bool) -> None:
+        super().__init__(responses)
+        self.supported = supported
+        self.capability_probes = 0
+
+    async def combined_tool_terminal_schema_supported(self) -> bool:
+        self.capability_probes += 1
+        return self.supported
+
+
+@pytest.mark.asyncio
+async def test_shadow_fast_path_records_hash_only_equivalence_but_sends_normal_harness_payload() -> None:
+    upstream = ScriptedUpstream([completion(content="done")])
+    observer = InMemoryFastPathObserver()
+    await ChatService(
+        Settings(upstream_base_url="http://upstream/v1", intervention_fast_path_mode="shadow"),
+        upstream,
+        fast_path_observer=observer,
+    ).complete({"model": "model", "messages": [{"role": "user", "content": "hello"}]}, {})
+
+    assert len(observer.records) == 1
+    safe = observer.records[0].to_safe_dict()
+    assert safe["eligible"] is True
+    assert safe["equivalent"] is True
+    assert "hello" not in str(safe)
+    assert upstream.requests[0]["messages"][0]["role"] == "system"
+    assert upstream.requests[0]["messages"][-1]["content"].startswith("[shiftedx harness]")
+
+
+@pytest.mark.asyncio
+async def test_client_body_or_header_never_selects_fast_path() -> None:
+    upstream = ScriptedUpstream([completion(content="done")])
+    observer = InMemoryFastPathObserver()
+    await ChatService(
+        Settings(upstream_base_url="http://upstream/v1"),
+        upstream,
+        fast_path_observer=observer,
+    ).complete(
+        {
+            "model": "model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "x-shiftedx-fast-path": "enabled",
+        },
+        {"x-shiftedx-fast-path": "enabled"},
+    )
+
+    assert observer.records == []
+    assert upstream.requests[0]["messages"][0]["role"] == "system"
+
+
+@pytest.mark.asyncio
+async def test_combined_mode_forwards_tools_and_strict_schema_together() -> None:
+    upstream = CombinedScriptedUpstream([completion(content='{"status":"done"}')], supported=True)
+    payload = request([{"role": "user", "content": "inspect"}])
+    payload["response_format"] = strict_schema()
+
+    await ChatService(
+        Settings(
+            upstream_base_url="http://upstream/v1",
+            upstream_tool_response_capability_mode="combined_v1",
+        ),
+        upstream,
+    ).complete(payload, {}, harness_enabled=False)
+
+    assert upstream.capability_probes == 1
+    assert upstream.requests[0]["tools"] == payload["tools"]
+    assert upstream.requests[0]["response_format"] == payload["response_format"]
+
+
+@pytest.mark.asyncio
+async def test_combined_mode_fails_closed_without_upstream_chat_when_capability_is_unavailable() -> None:
+    upstream = CombinedScriptedUpstream([completion(content='{"status":"done"}')], supported=False)
+    payload = request([{"role": "user", "content": "inspect"}])
+    payload["response_format"] = strict_schema()
+
+    with pytest.raises(ProxyError, match="combined capability") as raised:
+        await ChatService(
+            Settings(
+                upstream_base_url="http://upstream/v1",
+                upstream_tool_response_capability_mode="combined_v1",
+            ),
+            upstream,
+        ).complete(payload, {})
+
+    assert raised.value.code == "upstream_combined_capability_unavailable"
+    assert upstream.capability_probes == 1
+    assert upstream.requests == []
+
+
+@pytest.mark.asyncio
+async def test_combined_mode_rejects_non_strict_schema_before_capability_probe() -> None:
+    upstream = CombinedScriptedUpstream([completion(content='{"status":"done"}')], supported=True)
+    payload = request([{"role": "user", "content": "inspect"}])
+    payload["response_format"] = {"type": "json_object"}
+
+    with pytest.raises(ProxyError) as raised:
+        await ChatService(
+            Settings(
+                upstream_base_url="http://upstream/v1",
+                upstream_tool_response_capability_mode="combined_v1",
+            ),
+            upstream,
+        ).complete(payload, {})
+
+    assert raised.value.code == "unsupported_combined_schema"
+    assert upstream.capability_probes == 0
+    assert upstream.requests == []
 
 
 @pytest.mark.asyncio
@@ -292,12 +406,35 @@ async def test_phase_split_builds_a_fresh_outbound_payload_for_each_attempt() ->
 
 
 @pytest.mark.asyncio
+async def test_phase_split_releases_a_valid_receipt_backed_acquisition_terminal_without_finalization() -> None:
+    upstream = ScriptedUpstream([completion(content='{"status":"done"}')])
+    payload = request(
+        [
+            {"role": "user", "content": "inspect"},
+            {"role": "assistant", "tool_calls": [call("old", "read_file", '{"path":"a.py"}')]},
+            {"role": "tool", "tool_call_id": "old", "content": "source"},
+        ]
+    )
+    payload["response_format"] = strict_schema()
+
+    result = await ChatService(
+        Settings(upstream_base_url="http://upstream/v1", upstream_tool_response_capability_mode="phase_split"),
+        upstream,
+    ).complete(payload, {})
+
+    assert result.body["choices"][0]["message"]["content"] == '{"status":"done"}'
+    assert result.telemetry.upstream_calls == 1
+    assert len(upstream.requests) == 1
+    assert "tools" in upstream.requests[0]
+    assert "response_format" not in upstream.requests[0]
+
+
+@pytest.mark.asyncio
 async def test_phase_split_keeps_receipt_free_and_invalid_terminals_in_acquisition_until_success() -> None:
     upstream = ScriptedUpstream(
         [
             completion(content="not json"),
             completion(content='{"status":"acquired"}'),
-            completion(content='{"status":"final"}'),
         ]
     )
     payload = request([{"role": "user", "content": "answer"}])
@@ -309,10 +446,10 @@ async def test_phase_split_keeps_receipt_free_and_invalid_terminals_in_acquisiti
         upstream,
     ).complete(payload, {}, policy_extensions_allowed=True)
 
-    assert all("response_format" not in sent and "tools" in sent for sent in upstream.requests[:2])
-    assert "response_format" in upstream.requests[2]
-    assert "tools" not in upstream.requests[2]
-    assert result.body["choices"][0]["message"]["content"] == '{"status":"final"}'
+    assert all("response_format" not in sent and "tools" in sent for sent in upstream.requests)
+    assert result.telemetry.upstream_calls == 2
+    assert result.telemetry.corrections == 1
+    assert result.body["choices"][0]["message"]["content"] == '{"status":"acquired"}'
 
 
 @pytest.mark.asyncio
@@ -535,6 +672,74 @@ async def test_complete_typed_latest_receipt_projects_without_upstream_call() ->
     assert result.telemetry.receipt_projections == 1
     assert result.telemetry.local_projection_upstream_calls_avoided == 1
     assert upstream.requests == []
+
+
+@pytest.mark.asyncio
+async def test_exact_object_projection_candidate_remains_shadow_only_in_production() -> None:
+    upstream = ScriptedUpstream([completion(content='{"status":"upstream"}')])
+    payload = request(
+        [
+            {"role": "user", "content": "report"},
+            {"role": "assistant", "tool_calls": [call("read", "read_file", '{"path":"a.py"}')]},
+            {"role": "tool", "tool_call_id": "read", "content": '{"status":"nominal"}'},
+        ]
+    )
+    payload["response_format"] = strict_schema()
+
+    result = await ChatService(Settings(upstream_base_url="http://upstream/v1"), upstream).complete(payload, {})
+
+    assert result.body["choices"][0]["message"]["content"] == '{"status":"upstream"}'
+    assert result.telemetry.receipt_projections == 0
+    assert result.telemetry.local_projection_upstream_calls_avoided == 0
+    assert result.telemetry.upstream_calls == 1
+    assert len(upstream.requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [
+            {"role": "user", "content": "report"},
+            {"role": "assistant", "tool_calls": [call("old", "read_file", '{"path":"a.py"}')]},
+            {"role": "tool", "tool_call_id": "old", "content": '{"status":"nominal"}'},
+            {"role": "user", "content": "continue"},
+        ],
+        [
+            {"role": "user", "content": "report"},
+            {"role": "assistant", "tool_calls": [call("old", "read_file", '{"path":"a.py"}')]},
+            {"role": "tool", "tool_call_id": "orphan", "content": '{"status":"nominal"}'},
+        ],
+        [
+            {"role": "user", "content": "report"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    call("first", "read_file", '{"path":"a.py"}'),
+                    call("withheld", "read_file", '{"path":"b.py"}'),
+                ],
+            },
+            {"role": "tool", "tool_call_id": "first", "content": '{"status":"nominal"}'},
+        ],
+        [
+            {"role": "user", "content": "report"},
+            {"role": "assistant", "tool_calls": [call("verify", "run_tests", "{}")]},
+            {"role": "tool", "tool_call_id": "verify", "content": "2 passed"},
+            {"role": "assistant", "tool_calls": [call("mutate", "apply_patch", "{}")]},
+            {"role": "tool", "tool_call_id": "mutate", "content": "ok"},
+        ],
+    ],
+)
+async def test_only_the_exact_current_paired_receipt_can_project(messages: list[dict[str, Any]]) -> None:
+    upstream = ScriptedUpstream([completion(calls=[call("upstream", "run_tests", "{}")])])
+    payload = request(messages)
+    payload["response_format"] = strict_schema()
+
+    result = await ChatService(Settings(upstream_base_url="http://upstream/v1"), upstream).complete(payload, {})
+
+    assert result.telemetry.receipt_projections == 0
+    assert result.telemetry.upstream_calls == 1
+    assert upstream.requests
 
 
 @pytest.mark.asyncio

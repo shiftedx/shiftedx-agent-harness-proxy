@@ -7,6 +7,12 @@ from pydantic import SecretStr
 
 from shiftedx_harness_proxy.api import create_app
 from shiftedx_harness_proxy.config import Settings
+from shiftedx_harness_proxy.fast_path import InMemoryFastPathObserver
+from shiftedx_harness_proxy.qualification_timing import (
+    PrivateTimingSink,
+    read_timing_capture_ledger,
+    reserve_timing_capture_ledger,
+)
 from shiftedx_harness_proxy.transport import HttpxUpstream
 
 
@@ -28,11 +34,25 @@ class EchoUpstream:
     async def models(self, request_headers: dict[str, str]) -> dict[str, Any]:
         return {"object": "list", "data": [{"id": "model", "object": "model"}]}
 
+    async def combined_tool_terminal_schema_supported(self) -> bool:
+        return False
+
     async def ready(self) -> bool:
         return True
 
     async def close(self) -> None:
         return None
+
+
+class CombinedCapabilityUpstream(EchoUpstream):
+    def __init__(self, *, supported: bool) -> None:
+        super().__init__()
+        self.supported = supported
+        self.capability_probes = 0
+
+    async def combined_tool_terminal_schema_supported(self) -> bool:
+        self.capability_probes += 1
+        return self.supported
 
 
 class PhaseSplitUpstream(EchoUpstream):
@@ -77,6 +97,98 @@ class ObjectFinalizationUpstream(EchoUpstream):
         self.requests.append(payload)
         content: Any = "acquisition terminal" if "tools" in payload else {"status": "done"}
         return {"id": "chatcmpl", "choices": [{"message": {"role": "assistant", "content": content}}]}
+
+
+def test_shadow_fast_path_requires_an_explicit_private_observer_at_app_construction() -> None:
+    with pytest.raises(ValueError, match="intervention_fast_path_shadow_observer_required"):
+        create_app(
+            Settings(upstream_base_url="http://upstream/v1", intervention_fast_path_mode="shadow"),
+            EchoUpstream(),
+        )
+
+
+def test_shadow_fast_path_from_process_environment_cannot_start_without_observer(monkeypatch) -> None:
+    monkeypatch.setenv("INTERVENTION_FAST_PATH_MODE", "shadow")
+    settings = Settings(upstream_base_url="http://upstream/v1")
+
+    with pytest.raises(ValueError, match="intervention_fast_path_shadow_observer_required"):
+        create_app(settings, EchoUpstream())
+
+
+@pytest.mark.asyncio
+async def test_injected_fast_path_observer_records_shadow_without_public_surface() -> None:
+    observer = InMemoryFastPathObserver()
+    app = create_app(
+        Settings(upstream_base_url="http://upstream/v1", intervention_fast_path_mode="shadow"),
+        EchoUpstream(),
+        fast_path_observer=observer,
+    )
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={"model": "model", "messages": [{"role": "user", "content": "hello"}]},
+            )
+
+    assert response.status_code == 200
+    assert len(observer.records) == 1
+    assert observer.records[0].equivalent is True
+    assert not [name for name in response.headers if "fast" in name.lower()]
+    assert "fast_path" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_injected_private_timing_sink_captures_chat_lifecycle_without_public_surface(tmp_path) -> None:
+    ledger = tmp_path / "timing-captures.jsonl"
+    reserve_timing_capture_ledger(ledger)
+    app = create_app(
+        Settings(upstream_base_url="http://upstream/v1"),
+        EchoUpstream(),
+        timing_sink=PrivateTimingSink(ledger),
+    )
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={"model": "model", "messages": [{"role": "user", "content": "hello"}]},
+            )
+
+    assert response.status_code == 200
+    assert not [name for name in response.headers if "timing" in name.lower()]
+    captures = read_timing_capture_ledger(ledger)
+    assert len(captures) == 1
+    capture = captures[0]
+    assert capture["outcome"] == "succeeded"
+    assert capture["body_read_ns"] > 0
+    assert capture["admission_wait_ns"] >= 0
+    assert capture["response_finalize_ns"] >= 0
+    assert len(capture["attempts"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("supported", [True, False])
+async def test_combined_mode_readiness_requires_exact_capability_support(supported: bool) -> None:
+    upstream = CombinedCapabilityUpstream(supported=supported)
+    app = create_app(
+        Settings(
+            upstream_base_url="http://upstream/v1",
+            upstream_tool_response_capability_mode="combined_v1",
+        ),
+        upstream,
+    )
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
+            response = await client.get("/readyz")
+
+    assert response.status_code == (200 if supported else 503)
+    assert upstream.capability_probes == 1
+    if supported:
+        assert response.json() == {"status": "ready"}
+    else:
+        assert response.json()["error"]["code"] == "upstream_not_ready"
 
 
 @pytest.mark.asyncio
