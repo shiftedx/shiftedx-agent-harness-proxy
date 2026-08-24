@@ -1311,6 +1311,38 @@ async def test_harness_opt_out_requires_server_enablement_and_a_trusted_principa
 
 
 @pytest.mark.asyncio
+async def test_trusted_harness_opt_out_cannot_bypass_server_tool_deny_policy() -> None:
+    upstream = EchoUpstream()
+    settings = Settings(
+        upstream_base_url="http://upstream/v1",
+        deployment_profile="production",
+        proxy_api_key=SecretStr("ordinary-client"),
+        trusted_policy_extension_api_keys=SecretStr("trusted-extension"),
+        allow_harness_opt_out=True,
+        denied_tools="apply_patch",
+    )
+    app = create_app(settings, upstream)
+    payload = {
+        "model": "model",
+        "messages": [{"role": "user", "content": "repair"}],
+        "tools": [{"type": "function", "function": {"name": "apply_patch", "parameters": {}}}],
+    }
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer trusted-extension", "X-Shiftedx-Harness": "off"},
+                json=payload,
+            )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "harness_opt_out_denied_by_tool_policy"
+    assert response.json()["error"]["message"] == "Harness opt-out is unavailable for this request."
+    assert upstream.requests == []
+
+
+@pytest.mark.asyncio
 async def test_cache_namespace_controls_are_rejected_for_both_authenticated_principals(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

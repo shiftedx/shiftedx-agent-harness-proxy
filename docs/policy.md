@@ -145,7 +145,8 @@ withheld before client execution and receives a bounded correction result with
 `execution_status=blocked_not_executed`; the result does not reveal the tool name. If one call in a
 parallel batch is denied, the complete batch is withheld. Request-side
 `x-shiftedx-denied-tools` overrides are rejected with `400 tool_deny_override_denied` and are never
-forwarded upstream.
+forwarded upstream. While this server policy is nonempty, harness opt-out is rejected with
+`403 harness_opt_out_denied_by_tool_policy`; a trusted principal cannot bypass the deny set.
 
 An operator can explicitly authorize a separate authenticated policy-extension principal with
 `TRUSTED_POLICY_EXTENSION_API_KEYS`, a comma-separated list of opaque bearer capabilities. A request
@@ -287,8 +288,8 @@ Harness opt-out is also a policy-control extension. `X-Shiftedx-Harness: off` is
 the server explicitly enables `ALLOW_HARNESS_OPT_OUT=true` and the request authenticates with a
 trusted policy-extension capability. An ordinary principal receives
 `403 harness_opt_out_denied` even when the server enables opt-out; when the server disables it, the
-existing `403 harness_opt_out_disabled` response applies. The proxy-only header is never forwarded
-upstream.
+existing `403 harness_opt_out_disabled` response applies. A nonempty server `DENIED_TOOLS` policy
+also rejects opt-out. The proxy-only header is never forwarded upstream.
 
 ## Stateless transcript reconstruction
 

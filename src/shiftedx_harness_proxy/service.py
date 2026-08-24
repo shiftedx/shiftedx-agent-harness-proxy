@@ -86,6 +86,12 @@ class ChatService:
     ) -> ChatResult:
         started = time.perf_counter()
         _validate_chat_payload(payload, harness_enabled=harness_enabled)
+        if not harness_enabled and self.denied_tools:
+            raise ProxyError(
+                403,
+                "harness_opt_out_denied_by_tool_policy",
+                "Harness opt-out is unavailable for this request.",
+            )
         try:
             reject_client_cache_namespaces(
                 payload,
@@ -601,7 +607,7 @@ def _inject_harness(messages: list[Any], harness: AgentHarness, rebuilt: Reconst
 
 def _response_message(response: JsonObject) -> JsonObject:
     choices = response.get("choices")
-    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
         raise UpstreamFailure("upstream_malformed_completion")
     message = choices[0].get("message")
     if not isinstance(message, dict):

@@ -356,6 +356,45 @@ async def test_client_cannot_inject_or_override_server_tool_deny_set() -> None:
 
 
 @pytest.mark.asyncio
+async def test_server_tool_deny_set_rejects_harness_opt_out_before_upstream() -> None:
+    upstream = ScriptedUpstream([completion(content="must not be reached")])
+
+    with pytest.raises(ProxyError) as raised:
+        await ChatService(
+            Settings(upstream_base_url="http://upstream/v1", denied_tools="apply_patch"), upstream
+        ).complete(request([{"role": "user", "content": "repair"}]), {}, harness_enabled=False)
+
+    assert raised.value.code == "harness_opt_out_denied_by_tool_policy"
+    assert raised.value.message == "Harness opt-out is unavailable for this request."
+    assert upstream.requests == []
+
+
+@pytest.mark.asyncio
+async def test_harness_rejects_extra_upstream_choice_before_denied_call_can_escape() -> None:
+    response = completion(calls=[call("allowed", "read_file", '{"path":"a.py"}')])
+    response["choices"].append(
+        {
+            "index": 1,
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [call("denied", "apply_patch", '{"patch":"x"}')],
+            },
+            "finish_reason": "tool_calls",
+        }
+    )
+    upstream = ScriptedUpstream([response])
+
+    with pytest.raises(ProxyError) as raised:
+        await ChatService(
+            Settings(upstream_base_url="http://upstream/v1", denied_tools="apply_patch"), upstream
+        ).complete(request([{"role": "user", "content": "repair"}]), {})
+
+    assert raised.value.code == "upstream_malformed_completion"
+    assert len(upstream.requests) == 1
+
+
+@pytest.mark.asyncio
 async def test_server_tool_deny_set_leaves_allowed_call_unchanged() -> None:
     allowed = call("allowed", "read_file", '{"path":"a.py"}')
     upstream = ScriptedUpstream([completion(calls=[allowed])])
