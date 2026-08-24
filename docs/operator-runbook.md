@@ -6,6 +6,8 @@ upstreams, or sandbox the Downstream Client's tool runner.
 
 The exact AEON-tested artifact is authorized for controlled deployment under the latency exception
 in [Release status](../RELEASE_STATUS.md). It is not a stable/public release or production-certified.
+That exact artifact is non-streaming. A later source checkout that accepts `stream=true` is not a
+substitute; validate-then-replay SSE requires its own immutable image and compatibility evidence.
 
 ## Supported topology
 

@@ -358,6 +358,24 @@ async def test_malformed_completion_counts_the_started_attempt() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stream_failure_is_json_before_sse_headers_and_never_counts_as_replay() -> None:
+    upstream = ScriptedUpstream([{"id": "chatcmpl", "choices": "not-a-list"}])
+    response, values = await post(
+        create_app(settings(), upstream),
+        {**chat_payload(), "stream": True, "stream_options": {"include_usage": True}},
+    )
+
+    assert response.status_code == 502
+    assert response.headers["content-type"].startswith("application/json")
+    assert "x-shiftedx-stream-mode" not in response.headers
+    assert response.json()["error"]["code"] == "upstream_malformed_completion"
+    assert "data:" not in response.text
+    assert_ledger(values, requests=1, attempts=1, calls=len(upstream.calls))
+    assert values["shiftedx_proxy_errors_total"] == 1
+    assert values["shiftedx_proxy_stream_replays_total"] == 0
+
+
+@pytest.mark.asyncio
 async def test_failed_upstream_slot_acquisition_is_not_an_attempt_or_phase() -> None:
     upstream = ScriptedUpstream([completion("acquisition")])
     app = create_app(
@@ -450,6 +468,32 @@ async def test_inflight_disconnect_and_external_cancellation_retain_the_started_
     assert external_app.state.counters.downstream_requests == external_app.state.counters.upstream_calls == 1
     assert external_app.state.counters.cancellations == 1
     assert external_app.state.counters.errors == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_request_cancellation_aborts_buffered_upstream_before_replay() -> None:
+    upstream = WaitingUpstream()
+    app = create_app(settings(), upstream)
+    payload = {**chat_payload(), "stream": True, "stream_options": {"include_usage": True}}
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client:
+            task = asyncio.create_task(client.post("/v1/chat/completions", json=payload))
+            await upstream.started.wait()
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    assert len(upstream.calls) == 1
+    assert "stream" not in upstream.calls[0]
+    assert "stream_options" not in upstream.calls[0]
+    assert upstream.cancelled.is_set()
+    assert app.state.counters.downstream_requests == app.state.counters.upstream_calls == 1
+    assert app.state.counters.cancellations == 1
+    assert app.state.counters.errors == 0
+    assert app.state.counters.stream_replays == 0
 
 
 @pytest.mark.asyncio

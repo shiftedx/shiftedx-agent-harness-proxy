@@ -1,3 +1,4 @@
+import json
 import logging
 from typing import Any
 
@@ -53,6 +54,46 @@ class CombinedCapabilityUpstream(EchoUpstream):
     async def combined_tool_terminal_schema_supported(self) -> bool:
         self.capability_probes += 1
         return self.supported
+
+
+class RichCompletionUpstream(EchoUpstream):
+    async def chat(self, payload: dict[str, Any], request_headers: dict[str, str]) -> dict[str, Any]:
+        self.requests.append(payload)
+        return {
+            "id": "chatcmpl-rich",
+            "object": "chat.completion",
+            "created": 1_700_000_000,
+            "model": "model",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "Need the file.",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "read_file", "arguments": '{"path":"a.py"}'},
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        }
+
+
+class ScriptedCompletionUpstream(EchoUpstream):
+    def __init__(self, responses: list[dict[str, Any]]) -> None:
+        super().__init__()
+        self.responses = responses
+
+    async def chat(self, payload: dict[str, Any], request_headers: dict[str, str]) -> dict[str, Any]:
+        self.requests.append(payload)
+        return self.responses.pop(0)
 
 
 class PhaseSplitUpstream(EchoUpstream):
@@ -209,9 +250,42 @@ async def test_http_surface_auth_health_streaming_and_unknown_request_passthroug
             streamed = await client.post(
                 "/v1/chat/completions",
                 headers=headers,
-                json={"model": "model", "messages": [], "stream": True},
+                json={
+                    "model": "model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                },
             )
-            assert streamed.status_code == 400
+            assert streamed.status_code == 200
+            assert streamed.headers["content-type"].startswith("text/event-stream")
+            assert streamed.headers["cache-control"] == "no-cache"
+            assert streamed.headers["x-shiftedx-stream-mode"] == "validate-then-replay"
+            events = [line.removeprefix("data: ") for line in streamed.text.splitlines() if line]
+            assert events[-1] == "[DONE]"
+            chunks = [json.loads(event) for event in events[:-1]]
+            assert chunks == [
+                {
+                    "id": "chatcmpl",
+                    "object": "chat.completion.chunk",
+                    "model": "model",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": "ok"},
+                            "finish_reason": None,
+                        }
+                    ],
+                },
+                {
+                    "id": "chatcmpl",
+                    "object": "chat.completion.chunk",
+                    "model": "model",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                },
+            ]
+            assert "stream" not in upstream.requests[-1]
+            assert "stream_options" not in upstream.requests[-1]
             response = await client.post(
                 "/v1/chat/completions",
                 headers=headers,
@@ -229,6 +303,7 @@ async def test_http_surface_auth_health_streaming_and_unknown_request_passthroug
             assert (await client.get("/readyz")).json() == {"status": "ready"}
             metrics = await client.get("/metrics", headers=headers)
             assert "shiftedx_proxy_downstream_requests_total 2" in metrics.text
+            assert "shiftedx_proxy_stream_replays_total 1" in metrics.text
 
 
 @pytest.mark.asyncio
@@ -274,6 +349,244 @@ async def test_local_projection_marker_and_accounting_do_not_depend_on_telemetry
     assert upstream.requests == []
     assert "shiftedx_proxy_receipt_projections_total 1" in metrics.text
     assert "shiftedx_proxy_local_projection_upstream_calls_avoided_total 1" in metrics.text
+
+
+@pytest.mark.asyncio
+async def test_streamed_local_projection_keeps_its_truthful_origin_and_zero_usage() -> None:
+    upstream = EchoUpstream()
+    app = create_app(Settings(upstream_base_url="http://upstream/v1", telemetry_enabled=False), upstream)
+    payload = {
+        "model": "model",
+        "messages": [
+            {"role": "user", "content": "report"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "v",
+                        "type": "function",
+                        "function": {"name": "run_tests", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "v", "content": "14 passed"},
+        ],
+        "tools": [{"type": "function", "function": {"name": "run_tests", "parameters": {}}}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "result",
+                "schema": {
+                    "type": "object",
+                    "properties": {"status": {"type": "string"}, "tests": {"type": "integer"}},
+                },
+            },
+        },
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
+            response = await client.post("/v1/chat/completions", json=payload)
+
+    events = [line.removeprefix("data: ") for line in response.text.splitlines() if line]
+    chunks = [json.loads(event) for event in events[:-1]]
+    assert response.status_code == 200
+    assert chunks[0]["x-shiftedx-projection-v1"]["origin"] == "local_projection"
+    assert chunks[-1]["usage"] == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    assert upstream.requests == []
+
+
+@pytest.mark.asyncio
+async def test_stream_replay_preserves_reasoning_tool_calls_finish_reason_and_usage() -> None:
+    upstream = RichCompletionUpstream()
+    app = create_app(Settings(upstream_base_url="http://upstream/v1"), upstream)
+    payload = {
+        "model": "model",
+        "messages": [{"role": "user", "content": "Inspect the file."}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
+                },
+            }
+        ],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
+            response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    events = [line.removeprefix("data: ") for line in response.text.splitlines() if line]
+    chunks = [json.loads(event) for event in events[:-1]]
+    assert chunks[0]["choices"] == [
+        {
+            "index": 0,
+            "delta": {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "Need the file.",
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"path":"a.py"}'},
+                    }
+                ],
+            },
+            "finish_reason": None,
+        }
+    ]
+    assert chunks[1]["choices"] == [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+    assert chunks[2]["choices"] == []
+    assert chunks[2]["usage"] == {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    assert events[-1] == "[DONE]"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "completion",
+    [
+        {
+            "model": "model",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+        },
+        {
+            "id": "chatcmpl",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+        },
+        {
+            "id": "chatcmpl",
+            "model": "model",
+            "choices": [
+                {
+                    "index": "zero",
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+        },
+        {
+            "id": "chatcmpl",
+            "model": "model",
+            "choices": [
+                {"index": 0, "message": {"role": "assistant", "content": "ok"}}
+            ],
+        },
+    ],
+)
+async def test_malformed_optional_stream_fields_fail_before_sse_headers(
+    completion: dict[str, Any],
+) -> None:
+    upstream = ScriptedCompletionUpstream([completion])
+    app = create_app(Settings(upstream_base_url="http://upstream/v1"), upstream)
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+            )
+
+    assert response.status_code == 502
+    assert response.headers["content-type"].startswith("application/json")
+    assert "x-shiftedx-stream-mode" not in response.headers
+    assert response.json()["error"]["code"] == "upstream_malformed_completion"
+    assert "data:" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_stream_replay_never_releases_a_withheld_tool_batch() -> None:
+    def tool_call(call_id: str, path: str) -> dict[str, Any]:
+        return {
+            "id": call_id,
+            "type": "function",
+            "function": {"name": "read_file", "arguments": json.dumps({"path": path})},
+        }
+
+    def completion(*calls: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": "chatcmpl-tools",
+            "object": "chat.completion",
+            "model": "model",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "", "tool_calls": list(calls)},
+                    "finish_reason": "tool_calls",
+                }
+            ],
+        }
+
+    upstream = ScriptedCompletionUpstream(
+        [
+            completion(tool_call("allowed-first", "b.py"), tool_call("blocked", "a.py")),
+            completion(tool_call("allowed-reissued", "b.py")),
+        ]
+    )
+    app = create_app(Settings(upstream_base_url="http://upstream/v1"), upstream)
+    payload = {
+        "model": "model",
+        "messages": [
+            {"role": "user", "content": "inspect"},
+            {"role": "assistant", "tool_calls": [tool_call("old", "a.py")]},
+            {"role": "tool", "tool_call_id": "old", "content": "source"},
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
+                },
+            }
+        ],
+        "stream": True,
+    }
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
+            response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert "allowed-reissued" in response.text
+    assert "allowed-first" not in response.text
+    assert "blocked" not in response.text
+    assert len(upstream.requests) == 2
 
 
 @pytest.mark.asyncio
@@ -934,6 +1247,19 @@ async def test_policy_annotation_client_errors_are_stable(
         ({"model": "model", "messages": [{"role": "assistant", "content": None}]}, "invalid_messages"),
         ({"model": "model", "messages": [{"role": "assistant", "tool_calls": []}]}, "invalid_messages"),
         ({"model": "model", "messages": [], "stream": 1}, "invalid_stream"),
+        (
+            {"model": "model", "messages": [], "stream": True, "stream_options": []},
+            "invalid_stream_options",
+        ),
+        (
+            {
+                "model": "model",
+                "messages": [],
+                "stream": True,
+                "stream_options": {"include_usage": 1},
+            },
+            "invalid_stream_options",
+        ),
         ({"model": "model", "messages": [], "n": True}, "multiple_choices_not_supported"),
         ({"model": "model", "messages": [], "n": 2}, "multiple_choices_not_supported"),
         ({"model": "model", "messages": [], "tools": [{"type": "function"}]}, "invalid_tools"),

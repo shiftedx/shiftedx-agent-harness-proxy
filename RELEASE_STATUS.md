@@ -34,6 +34,10 @@ Deliberately outside v1:
 Those items belong to the separate provider/streaming roadmap and do not make this v1 release
 candidate incomplete within its supported surface.
 
+Later unqualified source work may contain validate-then-replay SSE compatibility. It does not alter
+the exact controlled-deployment artifact above, which remains non-streaming, and it is not supported
+until an immutable replacement image passes the streaming and productization gates.
+
 ## Verified evidence
 
 The controlled-deployment authorization is limited to:

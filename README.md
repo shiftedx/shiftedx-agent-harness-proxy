@@ -80,7 +80,7 @@ Stop it with `docker compose down`.
 
 ## Connect a client
 
-Point any non-streaming OpenAI-compatible client at `http://localhost:8090/v1`:
+Point an OpenAI-compatible client at `http://localhost:8090/v1`:
 
 ```python
 from openai import OpenAI
@@ -94,22 +94,26 @@ print(response.choices[0].message)
 ```
 
 Clients must send the complete visible conversation on every request, including assistant tool-call
-IDs and their later matching `role=tool` results. Version 1 rejects `stream=true` and requires
-`n=1` while the harness is enabled.
+IDs and their later matching `role=tool` results. `stream=true` uses policy-safe
+validate-then-replay SSE: the proxy obtains and validates the complete response before emitting any
+event. It is compatibility streaming, not a TTFT improvement. Harness mode requires `n=1`.
 
 ## v1 Chat Completions compatibility
 
-`POST /v1/chat/completions` supports non-streaming Chat Completions requests with a non-empty
+`POST /v1/chat/completions` supports buffered and validate-then-replay Chat Completions requests with a non-empty
 string `model`; an array of `system`, `user`, `assistant`, and `tool` messages; function tools; and
 unknown compatible request fields, which are retained when forwarding upstream. `stream` is an
-actual JSON boolean and only `false` is supported. While the Harness Proxy is enabled, `n` must be
+actual JSON boolean. For `true`, the proxy consumes `stream_options`, runs the ordinary buffered
+policy path, and emits OpenAI-compatible `chat.completion.chunk` events followed by exactly one
+`[DONE]`. `stream_options.include_usage` must be a JSON boolean when present. While the Harness
+Proxy is enabled, `n` must be
 the JSON integer `1` (JSON booleans are not integers). Tool schemas, tool-call transcripts, and
 proxy-owned `x-shiftedx-*` policy extensions are validated locally before any upstream call.
 Content-part arrays must be non-empty arrays of objects with non-empty string `type` values;
 unknown well-formed part types and fields remain compatible.
 
-Version 1 does not support SSE streaming, the Responses API, Anthropic Messages, multiple choices
-in harness mode, provider-native policy controls, or verbatim upstream error responses. See the
+Version 1 does not support progressive/token-time streaming, the Responses API, Anthropic Messages,
+multiple choices in harness mode, provider-native policy controls, or verbatim upstream error responses. See the
 [policy contract](docs/policy.md#transport-and-error-contract) for the error/status matrix.
 
 ## Authenticated production profile

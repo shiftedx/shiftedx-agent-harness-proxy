@@ -12,11 +12,16 @@ a tool or fabricates a successful receipt.
 
 ## Transport and error contract
 
-The v1 surface is `/v1/models` and non-streaming `/v1/chat/completions`. The Chat Completions
+The source surface is `/v1/models` and buffered or validate-then-replay `/v1/chat/completions`. The Chat Completions
 boundary validates a non-empty string `model`, an array of supported message shapes (`system`,
 `user`, `assistant`, and `tool`), function tools, and proxy-owned policy extensions before an
-upstream request. It preserves unrelated compatible JSON fields. `stream` must be a JSON boolean
-and `true` is rejected; with the harness enabled, `n` must be the JSON integer `1`, never a boolean.
+upstream request. It preserves unrelated compatible JSON fields. `stream` must be a JSON boolean.
+For `true`, `stream_options` must be an object and `include_usage`, when present, must be a JSON
+boolean. The proxy removes both streaming controls, obtains and validates the complete response
+through the ordinary policy path, and only then emits `chat.completion.chunk` SSE plus exactly one
+`[DONE]`. No content or tool-call fragment is released before the Withheld Batch and terminal gates
+finish. All failures therefore remain ordinary JSON errors before SSE headers; this mode makes no
+TTFT or progressive-delivery claim. With the harness enabled, `n` must be the JSON integer `1`, never a boolean.
 Content-part arrays must be non-empty arrays of objects with non-empty string `type` values, while
 unknown well-formed part types and fields are preserved. An assistant must have usable content or a
 non-empty valid function tool-call array. For `response_format.type=json_schema`, the wrapper and
@@ -219,7 +224,8 @@ semantics.
 
 `/metrics` exposes only aggregate counters:
 `shiftedx_proxy_phase_acquisition_total`, `shiftedx_proxy_phase_finalization_total`, and
-`shiftedx_proxy_phase_schema_rejections_total`. They have no request-derived labels or content.
+`shiftedx_proxy_phase_schema_rejections_total`, and `shiftedx_proxy_stream_replays_total`. They have
+no request-derived labels or content.
 
 ### Request and attempt accounting
 
