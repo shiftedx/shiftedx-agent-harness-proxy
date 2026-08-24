@@ -3,7 +3,12 @@
 [![CI](https://github.com/shiftedx/shiftedx-agent-harness-proxy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/shiftedx/shiftedx-agent-harness-proxy/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Status: public v0.1.0 release, qualified for controlled production deployment.** The r14 campaign
+> **Project status: paused as of 2026-08-24.** Active development is moving toward a custom Pi agent
+> harness where tool-call policy can live inside the harness. The v0.1.0 release remains available
+> as historical qualification evidence, but it is not recommended as a transparent default proxy for
+> general Hermes traffic.
+
+**Historical v0.1.0 result.** The r14 campaign
 improved valid agent outcomes from `160/240` (`66.7%`) direct to
 `220/240` (`91.7%`) proxy-assisted, while deadline-penalized mean time to a valid outcome fell
 from `203.488 s` to `54.605 s` (`73.2%` lower; `3.73×` faster). This is not a raw-inference or
